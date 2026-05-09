@@ -2,6 +2,7 @@
 import json
 import os
 import threading
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -20,6 +21,10 @@ from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import g
 
 DEFAULT_GLOBAL_SEGMENT_SIZE = 1073741824  # 1.0 GiB
 DEFAULT_LOCAL_BUFFER_SIZE = 1073741824  # 1.0 GiB
+
+
+def _sum_transfer_bytes(sizes: list[list[int]]) -> int:
+    return sum(sum(size_group) for size_group in sizes)
 
 
 class MooncakeBackend(Backend):
@@ -148,7 +153,12 @@ class MooncakeBackend(Backend):
             keys[:3],
         )
         try:
-            res = self.store.batch_get_into_multi_buffers(keys, addrs, sizes)
+            start_time = time.perf_counter()
+            try:
+                res = self.store.batch_get_into_multi_buffers(keys, addrs, sizes)
+            finally:
+                elapsed_ms = (time.perf_counter() - start_time) * 1000
+                logger.info("Mooncake load_kvc took %.3f ms, bytes=%d", elapsed_ms, _sum_transfer_bytes(sizes))
             res_list = list(res)
             logger.debug(
                 "MooncakeBackend.get result keys=%d result_sample=%s negative_count=%d",
