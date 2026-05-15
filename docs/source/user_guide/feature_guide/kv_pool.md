@@ -1115,6 +1115,11 @@ python -m vllm.entrypoints.openai.api_server \
 pip install openyuanrong-datasystem
 ```
 
+If the prebuilt package does not match the CANN or Ascend driver version in
+your environment, build Yuanrong Datasystem from source in the vLLM Ascend
+image. Follow the official Yuanrong Datasystem build instructions:
+<https://atomgit.com/openeuler/yuanrong-datasystem>
+
 ### Start etcd
 
 Yuanrong Datasystem requires etcd for service discovery. Start a single-node
@@ -1160,7 +1165,11 @@ dscli start -w \
   --shared_memory_size_mb 20480
 ```
 
-For more parameters, refer to the `dscli` usage documentation on the Yuanrong Datasystem official site:
+The `--worker_address` value is consumed later by `DS_WORKER_ADDR`, so keep
+the host and port identical on the same node.
+
+For more parameters, refer to the `dscli` usage documentation on the Yuanrong
+Datasystem official site:
 <https://atomgit.com/openeuler/yuanrong-datasystem>
 
 To stop the worker:
@@ -1171,8 +1180,14 @@ dscli stop --worker_address "${WORKER_IP}:31501"
 
 ### Environment Variable Configuration
 
-Set the worker address on each node. The value must match the
-`dscli start --worker_address` address on the same host.
+Set the following environment variables on each node before starting vLLM:
+
+| Variable | Required | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `PYTHONHASHSEED` | Yes | `0` | Must be consistent across all nodes to guarantee uniform hash generation. |
+| `DS_WORKER_ADDR` | Yes | N/A | Datasystem worker address in `<host>:<port>` format. This must match the local `dscli start --worker_address` value. |
+| `DS_ENABLE_EXCLUSIVE_CONNECTION` | No | `0` | Passed to Yuanrong `HeteroClient.enable_exclusive_connection`. Use `1` to enable the exclusive connection mode when required by your deployment. |
+| `DS_ENABLE_REMOTE_H2D` | No | `0` | Passed to Yuanrong `HeteroClient.enable_remote_h2d`. Use `1` only after the Remote H2D requirements below are met. |
 
 ```bash
 export PYTHONHASHSEED=0
@@ -1184,6 +1199,8 @@ export DS_ENABLE_REMOTE_H2D=0
 ```
 
 ### Run AscendStoreConnector with Yuanrong backend
+
+Use `AscendStoreConnector` with `backend: "yuanrong"`:
 
 ```bash
 python3 -m vllm.entrypoints.openai.api_server \
