@@ -270,6 +270,8 @@ class RForkTransferBackend:
         weight_mr_dict = {}
         weight_shape_dict = {}
         weight_addr_set = set()
+        weight_bytes = 0
+        collect_weights_tic = time.time()
         for name, weight in _iter_transferable_tensors(model):
             weight_mr_dict[name] = (
                 weight.data_ptr(),
@@ -278,9 +280,18 @@ class RForkTransferBackend:
             )
             weight_shape_dict[name] = tuple(weight.shape)
             weight_addr_set.add(weight.data_ptr())
-        sorted_weight_ptrs = sorted(weight_addr_set)
+            weight_bytes += weight.numel() * weight.element_size()
+        collect_weights_time = time.time() - collect_weights_tic
 
+        sort_ptrs_tic = time.time()
+        sorted_weight_ptrs = sorted(weight_addr_set)
+        sort_ptrs_time = time.time() - sort_ptrs_tic
+
+        memory_snapshot_tic = time.time()
         memory_snapshot = torch.npu.memory.memory_snapshot()
+        memory_snapshot_time = time.time() - memory_snapshot_tic
+
+        scan_snapshot_tic = time.time()
         weight_blocks_for_reg_mr = []
         for segment in memory_snapshot:
             current_weight_block = None
@@ -303,9 +314,12 @@ class RForkTransferBackend:
                         current_weight_block = (address, size)
             if current_weight_block is not None:
                 weight_blocks_for_reg_mr.append(current_weight_block)
+        scan_snapshot_time = time.time() - scan_snapshot_tic
 
         addresses, sizes = zip(*weight_blocks_for_reg_mr) if weight_blocks_for_reg_mr else ((), ())
+        batch_register_tic = time.time()
         ret = transfer_engine.batch_register_memory(addresses, sizes)
+        batch_register_time = time.time() - batch_register_tic
         if ret.is_error():
             logger.error(
                 "batch_register_memory failed for %d blocks, ret: %s",
@@ -318,6 +332,25 @@ class RForkTransferBackend:
         self.rfork_transfer_engine_weights_shape_dict = weight_shape_dict
         self.registered_weight_blocks = weight_blocks_for_reg_mr
 
+        registered_bytes = sum(sizes)
+        logger.info(
+            "register_memory_region details: collect_weights=%.4fs, "
+            "sort_ptrs=%.4fs, memory_snapshot=%.4fs, scan_snapshot=%.4fs, "
+            "batch_register=%.4fs, weights=%d, unique_ptrs=%d, "
+            "snapshot_segments=%d, registered_blocks=%d, weight_bytes=%.2f GiB, "
+            "registered_bytes=%.2f GiB",
+            collect_weights_time,
+            sort_ptrs_time,
+            memory_snapshot_time,
+            scan_snapshot_time,
+            batch_register_time,
+            len(weight_mr_dict),
+            len(weight_addr_set),
+            len(memory_snapshot),
+            len(weight_blocks_for_reg_mr),
+            weight_bytes / (1024**3),
+            registered_bytes / (1024**3),
+        )
         logger.info(
             "register_memory_region time: %.4fs, weights: %d",
             time.time() - start_reg_mr_tic,
@@ -359,15 +392,19 @@ class RForkTransferBackend:
         local_seed_key,
     ):
         transfer_engine = self._get_transfer_engine()
+        recv_start_tic = time.time()
         seed_url = f"http://{seed_instance_ip}:{seed_instance_service_port}"
+        get_remote_info_tic = time.time()
         seed_session_id, seed_weight_info, seed_weight_shapes = get_remote_instance_transfer_engine_info(
             seed_url,
             local_seed_key,
         )
+        get_remote_info_time = time.time() - get_remote_info_tic
         if seed_session_id is None or seed_weight_info is None:
             logger.error("Cannot get transfer engine session or weight info.")
             return False
 
+        prepare_metadata_tic = time.time()
         seed_ptr_list = []
         client_ptr_list = []
         client_len_list = []
@@ -410,6 +447,7 @@ class RForkTransferBackend:
             client_ptr_list.append(tensor.data_ptr())
             client_len_list.append(tensor.numel() * tensor.element_size())
             weight_names.append(name)
+        prepare_metadata_time = time.time() - prepare_metadata_tic
 
         if reshape_events:
             sample_events = ", ".join(
@@ -423,7 +461,7 @@ class RForkTransferBackend:
                 sample_events,
             )
 
-        start_transfer_tic = time.time()
+        build_chunks_tic = time.time()
         transfer_chunks = list(
             _iter_transfer_chunks(
                 weight_names,
@@ -432,11 +470,28 @@ class RForkTransferBackend:
                 client_len_list,
             )
         )
+        build_chunks_time = time.time() - build_chunks_tic
+        total_transfer_bytes = sum(client_len_list)
+        logger.info(
+            "recv_from_source prepare details: get_remote_info=%.4fs, "
+            "prepare_metadata=%.4fs, build_chunks=%.4fs, weights=%d, "
+            "seed_weights=%d, shape_info=%s, reshaped=%d, total bytes=%.2f GiB",
+            get_remote_info_time,
+            prepare_metadata_time,
+            build_chunks_time,
+            len(client_len_list),
+            len(seed_weight_info),
+            isinstance(seed_weight_shapes, dict),
+            len(reshape_events),
+            total_transfer_bytes / (1024**3),
+        )
+
+        start_transfer_tic = time.time()
         logger.info(
             "transfer weights starts, weights: %d, chunks: %d, total bytes: %.2f GiB",
             len(client_len_list),
             len(transfer_chunks),
-            sum(client_len_list) / (1024**3),
+            total_transfer_bytes / (1024**3),
         )
         for index, (chunk_names, chunk_seed_ptrs, chunk_client_ptrs, chunk_lengths) in enumerate(transfer_chunks, 1):
             chunk_start_tic = time.time()
@@ -472,28 +527,53 @@ class RForkTransferBackend:
                 time.time() - chunk_start_tic,
             )
 
-        logger.info("transfer weights time: %.4fs", time.time() - start_transfer_tic)
+        transfer_time = time.time() - start_transfer_tic
+        logger.info("transfer weights time: %.4fs", transfer_time)
+        logger.info(
+            "recv_from_source total time: %.4fs, pre_transfer_prepare=%.4fs, transfer=%.4fs",
+            time.time() - recv_start_tic,
+            start_transfer_tic - recv_start_tic,
+            transfer_time,
+        )
         return True
 
 
 def get_remote_instance_transfer_engine_info(seed_url: str, local_seed_key: str):
     try:
+        get_info_tic = time.time()
         response = requests.get(
             f"{seed_url}/get_rfork_transfer_engine_info",
             params={"seed_key": local_seed_key},
         )
+        get_info_time = time.time() - get_info_tic
         if response.status_code != 200:
             logger.error(
-                "GET %s/get_rfork_transfer_engine_info failed: %s",
+                "GET %s/get_rfork_transfer_engine_info failed: %s, time: %.4fs",
                 seed_url,
                 response.status_code,
+                get_info_time,
             )
             return None, None, None
 
+        parse_info_tic = time.time()
         data = response.json()
         info = data.get("rfork_transfer_engine_info", None)
+        parse_info_time = time.time() - parse_info_tic
         if info is not None and isinstance(info, list) and len(info) == 2:
-            return info[0], info[1], get_remote_instance_weight_shape_info(seed_url, local_seed_key)
+            get_shape_tic = time.time()
+            shape_info = get_remote_instance_weight_shape_info(seed_url, local_seed_key)
+            get_shape_time = time.time() - get_shape_tic
+            logger.info(
+                "get_remote_instance_transfer_engine_info details: "
+                "get_info=%.4fs, parse_info=%.4fs, get_shape=%.4fs, "
+                "seed_weights=%d, shape_info=%s",
+                get_info_time,
+                parse_info_time,
+                get_shape_time,
+                len(info[1]) if isinstance(info[1], dict) else -1,
+                isinstance(shape_info, dict),
+            )
+            return info[0], info[1], shape_info
 
         logger.error(
             "Failed to get rfork_transfer_engine_info in response from %s.",
@@ -507,21 +587,33 @@ def get_remote_instance_transfer_engine_info(seed_url: str, local_seed_key: str)
 
 def get_remote_instance_weight_shape_info(seed_url: str, local_seed_key: str):
     try:
+        get_shape_tic = time.time()
         response = requests.get(
             f"{seed_url}/get_rfork_transfer_engine_shape_info",
             params={"seed_key": local_seed_key},
         )
+        get_shape_time = time.time() - get_shape_tic
         if response.status_code != 200:
             logger.debug(
-                "GET %s/get_rfork_transfer_engine_shape_info failed: %s",
+                "GET %s/get_rfork_transfer_engine_shape_info failed: %s, time: %.4fs",
                 seed_url,
                 response.status_code,
+                get_shape_time,
             )
             return None
 
+        parse_shape_tic = time.time()
         data = response.json()
         info = data.get("rfork_transfer_engine_shape_info", None)
+        parse_shape_time = time.time() - parse_shape_tic
         if info is None or isinstance(info, dict):
+            logger.info(
+                "get_remote_instance_weight_shape_info details: "
+                "get_shape=%.4fs, parse_shape=%.4fs, shapes=%d",
+                get_shape_time,
+                parse_shape_time,
+                len(info) if isinstance(info, dict) else 0,
+            )
             return info
 
         logger.error(
