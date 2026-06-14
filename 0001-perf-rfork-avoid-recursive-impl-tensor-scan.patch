@@ -1,0 +1,103 @@
+From 10ca57fc757a97670a999c8cf02674611563c725 Mon Sep 17 00:00:00 2001
+From: yangsonglin13 <yangsonglin566@gmail.com>
+Date: Sun, 14 Jun 2026 22:54:11 +0800
+Subject: [PATCH] perf(rfork): avoid recursive impl tensor scan
+
+RFork tensor collection spent tens of seconds recursively walking attention impl objects even when all discovered tensors were duplicates.
+
+Limit impl scanning to public top-level attributes while preserving the normal parameter, buffer, and module attribute scans. This keeps runtime tensor discovery for direct impl attributes and avoids traversing deep object graphs during weight registration.
+
+Signed-off-by: yangsonglin13 <yangsonglin566@gmail.com>
+---
+ .../model_loader/rfork/transfer_backend.py    | 34 +++++++++++++------
+ 1 file changed, 23 insertions(+), 11 deletions(-)
+
+diff --git a/vllm_ascend/model_loader/rfork/transfer_backend.py b/vllm_ascend/model_loader/rfork/transfer_backend.py
+index 6e05b5cb..97e4c965 100644
+--- a/vllm_ascend/model_loader/rfork/transfer_backend.py
++++ b/vllm_ascend/model_loader/rfork/transfer_backend.py
+@@ -146,6 +146,16 @@ def _iter_tensors_in_value(prefix: str, value: Any, visited_object_ids: set[int]
+         yield from _iter_tensors_in_value(f"{prefix}.{attr_name}", attr_value, visited_object_ids, scan_objects)
+ 
+ 
++def _iter_tensors_in_public_attrs(prefix: str, value: Any):
++    if not hasattr(value, "__dict__"):
++        return
++
++    for attr_name, attr_value in vars(value).items():
++        if attr_name.startswith("_"):
++            continue
++        yield from _iter_tensors_in_value(f"{prefix}.{attr_name}", attr_value, set())
++
++
+ def _try_collect_transferable_tensor(
+     name: str,
+     tensor: torch.Tensor,
+@@ -208,10 +218,10 @@ def _collect_transferable_tensors(model: nn.Module) -> list[tuple[str, torch.Ten
+     module_attr_duplicate_count = 0
+     module_attr_scan_time = 0.0
+     impl_attr_count = 0
+-    impl_tensor_count = 0
++    impl_shallow_tensor_count = 0
+     impl_kept_count = 0
+     impl_duplicate_count = 0
+-    impl_scan_time = 0.0
++    impl_shallow_scan_time = 0.0
+     module_scan_tic = time.time()
+     # Some Ascend post-load paths replace checkpoint parameters with runtime
+     # tensors stored as plain module attributes, e.g. MLA/SFA W_UV and W_UK_T.
+@@ -221,14 +231,16 @@ def _collect_transferable_tensors(model: nn.Module) -> list[tuple[str, torch.Ten
+             if attr_name.startswith("_") or isinstance(attr_value, nn.Module):
+                 continue
+ 
+-            scan_objects = attr_name == "impl"
+             attr_scan_tic = time.time()
+-            attr_tensors = list(_iter_tensors_in_value(attr_name, attr_value, set(), scan_objects))
++            if attr_name == "impl":
++                attr_tensors = list(_iter_tensors_in_public_attrs(attr_name, attr_value))
++            else:
++                attr_tensors = list(_iter_tensors_in_value(attr_name, attr_value, set()))
+             attr_scan_time = time.time() - attr_scan_tic
+-            if scan_objects:
++            if attr_name == "impl":
+                 impl_attr_count += 1
+-                impl_tensor_count += len(attr_tensors)
+-                impl_scan_time += attr_scan_time
++                impl_shallow_tensor_count += len(attr_tensors)
++                impl_shallow_scan_time += attr_scan_time
+             else:
+                 module_attr_count += 1
+                 module_attr_tensor_count += len(attr_tensors)
+@@ -242,7 +254,7 @@ def _collect_transferable_tensors(model: nn.Module) -> list[tuple[str, torch.Ten
+                     seen_data_ptrs,
+                     collected_tensors,
+                 )
+-                if scan_objects:
++                if attr_name == "impl":
+                     impl_kept_count += int(is_kept)
+                     impl_duplicate_count += int(is_duplicate)
+                 else:
+@@ -254,7 +266,7 @@ def _collect_transferable_tensors(model: nn.Module) -> list[tuple[str, torch.Ten
+         "iter_transferable_tensors details: total=%.4fs, "
+         "named_parameters=%.4fs/%d/%d/%d, named_buffers=%.4fs/%d/%d/%d, "
+         "module_loop=%.4fs, module_attrs=%.4fs/%d/%d/%d/%d, "
+-        "impl_recursive_attrs=%.4fs/%d/%d/%d/%d, "
++        "impl_shallow_attrs=%.4fs/%d/%d/%d/%d, "
+         "modules=%d, tensors=%d, unique_ptrs=%d",
+         time.time() - scan_start_tic,
+         parameter_scan_time,
+@@ -271,9 +283,9 @@ def _collect_transferable_tensors(model: nn.Module) -> list[tuple[str, torch.Ten
+         module_attr_tensor_count,
+         module_attr_kept_count,
+         module_attr_duplicate_count,
+-        impl_scan_time,
++        impl_shallow_scan_time,
+         impl_attr_count,
+-        impl_tensor_count,
++        impl_shallow_tensor_count,
+         impl_kept_count,
+         impl_duplicate_count,
+         module_count,
+-- 
+2.51.0.windows.1
+
