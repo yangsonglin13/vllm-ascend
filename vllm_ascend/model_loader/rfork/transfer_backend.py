@@ -146,34 +146,145 @@ def _iter_tensors_in_value(prefix: str, value: Any, visited_object_ids: set[int]
         yield from _iter_tensors_in_value(f"{prefix}.{attr_name}", attr_value, visited_object_ids, scan_objects)
 
 
-def _iter_transferable_tensors(model: nn.Module):
+def _try_collect_transferable_tensor(
+    name: str,
+    tensor: torch.Tensor,
+    seen_data_ptrs: set[int],
+    collected_tensors: list[tuple[str, torch.Tensor]],
+) -> tuple[bool, bool]:
+    if not _is_transferable_tensor(tensor):
+        return False, False
+
+    data_ptr = tensor.data_ptr()
+    if data_ptr in seen_data_ptrs:
+        return False, True
+
+    seen_data_ptrs.add(data_ptr)
+    collected_tensors.append((name, tensor))
+    return True, False
+
+
+def _collect_transferable_tensors(model: nn.Module) -> list[tuple[str, torch.Tensor]]:
+    scan_start_tic = time.time()
     seen_data_ptrs: set[int] = set()
+    collected_tensors: list[tuple[str, torch.Tensor]] = []
 
+    parameter_count = 0
+    parameter_kept_count = 0
+    parameter_duplicate_count = 0
+    parameter_scan_tic = time.time()
     for name, tensor in model.named_parameters():
-        if _is_transferable_tensor(tensor) and tensor.data_ptr() not in seen_data_ptrs:
-            seen_data_ptrs.add(tensor.data_ptr())
-            yield name, tensor
+        parameter_count += 1
+        is_kept, is_duplicate = _try_collect_transferable_tensor(
+            name,
+            tensor,
+            seen_data_ptrs,
+            collected_tensors,
+        )
+        parameter_kept_count += int(is_kept)
+        parameter_duplicate_count += int(is_duplicate)
+    parameter_scan_time = time.time() - parameter_scan_tic
 
+    buffer_count = 0
+    buffer_kept_count = 0
+    buffer_duplicate_count = 0
+    buffer_scan_tic = time.time()
     for name, tensor in model.named_buffers():
-        if _is_transferable_tensor(tensor) and tensor.data_ptr() not in seen_data_ptrs:
-            seen_data_ptrs.add(tensor.data_ptr())
-            yield name, tensor
+        buffer_count += 1
+        is_kept, is_duplicate = _try_collect_transferable_tensor(
+            name,
+            tensor,
+            seen_data_ptrs,
+            collected_tensors,
+        )
+        buffer_kept_count += int(is_kept)
+        buffer_duplicate_count += int(is_duplicate)
+    buffer_scan_time = time.time() - buffer_scan_tic
 
+    module_count = 0
+    module_attr_count = 0
+    module_attr_tensor_count = 0
+    module_attr_kept_count = 0
+    module_attr_duplicate_count = 0
+    module_attr_scan_time = 0.0
+    impl_attr_count = 0
+    impl_tensor_count = 0
+    impl_kept_count = 0
+    impl_duplicate_count = 0
+    impl_scan_time = 0.0
+    module_scan_tic = time.time()
     # Some Ascend post-load paths replace checkpoint parameters with runtime
     # tensors stored as plain module attributes, e.g. MLA/SFA W_UV and W_UK_T.
     for module_prefix, module in model.named_modules():
+        module_count += 1
         for attr_name, attr_value in vars(module).items():
             if attr_name.startswith("_") or isinstance(attr_value, nn.Module):
                 continue
 
             scan_objects = attr_name == "impl"
-            for tensor_name, tensor in _iter_tensors_in_value(attr_name, attr_value, set(), scan_objects):
-                if not _is_transferable_tensor(tensor) or tensor.data_ptr() in seen_data_ptrs:
-                    continue
+            attr_scan_tic = time.time()
+            attr_tensors = list(_iter_tensors_in_value(attr_name, attr_value, set(), scan_objects))
+            attr_scan_time = time.time() - attr_scan_tic
+            if scan_objects:
+                impl_attr_count += 1
+                impl_tensor_count += len(attr_tensors)
+                impl_scan_time += attr_scan_time
+            else:
+                module_attr_count += 1
+                module_attr_tensor_count += len(attr_tensors)
+                module_attr_scan_time += attr_scan_time
 
-                seen_data_ptrs.add(tensor.data_ptr())
+            for tensor_name, tensor in attr_tensors:
                 full_name = f"{module_prefix}.{tensor_name}" if module_prefix else tensor_name
-                yield full_name, tensor
+                is_kept, is_duplicate = _try_collect_transferable_tensor(
+                    full_name,
+                    tensor,
+                    seen_data_ptrs,
+                    collected_tensors,
+                )
+                if scan_objects:
+                    impl_kept_count += int(is_kept)
+                    impl_duplicate_count += int(is_duplicate)
+                else:
+                    module_attr_kept_count += int(is_kept)
+                    module_attr_duplicate_count += int(is_duplicate)
+    module_scan_time = time.time() - module_scan_tic
+
+    logger.info(
+        "iter_transferable_tensors details: total=%.4fs, "
+        "named_parameters=%.4fs/%d/%d/%d, named_buffers=%.4fs/%d/%d/%d, "
+        "module_loop=%.4fs, module_attrs=%.4fs/%d/%d/%d/%d, "
+        "impl_recursive_attrs=%.4fs/%d/%d/%d/%d, "
+        "modules=%d, tensors=%d, unique_ptrs=%d",
+        time.time() - scan_start_tic,
+        parameter_scan_time,
+        parameter_count,
+        parameter_kept_count,
+        parameter_duplicate_count,
+        buffer_scan_time,
+        buffer_count,
+        buffer_kept_count,
+        buffer_duplicate_count,
+        module_scan_time,
+        module_attr_scan_time,
+        module_attr_count,
+        module_attr_tensor_count,
+        module_attr_kept_count,
+        module_attr_duplicate_count,
+        impl_scan_time,
+        impl_attr_count,
+        impl_tensor_count,
+        impl_kept_count,
+        impl_duplicate_count,
+        module_count,
+        len(collected_tensors),
+        len(seen_data_ptrs),
+    )
+    return collected_tensors
+
+
+def _iter_transferable_tensors(model: nn.Module):
+    yield from _collect_transferable_tensors(model)
 
 
 def _block_contains_weight_ptr(address: int, size: int, sorted_weight_ptrs: list[int]) -> bool:
@@ -608,8 +719,7 @@ def get_remote_instance_weight_shape_info(seed_url: str, local_seed_key: str):
         parse_shape_time = time.time() - parse_shape_tic
         if info is None or isinstance(info, dict):
             logger.info(
-                "get_remote_instance_weight_shape_info details: "
-                "get_shape=%.4fs, parse_shape=%.4fs, shapes=%d",
+                "get_remote_instance_weight_shape_info details: get_shape=%.4fs, parse_shape=%.4fs, shapes=%d",
                 get_shape_time,
                 parse_shape_time,
                 len(info) if isinstance(info, dict) else 0,
