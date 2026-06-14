@@ -112,6 +112,12 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
     # Whether to use MultiBlockPool for KV cache management
     "VLLM_ASCEND_APPLY_DSV4_PATCH": lambda: bool(int(os.getenv("VLLM_ASCEND_APPLY_DSV4_PATCH", "0"))),
+    # Whether RFork recursively scans tensors nested under attention impl objects.
+    # 0: default shallow scan for startup performance.
+    # 1: compatibility/debug fallback for models with required runtime tensors
+    #    hidden in nested impl objects. This can significantly slow down weight
+    #    registration on large models. This variable is not sensitive.
+    "VLLM_ASCEND_RFORK_SCAN_IMPL_RECURSIVE": lambda: bool(int(os.getenv("VLLM_ASCEND_RFORK_SCAN_IMPL_RECURSIVE", "0"))),
 }
 
 # end-env-vars-definition

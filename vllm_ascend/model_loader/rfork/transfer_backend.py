@@ -24,6 +24,8 @@ from torch import nn
 from vllm.logger import logger
 from vllm.utils.network_utils import get_ip, get_open_port, join_host_port
 
+from vllm_ascend import envs
+
 MAX_TRANSFER_CHUNK_BYTES = 1024**3
 MAX_TRANSFER_CHUNK_WEIGHTS = 512
 
@@ -222,6 +224,7 @@ def _collect_transferable_tensors(model: nn.Module) -> list[tuple[str, torch.Ten
     impl_kept_count = 0
     impl_duplicate_count = 0
     impl_shallow_scan_time = 0.0
+    impl_recursive_scan_enabled = envs.VLLM_ASCEND_RFORK_SCAN_IMPL_RECURSIVE
     module_scan_tic = time.time()
     # Some Ascend post-load paths replace checkpoint parameters with runtime
     # tensors stored as plain module attributes, e.g. MLA/SFA W_UV and W_UK_T.
@@ -233,7 +236,10 @@ def _collect_transferable_tensors(model: nn.Module) -> list[tuple[str, torch.Ten
 
             attr_scan_tic = time.time()
             if attr_name == "impl":
-                attr_tensors = list(_iter_tensors_in_public_attrs(attr_name, attr_value))
+                if impl_recursive_scan_enabled:
+                    attr_tensors = list(_iter_tensors_in_value(attr_name, attr_value, set(), scan_objects=True))
+                else:
+                    attr_tensors = list(_iter_tensors_in_public_attrs(attr_name, attr_value))
             else:
                 attr_tensors = list(_iter_tensors_in_value(attr_name, attr_value, set()))
             attr_scan_time = time.time() - attr_scan_tic
@@ -266,7 +272,7 @@ def _collect_transferable_tensors(model: nn.Module) -> list[tuple[str, torch.Ten
         "iter_transferable_tensors details: total=%.4fs, "
         "named_parameters=%.4fs/%d/%d/%d, named_buffers=%.4fs/%d/%d/%d, "
         "module_loop=%.4fs, module_attrs=%.4fs/%d/%d/%d/%d, "
-        "impl_shallow_attrs=%.4fs/%d/%d/%d/%d, "
+        "impl_attrs=%.4fs/%d/%d/%d/%d, impl_recursive=%s, "
         "modules=%d, tensors=%d, unique_ptrs=%d",
         time.time() - scan_start_tic,
         parameter_scan_time,
@@ -288,6 +294,7 @@ def _collect_transferable_tensors(model: nn.Module) -> list[tuple[str, torch.Ten
         impl_shallow_tensor_count,
         impl_kept_count,
         impl_duplicate_count,
+        impl_recursive_scan_enabled,
         module_count,
         len(collected_tensors),
         len(seen_data_ptrs),
