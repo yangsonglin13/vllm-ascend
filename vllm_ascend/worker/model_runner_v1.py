@@ -130,6 +130,7 @@ from vllm_ascend.eplb.core.eplb_device_transfer_loader import D2DExpertWeightLoa
 from vllm_ascend.eplb.core.eplb_worker import EplbProcess
 from vllm_ascend.eplb.eplb_updator import EplbUpdator
 from vllm_ascend.eplb.utils import model_register
+from vllm_ascend.model_loader.load_timing import record_model_loader_stage_timing
 from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
 from vllm_ascend.patch.worker.patch_draft_quarot import patch_load_weights
 from vllm_ascend.quantization.utils import enable_fa_quant
@@ -3593,6 +3594,12 @@ class NPUModelRunner(GPUModelRunner):
 
     def load_model(self) -> None:
         load_model_start_time = time.perf_counter()
+        main_get_model_time = 0.0
+        drafter_load_model_time = 0.0
+        lora_load_model_time = 0.0
+        offloader_post_init_time = 0.0
+        graph_wrapper_time = 0.0
+        start_dump_data_time = 0.0
         logger.info("Starting to load model %s...", self.model_config.model)
 
         if self.ascend_config.mix_placement:
@@ -3609,7 +3616,19 @@ class NPUModelRunner(GPUModelRunner):
                     return
                 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
                 DefaultModelLoader._init_ep_weight_filter = mock_pass
-            self.model: nn.Module = get_model(vllm_config=self.vllm_config)
+            main_get_model_start_time = time.perf_counter()
+            with record_model_loader_stage_timing("model_runner_main_get_model") as main_loader_timing:
+                self.model: nn.Module = get_model(vllm_config=self.vllm_config)
+            main_get_model_time = time.perf_counter() - main_get_model_start_time
+            logger.info(
+                "Model runner main get_model details: total=%.2fs, "
+                "default_load_weights=%.2fs/%d, process_weights_after_loading=%.2fs/%d",
+                main_get_model_time,
+                main_loader_timing.default_load_weights_time,
+                main_loader_timing.default_load_weights_calls,
+                main_loader_timing.process_weights_after_loading_time,
+                main_loader_timing.process_weights_after_loading_calls,
+            )
             for name, _ in self.model.named_parameters():
                 # sinks is a kind of parameter in attention
                 # only set in weight name
@@ -3624,7 +3643,19 @@ class NPUModelRunner(GPUModelRunner):
                 if self.vllm_config.quant_config is not None:
                     patch_load_weights(self.vllm_config)
                 with get_tp_context(self.drafter):
-                    self.drafter.load_model(self.model)
+                    drafter_load_model_start_time = time.perf_counter()
+                    with record_model_loader_stage_timing("model_runner_drafter_load_model") as drafter_loader_timing:
+                        self.drafter.load_model(self.model)
+                    drafter_load_model_time = time.perf_counter() - drafter_load_model_start_time
+                    logger.info(
+                        "Model runner drafter load_model details: total=%.2fs, "
+                        "default_load_weights=%.2fs/%d, process_weights_after_loading=%.2fs/%d",
+                        drafter_load_model_time,
+                        drafter_loader_timing.default_load_weights_time,
+                        drafter_loader_timing.default_load_weights_calls,
+                        drafter_loader_timing.process_weights_after_loading_time,
+                        drafter_loader_timing.process_weights_after_loading_calls,
+                    )
                 if self.use_aux_hidden_state_outputs:
                     from vllm.model_executor.models.interfaces import supports_eagle3
                     if not supports_eagle3(self.model):
@@ -3638,15 +3669,20 @@ class NPUModelRunner(GPUModelRunner):
                     self.model.set_aux_hidden_state_layers(aux_layers)
 
             if self.lora_config:
+                lora_load_model_start_time = time.perf_counter()
                 self.model = self.load_lora_model(self.model, self.vllm_config, self.device)
+                lora_load_model_time = time.perf_counter() - lora_load_model_start_time
         self.model_memory_usage = m.consumed_memory
         logger.info("Loading model weights took %.4f GB", m.consumed_memory / float(2**30))
 
         from vllm.model_executor.offloader.base import get_offloader
+        offloader_post_init_start_time = time.perf_counter()
         get_offloader().post_init()
+        offloader_post_init_time = time.perf_counter() - offloader_post_init_start_time
 
         # wrap the model with full graph wrapper if needed.
         if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
+            graph_wrapper_start_time = time.perf_counter()
             self.update_stream: torch.npu.Stream = torch.npu.Stream()
             self.model = ACLGraphWrapper(
                 self.model,
@@ -3655,13 +3691,38 @@ class NPUModelRunner(GPUModelRunner):
                 use_eagle=self.use_eagle,
                 enable_enpu=self.enable_enpu,
             )
+            graph_wrapper_time = time.perf_counter() - graph_wrapper_start_time
 
         if self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
+            start_dump_data_start_time = time.perf_counter()
             self._start_dump_data()
+            start_dump_data_time = time.perf_counter() - start_dump_data_start_time
 
+        load_model_total_time = time.perf_counter() - load_model_start_time
+        accounted_time = (
+            main_get_model_time
+            + drafter_load_model_time
+            + lora_load_model_time
+            + offloader_post_init_time
+            + graph_wrapper_time
+            + start_dump_data_time
+        )
+        logger.info(
+            "Model runner load_model stage details: main_get_model=%.2fs, "
+            "drafter_load_model=%.2fs, lora_load_model=%.2fs, "
+            "offloader_post_init=%.2fs, graph_wrapper=%.2fs, "
+            "start_dump_data=%.2fs, other=%.2fs",
+            main_get_model_time,
+            drafter_load_model_time,
+            lora_load_model_time,
+            offloader_post_init_time,
+            graph_wrapper_time,
+            start_dump_data_time,
+            load_model_total_time - accounted_time,
+        )
         logger.info(
             "Model runner load_model total time: %.2f seconds, model=%s, load_format=%s, has_drafter=%s",
-            time.perf_counter() - load_model_start_time,
+            load_model_total_time,
             self.model_config.model,
             getattr(self.load_config, "load_format", None),
             self.drafter is not None,

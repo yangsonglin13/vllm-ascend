@@ -34,6 +34,7 @@ from vllm.model_executor.model_loader.utils import (
 )
 from vllm.utils.torch_utils import set_default_torch_dtype
 
+from vllm_ascend.model_loader.load_timing import record_model_loader_stage_timing
 from vllm_ascend.model_loader.rfork.rfork_worker import RForkWorker
 
 
@@ -240,13 +241,16 @@ class RForkModelLoader(BaseModelLoader):
                     "RFork load_model total time: %.2f seconds, seed_lookup=%.2fs, "
                     "initialize_model=%.2fs, process_weights_after_loading=%.2fs, "
                     "transfer=%.2fs, start_seed_service=%.2fs, "
-                    "processed_layout_transfer=%s, is_draft_model=%s",
+                    "common=%.2fs, rfork_unique=%.2fs, processed_layout_transfer=%s, "
+                    "is_draft_model=%s",
                     time.time() - load_model_start_time,
                     seed_lookup_time,
                     initialize_model_time,
                     process_weights_time,
                     transfer_time,
                     seed_service_time,
+                    initialize_model_time + process_weights_time,
+                    seed_lookup_time + transfer_time + seed_service_time,
                     processed_layout_transfer,
                     getattr(rfork_worker.seed_protocol, "is_draft_worker", False),
                 )
@@ -270,17 +274,33 @@ class RForkModelLoader(BaseModelLoader):
                 from vllm.model_executor.model_loader import get_model
 
                 try:
+                    rfork_attempt_before_fallback_time = time.time() - load_model_start_time
                     fallback_start_time = time.time()
-                    model = get_model(
-                        vllm_config=vllm_config,
-                        model_config=model_config,
-                        load_config=fallback_load_config,
-                        prefix=prefix,
+                    with record_model_loader_stage_timing("rfork_fallback_default") as fallback_loader_timing:
+                        model = get_model(
+                            vllm_config=vllm_config,
+                            model_config=model_config,
+                            load_config=fallback_load_config,
+                            prefix=prefix,
+                        )
+                    fallback_load_time = time.time() - fallback_start_time
+                    total_load_time = time.time() - load_model_start_time
+                    logger.info(
+                        "RFork fallback default details: get_model=%.2fs, "
+                        "default_load_weights=%.2fs/%d, process_weights_after_loading=%.2fs/%d, "
+                        "rfork_attempt_before_fallback=%.2fs, total=%.2fs",
+                        fallback_load_time,
+                        fallback_loader_timing.default_load_weights_time,
+                        fallback_loader_timing.default_load_weights_calls,
+                        fallback_loader_timing.process_weights_after_loading_time,
+                        fallback_loader_timing.process_weights_after_loading_calls,
+                        rfork_attempt_before_fallback_time,
+                        total_load_time,
                     )
                     logger.info(
                         "RFork fallback default load_model time: %.2f seconds, total time: %.2f seconds",
-                        time.time() - fallback_start_time,
-                        time.time() - load_model_start_time,
+                        fallback_load_time,
+                        total_load_time,
                     )
                 except Exception:
                     logger.exception("RFork fallback default loader failed.")
