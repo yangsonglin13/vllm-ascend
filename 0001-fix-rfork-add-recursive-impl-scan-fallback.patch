@@ -1,0 +1,85 @@
+From eb0aa4d4075b847126151272a4938a219cf4759a Mon Sep 17 00:00:00 2001
+From: yangsonglin13 <yangsonglin566@gmail.com>
+Date: Sun, 14 Jun 2026 23:42:40 +0800
+Subject: [PATCH 1/2] fix(rfork): add recursive impl scan fallback
+
+Add a compatibility fallback for RFork tensor discovery so deployments can restore recursive impl scanning when a model hides required runtime tensors under nested impl objects.
+
+The default path keeps the optimized shallow impl scan, while VLLM_ASCEND_RFORK_SCAN_IMPL_RECURSIVE=1 restores the previous recursive behavior for debugging or compatibility.
+
+Signed-off-by: yangsonglin13 <yangsonglin566@gmail.com>
+---
+ vllm_ascend/envs.py                                |  6 ++++++
+ vllm_ascend/model_loader/rfork/transfer_backend.py | 11 +++++++++--
+ 2 files changed, 15 insertions(+), 2 deletions(-)
+
+diff --git a/vllm_ascend/envs.py b/vllm_ascend/envs.py
+index 4d864839..c8ba9bc1 100644
+--- a/vllm_ascend/envs.py
++++ b/vllm_ascend/envs.py
+@@ -112,6 +112,12 @@ env_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+     # Whether to use MultiBlockPool for KV cache management
+     "VLLM_ASCEND_APPLY_DSV4_PATCH": lambda: bool(int(os.getenv("VLLM_ASCEND_APPLY_DSV4_PATCH", "0"))),
++    # Whether RFork recursively scans tensors nested under attention impl objects.
++    # 0: default shallow scan for startup performance.
++    # 1: compatibility/debug fallback for models with required runtime tensors
++    #    hidden in nested impl objects. This can significantly slow down weight
++    #    registration on large models. This variable is not sensitive.
++    "VLLM_ASCEND_RFORK_SCAN_IMPL_RECURSIVE": lambda: bool(int(os.getenv("VLLM_ASCEND_RFORK_SCAN_IMPL_RECURSIVE", "0"))),
+ }
+ 
+ # end-env-vars-definition
+diff --git a/vllm_ascend/model_loader/rfork/transfer_backend.py b/vllm_ascend/model_loader/rfork/transfer_backend.py
+index 97e4c965..a8fbe9b4 100644
+--- a/vllm_ascend/model_loader/rfork/transfer_backend.py
++++ b/vllm_ascend/model_loader/rfork/transfer_backend.py
+@@ -24,6 +24,8 @@ from torch import nn
+ from vllm.logger import logger
+ from vllm.utils.network_utils import get_ip, get_open_port, join_host_port
+ 
++from vllm_ascend import envs
++
+ MAX_TRANSFER_CHUNK_BYTES = 1024**3
+ MAX_TRANSFER_CHUNK_WEIGHTS = 512
+ 
+@@ -222,6 +224,7 @@ def _collect_transferable_tensors(model: nn.Module) -> list[tuple[str, torch.Ten
+     impl_kept_count = 0
+     impl_duplicate_count = 0
+     impl_shallow_scan_time = 0.0
++    impl_recursive_scan_enabled = envs.VLLM_ASCEND_RFORK_SCAN_IMPL_RECURSIVE
+     module_scan_tic = time.time()
+     # Some Ascend post-load paths replace checkpoint parameters with runtime
+     # tensors stored as plain module attributes, e.g. MLA/SFA W_UV and W_UK_T.
+@@ -233,7 +236,10 @@ def _collect_transferable_tensors(model: nn.Module) -> list[tuple[str, torch.Ten
+ 
+             attr_scan_tic = time.time()
+             if attr_name == "impl":
+-                attr_tensors = list(_iter_tensors_in_public_attrs(attr_name, attr_value))
++                if impl_recursive_scan_enabled:
++                    attr_tensors = list(_iter_tensors_in_value(attr_name, attr_value, set(), scan_objects=True))
++                else:
++                    attr_tensors = list(_iter_tensors_in_public_attrs(attr_name, attr_value))
+             else:
+                 attr_tensors = list(_iter_tensors_in_value(attr_name, attr_value, set()))
+             attr_scan_time = time.time() - attr_scan_tic
+@@ -266,7 +272,7 @@ def _collect_transferable_tensors(model: nn.Module) -> list[tuple[str, torch.Ten
+         "iter_transferable_tensors details: total=%.4fs, "
+         "named_parameters=%.4fs/%d/%d/%d, named_buffers=%.4fs/%d/%d/%d, "
+         "module_loop=%.4fs, module_attrs=%.4fs/%d/%d/%d/%d, "
+-        "impl_shallow_attrs=%.4fs/%d/%d/%d/%d, "
++        "impl_attrs=%.4fs/%d/%d/%d/%d, impl_recursive=%s, "
+         "modules=%d, tensors=%d, unique_ptrs=%d",
+         time.time() - scan_start_tic,
+         parameter_scan_time,
+@@ -288,6 +294,7 @@ def _collect_transferable_tensors(model: nn.Module) -> list[tuple[str, torch.Ten
+         impl_shallow_tensor_count,
+         impl_kept_count,
+         impl_duplicate_count,
++        impl_recursive_scan_enabled,
+         module_count,
+         len(collected_tensors),
+         len(seen_data_ptrs),
+-- 
+2.51.0.windows.1
+
