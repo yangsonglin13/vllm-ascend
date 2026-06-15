@@ -1,0 +1,342 @@
+From 4e8528db6e1922bcb7afaa09086a531439710343 Mon Sep 17 00:00:00 2001
+From: yangsonglin13 <yangsonglin566@gmail.com>
+Date: Mon, 15 Jun 2026 20:53:33 +0800
+Subject: [PATCH] perf(rfork): log model load stage timing
+
+Add timing hooks for default loader weight loading and post-load processing so RFork fallback and disk-loading paths can be compared against successful RFork transfers.
+
+Also log model runner stage totals for main model loading, drafter loading, offloader initialization, graph wrapping, and remaining load_model overhead.
+
+Signed-off-by: yangsonglin13 <yangsonglin566@gmail.com>
+---
+ vllm_ascend/model_loader/load_timing.py       | 116 ++++++++++++++++++
+ .../model_loader/rfork/rfork_loader.py        |  36 ++++--
+ vllm_ascend/worker/model_runner_v1.py         |  69 ++++++++++-
+ 3 files changed, 209 insertions(+), 12 deletions(-)
+ create mode 100644 vllm_ascend/model_loader/load_timing.py
+
+diff --git a/vllm_ascend/model_loader/load_timing.py b/vllm_ascend/model_loader/load_timing.py
+new file mode 100644
+index 00000000..3296db9a
+--- /dev/null
++++ b/vllm_ascend/model_loader/load_timing.py
+@@ -0,0 +1,116 @@
++#
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++#
++
++import time
++from collections.abc import Callable, Iterator
++from contextlib import contextmanager
++from dataclasses import dataclass
++from functools import wraps
++from typing import Any
++
++from vllm.logger import logger
++
++
++@dataclass
++class ModelLoaderStageTiming:
++    label: str
++    default_load_weights_time: float = 0.0
++    default_load_weights_calls: int = 0
++    process_weights_after_loading_time: float = 0.0
++    process_weights_after_loading_calls: int = 0
++
++
++def _set_timed_attr(
++    patches: list[tuple[object, str, object]],
++    owner: object | None,
++    attr_name: str,
++    make_wrapper: Callable[[Any], Any],
++) -> None:
++    if owner is None or not hasattr(owner, attr_name):
++        return
++
++    original = getattr(owner, attr_name)
++    setattr(owner, attr_name, make_wrapper(original))
++    patches.append((owner, attr_name, original))
++
++
++@contextmanager
++def record_model_loader_stage_timing(label: str) -> Iterator[ModelLoaderStageTiming]:
++    timing = ModelLoaderStageTiming(label=label)
++    patches: list[tuple[object, str, object]] = []
++
++    def make_load_weights_wrapper(original):
++        @wraps(original)
++        def timed_load_weights(*args, **kwargs):
++            tic = time.perf_counter()
++            try:
++                return original(*args, **kwargs)
++            finally:
++                timing.default_load_weights_time += time.perf_counter() - tic
++                timing.default_load_weights_calls += 1
++
++        return timed_load_weights
++
++    def make_process_weights_wrapper(original):
++        @wraps(original)
++        def timed_process_weights(*args, **kwargs):
++            tic = time.perf_counter()
++            try:
++                return original(*args, **kwargs)
++            finally:
++                timing.process_weights_after_loading_time += time.perf_counter() - tic
++                timing.process_weights_after_loading_calls += 1
++
++        return timed_process_weights
++
++    try:
++        try:
++            from vllm.model_executor.model_loader import default_loader
++            from vllm.model_executor.model_loader import utils as loader_utils
++        except Exception as e:
++            logger.debug("Could not install model loader timing hooks for %s: %s", label, e)
++        else:
++            _set_timed_attr(
++                patches,
++                getattr(default_loader, "DefaultModelLoader", None),
++                "load_weights",
++                make_load_weights_wrapper,
++            )
++            _set_timed_attr(
++                patches,
++                loader_utils,
++                "process_weights_after_loading",
++                make_process_weights_wrapper,
++            )
++            _set_timed_attr(
++                patches,
++                default_loader,
++                "process_weights_after_loading",
++                make_process_weights_wrapper,
++            )
++        yield timing
++    finally:
++        for owner, attr_name, original in reversed(patches):
++            setattr(owner, attr_name, original)
++        logger.info(
++            "model_loader stage details: label=%s, default_load_weights=%.4fs/%d, "
++            "process_weights_after_loading=%.4fs/%d",
++            timing.label,
++            timing.default_load_weights_time,
++            timing.default_load_weights_calls,
++            timing.process_weights_after_loading_time,
++            timing.process_weights_after_loading_calls,
++        )
+diff --git a/vllm_ascend/model_loader/rfork/rfork_loader.py b/vllm_ascend/model_loader/rfork/rfork_loader.py
+index a121310d..63a12f1b 100644
+--- a/vllm_ascend/model_loader/rfork/rfork_loader.py
++++ b/vllm_ascend/model_loader/rfork/rfork_loader.py
+@@ -34,6 +34,7 @@ from vllm.model_executor.model_loader.utils import (
+ )
+ from vllm.utils.torch_utils import set_default_torch_dtype
+ 
++from vllm_ascend.model_loader.load_timing import record_model_loader_stage_timing
+ from vllm_ascend.model_loader.rfork.rfork_worker import RForkWorker
+ 
+ 
+@@ -240,13 +241,16 @@ class RForkModelLoader(BaseModelLoader):
+                     "RFork load_model total time: %.2f seconds, seed_lookup=%.2fs, "
+                     "initialize_model=%.2fs, process_weights_after_loading=%.2fs, "
+                     "transfer=%.2fs, start_seed_service=%.2fs, "
+-                    "processed_layout_transfer=%s, is_draft_model=%s",
++                    "common=%.2fs, rfork_unique=%.2fs, processed_layout_transfer=%s, "
++                    "is_draft_model=%s",
+                     time.time() - load_model_start_time,
+                     seed_lookup_time,
+                     initialize_model_time,
+                     process_weights_time,
+                     transfer_time,
+                     seed_service_time,
++                    initialize_model_time + process_weights_time,
++                    seed_lookup_time + transfer_time + seed_service_time,
+                     processed_layout_transfer,
+                     getattr(rfork_worker.seed_protocol, "is_draft_worker", False),
+                 )
+@@ -270,17 +274,33 @@ class RForkModelLoader(BaseModelLoader):
+                 from vllm.model_executor.model_loader import get_model
+ 
+                 try:
++                    rfork_attempt_before_fallback_time = time.time() - load_model_start_time
+                     fallback_start_time = time.time()
+-                    model = get_model(
+-                        vllm_config=vllm_config,
+-                        model_config=model_config,
+-                        load_config=fallback_load_config,
+-                        prefix=prefix,
++                    with record_model_loader_stage_timing("rfork_fallback_default") as fallback_loader_timing:
++                        model = get_model(
++                            vllm_config=vllm_config,
++                            model_config=model_config,
++                            load_config=fallback_load_config,
++                            prefix=prefix,
++                        )
++                    fallback_load_time = time.time() - fallback_start_time
++                    total_load_time = time.time() - load_model_start_time
++                    logger.info(
++                        "RFork fallback default details: get_model=%.2fs, "
++                        "default_load_weights=%.2fs/%d, process_weights_after_loading=%.2fs/%d, "
++                        "rfork_attempt_before_fallback=%.2fs, total=%.2fs",
++                        fallback_load_time,
++                        fallback_loader_timing.default_load_weights_time,
++                        fallback_loader_timing.default_load_weights_calls,
++                        fallback_loader_timing.process_weights_after_loading_time,
++                        fallback_loader_timing.process_weights_after_loading_calls,
++                        rfork_attempt_before_fallback_time,
++                        total_load_time,
+                     )
+                     logger.info(
+                         "RFork fallback default load_model time: %.2f seconds, total time: %.2f seconds",
+-                        time.time() - fallback_start_time,
+-                        time.time() - load_model_start_time,
++                        fallback_load_time,
++                        total_load_time,
+                     )
+                 except Exception:
+                     logger.exception("RFork fallback default loader failed.")
+diff --git a/vllm_ascend/worker/model_runner_v1.py b/vllm_ascend/worker/model_runner_v1.py
+index ec78fec1..4e59a8ff 100644
+--- a/vllm_ascend/worker/model_runner_v1.py
++++ b/vllm_ascend/worker/model_runner_v1.py
+@@ -130,6 +130,7 @@ from vllm_ascend.eplb.core.eplb_device_transfer_loader import D2DExpertWeightLoa
+ from vllm_ascend.eplb.core.eplb_worker import EplbProcess
+ from vllm_ascend.eplb.eplb_updator import EplbUpdator
+ from vllm_ascend.eplb.utils import model_register
++from vllm_ascend.model_loader.load_timing import record_model_loader_stage_timing
+ from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
+ from vllm_ascend.patch.worker.patch_draft_quarot import patch_load_weights
+ from vllm_ascend.quantization.utils import enable_fa_quant
+@@ -3593,6 +3594,12 @@ class NPUModelRunner(GPUModelRunner):
+ 
+     def load_model(self) -> None:
+         load_model_start_time = time.perf_counter()
++        main_get_model_time = 0.0
++        drafter_load_model_time = 0.0
++        lora_load_model_time = 0.0
++        offloader_post_init_time = 0.0
++        graph_wrapper_time = 0.0
++        start_dump_data_time = 0.0
+         logger.info("Starting to load model %s...", self.model_config.model)
+ 
+         if self.ascend_config.mix_placement:
+@@ -3609,7 +3616,19 @@ class NPUModelRunner(GPUModelRunner):
+                     return
+                 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
+                 DefaultModelLoader._init_ep_weight_filter = mock_pass
+-            self.model: nn.Module = get_model(vllm_config=self.vllm_config)
++            main_get_model_start_time = time.perf_counter()
++            with record_model_loader_stage_timing("model_runner_main_get_model") as main_loader_timing:
++                self.model: nn.Module = get_model(vllm_config=self.vllm_config)
++            main_get_model_time = time.perf_counter() - main_get_model_start_time
++            logger.info(
++                "Model runner main get_model details: total=%.2fs, "
++                "default_load_weights=%.2fs/%d, process_weights_after_loading=%.2fs/%d",
++                main_get_model_time,
++                main_loader_timing.default_load_weights_time,
++                main_loader_timing.default_load_weights_calls,
++                main_loader_timing.process_weights_after_loading_time,
++                main_loader_timing.process_weights_after_loading_calls,
++            )
+             for name, _ in self.model.named_parameters():
+                 # sinks is a kind of parameter in attention
+                 # only set in weight name
+@@ -3624,7 +3643,19 @@ class NPUModelRunner(GPUModelRunner):
+                 if self.vllm_config.quant_config is not None:
+                     patch_load_weights(self.vllm_config)
+                 with get_tp_context(self.drafter):
+-                    self.drafter.load_model(self.model)
++                    drafter_load_model_start_time = time.perf_counter()
++                    with record_model_loader_stage_timing("model_runner_drafter_load_model") as drafter_loader_timing:
++                        self.drafter.load_model(self.model)
++                    drafter_load_model_time = time.perf_counter() - drafter_load_model_start_time
++                    logger.info(
++                        "Model runner drafter load_model details: total=%.2fs, "
++                        "default_load_weights=%.2fs/%d, process_weights_after_loading=%.2fs/%d",
++                        drafter_load_model_time,
++                        drafter_loader_timing.default_load_weights_time,
++                        drafter_loader_timing.default_load_weights_calls,
++                        drafter_loader_timing.process_weights_after_loading_time,
++                        drafter_loader_timing.process_weights_after_loading_calls,
++                    )
+                 if self.use_aux_hidden_state_outputs:
+                     from vllm.model_executor.models.interfaces import supports_eagle3
+                     if not supports_eagle3(self.model):
+@@ -3638,15 +3669,20 @@ class NPUModelRunner(GPUModelRunner):
+                     self.model.set_aux_hidden_state_layers(aux_layers)
+ 
+             if self.lora_config:
++                lora_load_model_start_time = time.perf_counter()
+                 self.model = self.load_lora_model(self.model, self.vllm_config, self.device)
++                lora_load_model_time = time.perf_counter() - lora_load_model_start_time
+         self.model_memory_usage = m.consumed_memory
+         logger.info("Loading model weights took %.4f GB", m.consumed_memory / float(2**30))
+ 
+         from vllm.model_executor.offloader.base import get_offloader
++        offloader_post_init_start_time = time.perf_counter()
+         get_offloader().post_init()
++        offloader_post_init_time = time.perf_counter() - offloader_post_init_start_time
+ 
+         # wrap the model with full graph wrapper if needed.
+         if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
++            graph_wrapper_start_time = time.perf_counter()
+             self.update_stream: torch.npu.Stream = torch.npu.Stream()
+             self.model = ACLGraphWrapper(
+                 self.model,
+@@ -3655,13 +3691,38 @@ class NPUModelRunner(GPUModelRunner):
+                 use_eagle=self.use_eagle,
+                 enable_enpu=self.enable_enpu,
+             )
++            graph_wrapper_time = time.perf_counter() - graph_wrapper_start_time
+ 
+         if self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
++            start_dump_data_start_time = time.perf_counter()
+             self._start_dump_data()
+-
++            start_dump_data_time = time.perf_counter() - start_dump_data_start_time
++
++        load_model_total_time = time.perf_counter() - load_model_start_time
++        accounted_time = (
++            main_get_model_time
++            + drafter_load_model_time
++            + lora_load_model_time
++            + offloader_post_init_time
++            + graph_wrapper_time
++            + start_dump_data_time
++        )
++        logger.info(
++            "Model runner load_model stage details: main_get_model=%.2fs, "
++            "drafter_load_model=%.2fs, lora_load_model=%.2fs, "
++            "offloader_post_init=%.2fs, graph_wrapper=%.2fs, "
++            "start_dump_data=%.2fs, other=%.2fs",
++            main_get_model_time,
++            drafter_load_model_time,
++            lora_load_model_time,
++            offloader_post_init_time,
++            graph_wrapper_time,
++            start_dump_data_time,
++            load_model_total_time - accounted_time,
++        )
+         logger.info(
+             "Model runner load_model total time: %.2f seconds, model=%s, load_format=%s, has_drafter=%s",
+-            time.perf_counter() - load_model_start_time,
++            load_model_total_time,
+             self.model_config.model,
+             getattr(self.load_config, "load_format", None),
+             self.drafter is not None,
+-- 
+2.51.0.windows.1
+
