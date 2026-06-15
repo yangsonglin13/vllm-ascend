@@ -3592,6 +3592,7 @@ class NPUModelRunner(GPUModelRunner):
             self.eplb_updator.warm_up_eplb()
 
     def load_model(self) -> None:
+        load_model_start_time = time.perf_counter()
         logger.info("Starting to load model %s...", self.model_config.model)
 
         if self.ascend_config.mix_placement:
@@ -3657,6 +3658,14 @@ class NPUModelRunner(GPUModelRunner):
 
         if self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
             self._start_dump_data()
+
+        logger.info(
+            "Model runner load_model total time: %.2f seconds, model=%s, load_format=%s, has_drafter=%s",
+            time.perf_counter() - load_model_start_time,
+            self.model_config.model,
+            getattr(self.load_config, "load_format", None),
+            self.drafter is not None,
+        )
 
     def _start_dump_data(self) -> None:
         if self.debugger is None or self._debugger_started:
