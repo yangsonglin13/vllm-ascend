@@ -1,0 +1,93 @@
+From ee356edd98a6e54db71e1d4164fab1891b39319f Mon Sep 17 00:00:00 2001
+From: yangsonglin13 <yangsonglin566@gmail.com>
+Date: Thu, 2 Jul 2026 14:59:12 +0800
+Subject: [PATCH] fix(kv-pool): support load failure block ids for yuanrong
+ backend
+
+Return Yuanrong get failure markers so KV pool can record failed block ids for recompute fallback. Update Yuanrong backend tests for successful, partial-failure, and exception get results.
+
+Signed-off-by: yangsonglin13 <yangsonglin566@gmail.com>
+---
+ .../distributed/ascend_store/test_backend.py   | 18 ++++++++++++++----
+ .../ascend_store/backend/yuanrong_backend.py   |  7 +++++--
+ 2 files changed, 19 insertions(+), 6 deletions(-)
+
+diff --git a/tests/ut/distributed/ascend_store/test_backend.py b/tests/ut/distributed/ascend_store/test_backend.py
+index 811ea640..b7d92d63 100644
+--- a/tests/ut/distributed/ascend_store/test_backend.py
++++ b/tests/ut/distributed/ascend_store/test_backend.py
+@@ -436,24 +436,34 @@ class TestYuanrongBackendMethods(unittest.TestCase):
+ 
+     def test_get_empty(self):
+         b = self._make_backend()
+-        b.get([], [], [])
++        result = b.get([], [], [])
++        self.assertEqual(result, [])
+         b._hetero_client.mget_h2d.assert_not_called()
+ 
+     def test_get(self):
+         b = self._make_backend()
+         b._hetero_client.mget_h2d.return_value = []
+-        b.get(["k1"], [[100]], [[10]])
++        result = b.get(["k1"], [[100]], [[10]])
++        self.assertEqual(result, [0])
+         b._hetero_client.mget_h2d.assert_called_once()
+ 
++    def test_get_partial_failure(self):
++        b = self._make_backend()
++        b._hetero_client.mget_h2d.return_value = ["k2"]
++        result = b.get(["k1", "k2", "k3"], [[100], [200], [300]], [[10], [20], [30]])
++        self.assertEqual(result, [0, 1, 0])
++
+     def test_get_failed_keys(self):
+         b = self._make_backend()
+         b._hetero_client.mget_h2d.return_value = ["k1"]
+-        b.get(["k1"], [[100]], [[10]])  # Should log error
++        result = b.get(["k1"], [[100]], [[10]])  # Should log error
++        self.assertEqual(result, [1])
+ 
+     def test_get_exception(self):
+         b = self._make_backend()
+         b._hetero_client.mget_h2d.side_effect = Exception("fail")
+-        b.get(["k1"], [[100]], [[10]])
++        result = b.get(["k1"], [[100]], [[10]])
++        self.assertIsNone(result)
+ 
+     def test_put_empty(self):
+         b = self._make_backend()
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/yuanrong_backend.py b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/yuanrong_backend.py
+index fdd1e8b5..0de2db26 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/yuanrong_backend.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/yuanrong_backend.py
+@@ -152,9 +152,9 @@ class YuanrongBackend(Backend):
+             )
+             return [0] * len(keys)
+ 
+-    def get(self, keys: list[str], addrs: list[list[int]], sizes: list[list[int]]):
++    def get(self, keys: list[str], addrs: list[list[int]], sizes: list[list[int]]) -> list[int] | None:
+         if len(keys) == 0:
+-            return
++            return []
+         failed_keys_for_log = keys
+         try:
+             self._ensure_device_ready()
+@@ -181,6 +181,8 @@ class YuanrongBackend(Backend):
+                     len(keys),
+                 )
+                 logger.debug("Failed to get key details. failed_keys=%s", failed_keys)
++            failed_set = set(failed_keys)
++            return [1 if k in failed_set else 0 for k in keys]
+         except Exception as exc:
+             logger.error(
+                 "Failed to get %d keys out of %d. Check network and yuanrong service.",
+@@ -193,6 +195,7 @@ class YuanrongBackend(Backend):
+                 type(exc).__name__,
+                 exc,
+             )
++            return None
+ 
+     def put(self, keys: list[str], addrs: list[list[int]], sizes: list[list[int]]):
+         if len(keys) == 0:
+-- 
+2.51.0.windows.1
+
