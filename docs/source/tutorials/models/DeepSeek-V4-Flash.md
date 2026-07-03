@@ -192,7 +192,7 @@ export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libjemalloc.so.2:$LD_PRELOAD
 export HCCL_BUFFSIZE=1024
 export VLLM_ASCEND_APPLY_DSV4_PATCH=1
 export VLLM_ASCEND_ENABLE_FLASHCOMM1=1
-export TASK_QUEUE_ENABLE=1   
+export TASK_QUEUE_ENABLE=1
 export HCCL_OP_EXPANSION_MODE="AIV"
 
 vllm serve /root/.cache/modelscope/hub/models/vllm-ascend/DeepSeek-V4-Flash-w8a8-mtp \
@@ -664,7 +664,7 @@ Before you start, please
                     }
             }
         }'
-                
+
     ```
 
 For each P instance, only these two configuration values need to be modified: “kv_port” and “engine_id”. The “engine_id” should start from 0 and increment sequentially, while the “kv_port” (e.g., “30100”) must be unique for each P instance, such as 30000, 30100, etc.

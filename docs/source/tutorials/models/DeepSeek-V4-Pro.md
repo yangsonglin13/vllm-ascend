@@ -752,7 +752,7 @@ Before you start, please
                 },
             "enable_cpu_binding":true,
             "recompute_scheduler_enable":true
-            }' 
+            }'
         ```
 
 Once the preparation is done, you can start the server with the following command on each node:
@@ -801,7 +801,7 @@ Before you start, please
    import os
    import subprocess
    import sys
-   
+
    def parse_args():
        parser = argparse.ArgumentParser()
        parser.add_argument(
@@ -847,7 +847,7 @@ Before you start, please
            help="Starting port for the engine."
        )
        return parser.parse_args()
-   
+
    args = parse_args()
    dp_size = args.dp_size
    tp_size = args.tp_size
@@ -858,7 +858,7 @@ Before you start, please
    dp_address = args.dp_address
    dp_rpc_port = args.dp_rpc_port
    vllm_start_port = args.vllm_start_port
-   
+
    def run_command(visible_devices, dp_rank, vllm_engine_port):
        command = [
            "bash",
@@ -872,13 +872,13 @@ Before you start, please
            str(tp_size),
        ]
        subprocess.run(command, check=True)
-   
+
    if __name__ == "__main__":
        template_path = "./run_dp_template.sh"
        if not os.path.exists(template_path):
            print(f"Template file {template_path} does not exist.")
            sys.exit(1)
-   
+
        processes = []
        num_cards = dp_size_local * tp_size
        for i in range(dp_size_local):
@@ -890,7 +890,7 @@ Before you start, please
                                                    vllm_engine_port))
            processes.append(process)
            process.start()
-   
+
        for process in processes:
            process.join()
    ```
@@ -902,16 +902,16 @@ Before you start, please
       ```shell
       nic_name="xxxx" # change to your own nic name
       local_ip=xx.xx.xx.1/2/3/4 # change to your own ip
-      
+
       export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libjemalloc.so.2:$LD_PRELOAD
       export HCCL_OP_EXPANSION_MODE="AIV"
       export TASK_QUEUE_ENABLE=1
-      
+
       export VLLM_RPC_TIMEOUT=3600000
       export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=30000
       export HCCL_EXEC_TIMEOUT=204
       export HCCL_CONNECT_TIMEOUT=1200
-      
+
       export HCCL_IF_IP=$local_ip
       export GLOO_SOCKET_IFNAME=$nic_name
       export TP_SOCKET_IFNAME=$nic_name
@@ -924,11 +924,11 @@ Before you start, please
       sysctl -w vm.swappiness=0
       sysctl -w kernel.numa_balancing=0
       sysctl kernel.sched_migration_cost_ns=50000
-      
+
       export VLLM_ASCEND_ENABLE_FLASHCOMM1=1
       export ASCEND_RT_VISIBLE_DEVICES=$1
       export VLLM_ASCEND_APPLY_DSV4_PATCH=1
-      
+
       vllm serve /root/.cache/modelscope/hub/models/vllm-ascend/DeepSeek-V4-Pro-w4a8-mtp \
           --host 0.0.0.0 \
           --port $2 \
@@ -980,16 +980,16 @@ Before you start, please
       ```shell
       nic_name="xxxx" # change to your own nic name
       local_ip=xx.xx.xx.5/6/7/8 # change to your own ip
-      
+
       export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libjemalloc.so.2:$LD_PRELOAD
       export HCCL_OP_EXPANSION_MODE="AIV"
       export TASK_QUEUE_ENABLE=1
-      
+
       export VLLM_RPC_TIMEOUT=3600000
       export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=30000
       export HCCL_EXEC_TIMEOUT=204
       export HCCL_CONNECT_TIMEOUT=1200
-      
+
       export HCCL_IF_IP=$local_ip
       export GLOO_SOCKET_IFNAME=$nic_name
       export TP_SOCKET_IFNAME=$nic_name
@@ -1002,10 +1002,10 @@ Before you start, please
       sysctl -w vm.swappiness=0
       sysctl -w kernel.numa_balancing=0
       sysctl kernel.sched_migration_cost_ns=50000
-      
+
       export ASCEND_RT_VISIBLE_DEVICES=$1
       export VLLM_ASCEND_APPLY_DSV4_PATCH=1
-      
+
       vllm serve /root/.cache/modelscope/hub/models/vllm-ascend/DeepSeek-V4-Pro-w4a8-mtp \
           --host 0.0.0.0 \
           --port $2 \
