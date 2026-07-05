@@ -12,6 +12,7 @@ from vllm.logger import logger
 from vllm.utils.network_utils import split_host_port
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.backend import Backend
+from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
 
 def _sum_transfer_bytes(sizes: list[list[int]]) -> int:
@@ -120,6 +121,9 @@ class YuanrongBackend(Backend):
             enable_remote_h2d=self.config.enable_remote_h2d,
         )
         self._hetero_client.init()
+        self._is_a2 = get_ascend_device_type() in {AscendDeviceType.A2}
+        self._registered_buffers: tuple[list[int], list[int]] | None = None
+        self._buffers_registered = False
 
     def _ensure_device_ready(self):
         if self._helper._device_id is None:
@@ -131,9 +135,19 @@ class YuanrongBackend(Backend):
         self._helper._device_id = int(torch.npu.current_device())
 
     def register_buffer(self, ptrs: list[int], lengths: list[int]):
-        # Yuanrong APIs consume device pointers directly when building blob
-        # lists. No explicit pre-registration is required.
-        self._ensure_device_ready()
+        self._registered_buffers = (list(ptrs), list(lengths))
+        self._register_buffers_if_needed()
+
+    def _register_buffers_if_needed(self):
+        if self._is_a2:
+            return
+        if not self.config.enable_remote_h2d:
+            return
+        if self._registered_buffers is None or self._buffers_registered:
+            return
+        ptrs, lengths = self._registered_buffers
+        self._hetero_client.pre_register_device_memory(ptrs, lengths)  # type: ignore[union-attr]
+        self._buffers_registered = True
 
     def exists(self, keys: list[str]) -> list[int]:
         if len(keys) == 0:
