@@ -28,6 +28,7 @@ from vllm_ascend.model_loader.rfork.rfork_loader import (
     _is_dynamic_eplb_enabled,
     _is_layer_sharding_enabled,
     _make_fallback_load_config,
+    _shared_expert_consistency_check_disabled,
 )
 from vllm_ascend.model_loader.rfork.seed_protocol import get_local_seed_key
 
@@ -511,3 +512,45 @@ def test_rfork_native_eplb_uses_default_loader(monkeypatch):
     assert captured["load_config"] is not load_config
     assert captured["load_config"].load_format == "auto"
     assert captured["load_config"].model_loader_extra_config == {}
+
+
+def test_shared_expert_consistency_check_disabled_neutralizes_and_restores():
+    """Inside the context, AscendFusedMoE validators must be no-ops so the
+    pre-transfer post-process does not run a forward on empty weights. On exit
+    (including exceptions), the original validators must be restored."""
+    import vllm_ascend.ops.fused_moe.fused_moe as fused_moe_module
+
+    class _FakeAscendFusedMoE:
+        pass
+
+    def _real_validator(*args, **kwargs):
+        raise AssertionError("Real validator must not run while disabled.")
+
+    fused_moe_layer = _FakeAscendFusedMoE()
+    fused_moe_layer._validate_shared_expert_consistency = _real_validator
+    other_layer = SimpleNamespace()
+
+    class _FakeModule:
+        def modules(self):
+            return iter([self, fused_moe_layer, other_layer])
+
+    fake_module = _FakeModule()
+
+    real_fused_moe_cls = fused_moe_module.AscendFusedMoE
+    fused_moe_module.AscendFusedMoE = _FakeAscendFusedMoE
+    try:
+        # While disabled, calling the validator must not raise.
+        with _shared_expert_consistency_check_disabled(fake_module):
+            assert fused_moe_layer._validate_shared_expert_consistency is not _real_validator
+            fused_moe_layer._validate_shared_expert_consistency()
+            assert not hasattr(other_layer, "_validate_shared_expert_consistency")
+        # After exit, the original validator is restored.
+        assert fused_moe_layer._validate_shared_expert_consistency is _real_validator
+
+        # Restoration must happen even when the wrapped block raises.
+        with pytest.raises(RuntimeError, match="boom"):
+            with _shared_expert_consistency_check_disabled(fake_module):
+                raise RuntimeError("boom")
+        assert fused_moe_layer._validate_shared_expert_consistency is _real_validator
+    finally:
+        fused_moe_module.AscendFusedMoE = real_fused_moe_cls

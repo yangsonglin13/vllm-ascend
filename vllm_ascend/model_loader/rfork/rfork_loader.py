@@ -17,6 +17,7 @@
 import gc
 import os
 import time
+from contextlib import contextmanager
 from copy import copy
 
 import torch
@@ -105,6 +106,40 @@ def _make_fallback_load_config(load_config: LoadConfig) -> LoadConfig:
     fallback_load_config.load_format = "auto"
     fallback_load_config.model_loader_extra_config = {}
     return fallback_load_config
+
+
+@contextmanager
+def _shared_expert_consistency_check_disabled(model: Module):
+    """Temporarily neutralize the FusedMoE shared-expert consistency check.
+
+    ``AscendFusedMoE`` wraps ``process_weights_after_loading`` to run a
+    consistency forward pass after weights are processed. RFork's pre-transfer
+    post-process builds the post-load tensor layout *before* weights are
+    transferred from the seed, so the forward would run on empty weights and
+    raise on NaN. Swap the validator for a no-op on every ``AscendFusedMoE``
+    instance for the duration of the wrapped call, then restore — even on
+    exception. Normal loads are untouched.
+    """
+    from vllm_ascend.ops.fused_moe.fused_moe import AscendFusedMoE
+
+    saved: dict[int, object] = {}
+    for module in model.modules():
+        if isinstance(module, AscendFusedMoE):
+            # Fail loud if the upstream validator is renamed/removed, rather
+            # than silently leaving the real check in place (which would bring
+            # Bug #1 back). The fallback (Bug #2 fix) would keep the worker
+            # alive, but an explicit failure surfaces the drift immediately.
+            assert hasattr(module, "_validate_shared_expert_consistency"), (
+                "AscendFusedMoE no longer exposes _validate_shared_expert_consistency; "
+                "update _shared_expert_consistency_check_disabled."
+            )
+            saved[id(module)] = (module, module._validate_shared_expert_consistency)
+            module._validate_shared_expert_consistency = lambda *args, **kwargs: None
+    try:
+        yield
+    finally:
+        for module, original in saved.values():
+            module._validate_shared_expert_consistency = original
 
 
 def _is_layer_sharding_enabled(vllm_config: VllmConfig) -> bool:
@@ -274,7 +309,8 @@ class RForkModelLoader(BaseModelLoader):
 
                 if processed_layout_transfer:
                     logger.info("RFork uses post-load tensor layout transfer for quantized model.")
-                    process_weights_after_loading(model, model_config, target_device)
+                    with _shared_expert_consistency_check_disabled(model):
+                        process_weights_after_loading(model, model_config, target_device)
 
                 weight_load_start_time = time.perf_counter()
                 if not rfork_worker.pre_transfer(model):
