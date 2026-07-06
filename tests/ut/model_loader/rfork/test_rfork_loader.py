@@ -28,6 +28,7 @@ from vllm_ascend.model_loader.rfork.rfork_loader import (
     _is_dynamic_eplb_enabled,
     _is_layer_sharding_enabled,
     _make_fallback_load_config,
+    _reset_process_global_model_state,
     _shared_expert_consistency_check_disabled,
 )
 from vllm_ascend.model_loader.rfork.seed_protocol import get_local_seed_key
@@ -512,6 +513,71 @@ def test_rfork_native_eplb_uses_default_loader(monkeypatch):
     assert captured["load_config"] is not load_config
     assert captured["load_config"].load_format == "auto"
     assert captured["load_config"].model_loader_extra_config == {}
+
+
+def test_rfork_fallback_clears_process_global_state_before_reinit(monkeypatch):
+    """RFork fallback re-runs get_model in the same process; the process-global
+    layer registries populated by the first initialize_model must be cleared
+    before re-init, otherwise DeepseekV32IndexerCache/Attention/FusedMoE raise
+    `Duplicate layer name`."""
+    import vllm.model_executor.model_loader as model_loader
+    from vllm.model_executor.layers.rotary_embedding import _ROPE_DICT
+
+    load_config = DummyLoadConfig({"model_url": "model", "model_deploy_strategy_name": "tp8"})
+    loader = RForkModelLoader(load_config)
+    model_config = SimpleNamespace(dtype=torch.float32, model="/models/test", quantization="ascend")
+    vllm_config = _vllm_config(model_config=model_config)
+    vllm_config.compilation_config = SimpleNamespace(
+        static_forward_context={"model.layers.0.self_attn.indexer.k_cache": object()},
+        static_all_moe_layers=["model.layers.0.mlp"],
+    )
+    _ROPE_DICT[("identity", 1.0, 32768)] = object()
+
+    expected_model = SimpleNamespace()
+    get_model_calls = []
+
+    def fake_get_model(**kwargs):
+        get_model_calls.append(kwargs)
+        if len(get_model_calls) == 1:
+            # Simulate Bug #1: pre-transfer post-process raises on NaN.
+            raise ValueError("FusedMoE shared experts split computation does not match.")
+        return expected_model
+
+    rfork_worker = SimpleNamespace(
+        is_seed_available=lambda: True,
+        pre_transfer=lambda model: True,
+        transfer=lambda model: True,
+        post_transfer=lambda: True,
+        reset_transfer_state=lambda: None,
+        start_seed_service=lambda model: None,
+    )
+
+    monkeypatch.setattr(loader, "_ensure_rfork_worker", lambda vc, mc: rfork_worker)
+    monkeypatch.setattr(model_loader, "get_model", fake_get_model)
+    monkeypatch.setattr(
+        "vllm_ascend.model_loader.rfork.rfork_loader.initialize_model",
+        lambda **kwargs: SimpleNamespace(modules=lambda: iter([]), eval=lambda: expected_model),
+    )
+    monkeypatch.setattr(
+        "vllm_ascend.model_loader.rfork.rfork_loader.process_weights_after_loading",
+        lambda *args, **kwargs: None,
+    )
+
+    model = loader.load_model(vllm_config=vllm_config, model_config=model_config)
+
+    assert model is expected_model
+    assert len(get_model_calls) == 2
+    # Registries cleared before the second get_model call.
+    assert vllm_config.compilation_config.static_forward_context == {}
+    assert vllm_config.compilation_config.static_all_moe_layers == []
+    assert _ROPE_DICT == {}
+
+
+def test_reset_process_global_model_state_is_safe_when_attrs_missing():
+    vllm_config = SimpleNamespace(compilation_config=SimpleNamespace())
+    # Should not raise even when static_forward_context / static_all_moe_layers
+    # are absent (some vLLM versions).
+    _reset_process_global_model_state(vllm_config)
 
 
 def test_shared_expert_consistency_check_disabled_neutralizes_and_restores():

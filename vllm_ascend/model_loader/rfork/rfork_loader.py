@@ -108,6 +108,38 @@ def _make_fallback_load_config(load_config: LoadConfig) -> LoadConfig:
     return fallback_load_config
 
 
+def _reset_process_global_model_state(vllm_config: VllmConfig) -> None:
+    """Clear process-global registries populated during ``initialize_model``.
+
+    RFork fallback re-runs ``get_model`` in the same worker process after
+    discarding a failed model. Layer ``__init__`` registers each prefix into
+    ``compilation_config.static_forward_context`` (used by Attention, FusedMoE,
+    DeepseekV32IndexerCache, Compressor, KDA, GDN, ...) and raises
+    ``Duplicate layer name`` if a prefix is already present. ``del model`` only
+    releases the module instance; the registries survive. Clear them before
+    re-initializing, mirroring ``vllm.v1.worker.gpu.shutdown.free_before_shutdown``.
+    """
+    compilation_config = getattr(vllm_config, "compilation_config", None)
+    if compilation_config is not None:
+        static_forward_context = getattr(compilation_config, "static_forward_context", None)
+        if isinstance(static_forward_context, dict):
+            static_forward_context.clear()
+        static_all_moe_layers = getattr(compilation_config, "static_all_moe_layers", None)
+        if isinstance(static_all_moe_layers, list):
+            static_all_moe_layers.clear()
+
+    # ROPE instances are cached globally and keyed by config; clear them so the
+    # re-initialized model builds fresh rope rather than reusing stale entries
+    # bound to the discarded model.
+    try:
+        from vllm.model_executor.layers.rotary_embedding import _ROPE_DICT
+
+        if isinstance(_ROPE_DICT, dict):
+            _ROPE_DICT.clear()
+    except Exception as e:  # pragma: no cover - best-effort across vLLM versions
+        logger.debug("RFork fallback: skip clearing _ROPE_DICT: %s", e)
+
+
 @contextmanager
 def _shared_expert_consistency_check_disabled(model: Module):
     """Temporarily neutralize the FusedMoE shared-expert consistency check.
@@ -342,6 +374,12 @@ class RForkModelLoader(BaseModelLoader):
                     for _ in range(3):
                         gc.collect()
                         torch.npu.empty_cache()
+
+                # initialize_model populates process-global layer registries
+                # (compilation_config.static_forward_context, _ROPE_DICT) that
+                # survive `del model` and would raise "Duplicate layer name" on
+                # re-init. Clear them before rebuilding in the same process.
+                _reset_process_global_model_state(vllm_config)
 
                 fallback_load_config = _make_fallback_load_config(self.load_config)
 
