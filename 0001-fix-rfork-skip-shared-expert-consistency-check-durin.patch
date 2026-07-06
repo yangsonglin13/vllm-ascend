@@ -1,0 +1,154 @@
+From 7c5574cc7e49876f413965240b65d560495304c0 Mon Sep 17 00:00:00 2001
+From: yangsonglin13 <yangsonglin566@gmail.com>
+Date: Mon, 6 Jul 2026 15:32:56 +0800
+Subject: [PATCH 1/2] fix(rfork): skip shared-expert consistency check during
+ pre-transfer post-process
+
+AscendFusedMoE wraps process_weights_after_loading to run a shared-expert
+consistency forward pass after weights are processed. In the RFork
+processed-layout-transfer path (quantized models), process_weights_after_loading
+runs *before* weights are transferred from the seed instance, so the forward
+runs on empty/uninitialized weights and produces NaN, which aborts the whole
+RFork transfer with 'FusedMoE shared experts split computation does not match
+the integrated computation' on every receiver rank.
+
+Wrap the pre-transfer post-process in _shared_expert_consistency_check_disabled,
+a context manager that swaps each AscendFusedMoE instance's
+_validate_shared_expert_consistency for a no-op for the duration of the call
+and restores it on exit (even on exception). Normal loads are untouched; the
+validator stays active for any post-transfer validation. An assert guards
+against silent regressions if the upstream validator is ever renamed.
+
+- vLLM version: v0.22.1
+- vLLM main: https://github.com/vllm-project/vllm/commit/967c5c3bc38891f4465d3f4e99917ed837bb3833
+
+Signed-off-by: yangsonglin13 <yangsonglin566@gmail.com>
+---
+ .../model_loader/rfork/test_rfork_loader.py   | 43 +++++++++++++++++++
+ .../model_loader/rfork/rfork_loader.py        | 38 +++++++++++++++-
+ 2 files changed, 80 insertions(+), 1 deletion(-)
+
+diff --git a/tests/ut/model_loader/rfork/test_rfork_loader.py b/tests/ut/model_loader/rfork/test_rfork_loader.py
+index 6eb254cd1..7261d43ec 100644
+--- a/tests/ut/model_loader/rfork/test_rfork_loader.py
++++ b/tests/ut/model_loader/rfork/test_rfork_loader.py
+@@ -28,6 +28,7 @@ from vllm_ascend.model_loader.rfork.rfork_loader import (
+     _is_dynamic_eplb_enabled,
+     _is_layer_sharding_enabled,
+     _make_fallback_load_config,
++    _shared_expert_consistency_check_disabled,
+ )
+ from vllm_ascend.model_loader.rfork.seed_protocol import get_local_seed_key
+ 
+@@ -511,3 +512,45 @@ def test_rfork_native_eplb_uses_default_loader(monkeypatch):
+     assert captured["load_config"] is not load_config
+     assert captured["load_config"].load_format == "auto"
+     assert captured["load_config"].model_loader_extra_config == {}
++
++
++def test_shared_expert_consistency_check_disabled_neutralizes_and_restores():
++    """Inside the context, AscendFusedMoE validators must be no-ops so the
++    pre-transfer post-process does not run a forward on empty weights. On exit
++    (including exceptions), the original validators must be restored."""
++    import vllm_ascend.ops.fused_moe.fused_moe as fused_moe_module
++
++    class _FakeAscendFusedMoE:
++        pass
++
++    def _real_validator(*args, **kwargs):
++        raise AssertionError("Real validator must not run while disabled.")
++
++    fused_moe_layer = _FakeAscendFusedMoE()
++    fused_moe_layer._validate_shared_expert_consistency = _real_validator
++    other_layer = SimpleNamespace()
++
++    class _FakeModule:
++        def modules(self):
++            return iter([self, fused_moe_layer, other_layer])
++
++    fake_module = _FakeModule()
++
++    real_fused_moe_cls = fused_moe_module.AscendFusedMoE
++    fused_moe_module.AscendFusedMoE = _FakeAscendFusedMoE
++    try:
++        # While disabled, calling the validator must not raise.
++        with _shared_expert_consistency_check_disabled(fake_module):
++            assert fused_moe_layer._validate_shared_expert_consistency is not _real_validator
++            fused_moe_layer._validate_shared_expert_consistency()
++            assert not hasattr(other_layer, "_validate_shared_expert_consistency")
++        # After exit, the original validator is restored.
++        assert fused_moe_layer._validate_shared_expert_consistency is _real_validator
++
++        # Restoration must happen even when the wrapped block raises.
++        with pytest.raises(RuntimeError, match="boom"):
++            with _shared_expert_consistency_check_disabled(fake_module):
++                raise RuntimeError("boom")
++        assert fused_moe_layer._validate_shared_expert_consistency is _real_validator
++    finally:
++        fused_moe_module.AscendFusedMoE = real_fused_moe_cls
+diff --git a/vllm_ascend/model_loader/rfork/rfork_loader.py b/vllm_ascend/model_loader/rfork/rfork_loader.py
+index 6d21d7955..61758d5e8 100644
+--- a/vllm_ascend/model_loader/rfork/rfork_loader.py
++++ b/vllm_ascend/model_loader/rfork/rfork_loader.py
+@@ -17,6 +17,7 @@
+ import gc
+ import os
+ import time
++from contextlib import contextmanager
+ from copy import copy
+ 
+ import torch
+@@ -107,6 +108,40 @@ def _make_fallback_load_config(load_config: LoadConfig) -> LoadConfig:
+     return fallback_load_config
+ 
+ 
++@contextmanager
++def _shared_expert_consistency_check_disabled(model: Module):
++    """Temporarily neutralize the FusedMoE shared-expert consistency check.
++
++    ``AscendFusedMoE`` wraps ``process_weights_after_loading`` to run a
++    consistency forward pass after weights are processed. RFork's pre-transfer
++    post-process builds the post-load tensor layout *before* weights are
++    transferred from the seed, so the forward would run on empty weights and
++    raise on NaN. Swap the validator for a no-op on every ``AscendFusedMoE``
++    instance for the duration of the wrapped call, then restore — even on
++    exception. Normal loads are untouched.
++    """
++    from vllm_ascend.ops.fused_moe.fused_moe import AscendFusedMoE
++
++    saved: dict[int, object] = {}
++    for module in model.modules():
++        if isinstance(module, AscendFusedMoE):
++            # Fail loud if the upstream validator is renamed/removed, rather
++            # than silently leaving the real check in place (which would bring
++            # Bug #1 back). The fallback (Bug #2 fix) would keep the worker
++            # alive, but an explicit failure surfaces the drift immediately.
++            assert hasattr(module, "_validate_shared_expert_consistency"), (
++                "AscendFusedMoE no longer exposes _validate_shared_expert_consistency; "
++                "update _shared_expert_consistency_check_disabled."
++            )
++            saved[id(module)] = (module, module._validate_shared_expert_consistency)
++            module._validate_shared_expert_consistency = lambda *args, **kwargs: None
++    try:
++        yield
++    finally:
++        for module, original in saved.values():
++            module._validate_shared_expert_consistency = original
++
++
+ def _is_layer_sharding_enabled(vllm_config: VllmConfig) -> bool:
+     additional_config = getattr(vllm_config, "additional_config", None) or {}
+     return bool(additional_config.get("layer_sharding"))
+@@ -274,7 +309,8 @@ class RForkModelLoader(BaseModelLoader):
+ 
+                 if processed_layout_transfer:
+                     logger.info("RFork uses post-load tensor layout transfer for quantized model.")
+-                    process_weights_after_loading(model, model_config, target_device)
++                    with _shared_expert_consistency_check_disabled(model):
++                        process_weights_after_loading(model, model_config, target_device)
+ 
+                 weight_load_start_time = time.perf_counter()
+                 if not rfork_worker.pre_transfer(model):
+-- 
+2.51.0.windows.1
+

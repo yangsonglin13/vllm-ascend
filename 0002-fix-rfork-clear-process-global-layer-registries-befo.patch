@@ -1,0 +1,183 @@
+From 7f596892183ec8ec37bf29c8bc9097a253b1eae6 Mon Sep 17 00:00:00 2001
+From: yangsonglin13 <yangsonglin566@gmail.com>
+Date: Mon, 6 Jul 2026 15:40:22 +0800
+Subject: [PATCH 2/2] fix(rfork): clear process-global layer registries before
+ fallback re-init
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+When RFork transfer fails (e.g. the previous fix's pre-transfer NaN, or any
+future failure), RFork falls back to the default loader by re-running get_model
+in the same worker process. initialize_model re-runs every layer __init__, which
+re-registers each prefix into compilation_config.static_forward_context — a
+process-global dict (not on the module instance) that survives 'del model'.
+DeepseekV32IndexerCache.__init__ (and Attention/FusedMoE/Compressor/KDA/GDN)
+raise 'Duplicate layer name: <prefix>' on the second registration, so the
+fallback itself crashes and takes the worker down ('WorkerProc failed to start').
+
+This affects DeepseekV2-family models including GLM-5 (GlmMoeDsaForCausalLM is
+a DeepseekV2ForCausalLM subclass and reuses its Indexer/MLA stack).
+
+Add _reset_process_global_model_state, mirroring
+vllm.v1.worker.gpu.shutdown.free_before_shutdown, and call it in the fallback
+except block after discarding the failed model and before the second
+get_model. It clears static_forward_context, static_all_moe_layers, and
+vllm.model_executor.layers.rotary_embedding._ROPE_DICT, each guarded so a
+missing attribute on some vLLM version degrades gracefully.
+
+Defense-in-depth: with the previous fix preventing the common trigger, this
+ensures any future RFork failure no longer kills the worker.
+
+- vLLM version: v0.22.1
+- vLLM main: https://github.com/vllm-project/vllm/commit/967c5c3bc38891f4465d3f4e99917ed837bb3833
+
+Signed-off-by: yangsonglin13 <yangsonglin566@gmail.com>
+---
+ .../model_loader/rfork/test_rfork_loader.py   | 66 +++++++++++++++++++
+ .../model_loader/rfork/rfork_loader.py        | 38 +++++++++++
+ 2 files changed, 104 insertions(+)
+
+diff --git a/tests/ut/model_loader/rfork/test_rfork_loader.py b/tests/ut/model_loader/rfork/test_rfork_loader.py
+index 7261d43ec..79b9cd8d4 100644
+--- a/tests/ut/model_loader/rfork/test_rfork_loader.py
++++ b/tests/ut/model_loader/rfork/test_rfork_loader.py
+@@ -28,6 +28,7 @@ from vllm_ascend.model_loader.rfork.rfork_loader import (
+     _is_dynamic_eplb_enabled,
+     _is_layer_sharding_enabled,
+     _make_fallback_load_config,
++    _reset_process_global_model_state,
+     _shared_expert_consistency_check_disabled,
+ )
+ from vllm_ascend.model_loader.rfork.seed_protocol import get_local_seed_key
+@@ -514,6 +515,71 @@ def test_rfork_native_eplb_uses_default_loader(monkeypatch):
+     assert captured["load_config"].model_loader_extra_config == {}
+ 
+ 
++def test_rfork_fallback_clears_process_global_state_before_reinit(monkeypatch):
++    """RFork fallback re-runs get_model in the same process; the process-global
++    layer registries populated by the first initialize_model must be cleared
++    before re-init, otherwise DeepseekV32IndexerCache/Attention/FusedMoE raise
++    `Duplicate layer name`."""
++    import vllm.model_executor.model_loader as model_loader
++    from vllm.model_executor.layers.rotary_embedding import _ROPE_DICT
++
++    load_config = DummyLoadConfig({"model_url": "model", "model_deploy_strategy_name": "tp8"})
++    loader = RForkModelLoader(load_config)
++    model_config = SimpleNamespace(dtype=torch.float32, model="/models/test", quantization="ascend")
++    vllm_config = _vllm_config(model_config=model_config)
++    vllm_config.compilation_config = SimpleNamespace(
++        static_forward_context={"model.layers.0.self_attn.indexer.k_cache": object()},
++        static_all_moe_layers=["model.layers.0.mlp"],
++    )
++    _ROPE_DICT[("identity", 1.0, 32768)] = object()
++
++    expected_model = SimpleNamespace()
++    get_model_calls = []
++
++    def fake_get_model(**kwargs):
++        get_model_calls.append(kwargs)
++        if len(get_model_calls) == 1:
++            # Simulate Bug #1: pre-transfer post-process raises on NaN.
++            raise ValueError("FusedMoE shared experts split computation does not match.")
++        return expected_model
++
++    rfork_worker = SimpleNamespace(
++        is_seed_available=lambda: True,
++        pre_transfer=lambda model: True,
++        transfer=lambda model: True,
++        post_transfer=lambda: True,
++        reset_transfer_state=lambda: None,
++        start_seed_service=lambda model: None,
++    )
++
++    monkeypatch.setattr(loader, "_ensure_rfork_worker", lambda vc, mc: rfork_worker)
++    monkeypatch.setattr(model_loader, "get_model", fake_get_model)
++    monkeypatch.setattr(
++        "vllm_ascend.model_loader.rfork.rfork_loader.initialize_model",
++        lambda **kwargs: SimpleNamespace(modules=lambda: iter([]), eval=lambda: expected_model),
++    )
++    monkeypatch.setattr(
++        "vllm_ascend.model_loader.rfork.rfork_loader.process_weights_after_loading",
++        lambda *args, **kwargs: None,
++    )
++
++    model = loader.load_model(vllm_config=vllm_config, model_config=model_config)
++
++    assert model is expected_model
++    assert len(get_model_calls) == 2
++    # Registries cleared before the second get_model call.
++    assert vllm_config.compilation_config.static_forward_context == {}
++    assert vllm_config.compilation_config.static_all_moe_layers == []
++    assert _ROPE_DICT == {}
++
++
++def test_reset_process_global_model_state_is_safe_when_attrs_missing():
++    vllm_config = SimpleNamespace(compilation_config=SimpleNamespace())
++    # Should not raise even when static_forward_context / static_all_moe_layers
++    # are absent (some vLLM versions).
++    _reset_process_global_model_state(vllm_config)
++
++
+ def test_shared_expert_consistency_check_disabled_neutralizes_and_restores():
+     """Inside the context, AscendFusedMoE validators must be no-ops so the
+     pre-transfer post-process does not run a forward on empty weights. On exit
+diff --git a/vllm_ascend/model_loader/rfork/rfork_loader.py b/vllm_ascend/model_loader/rfork/rfork_loader.py
+index 61758d5e8..5635bd088 100644
+--- a/vllm_ascend/model_loader/rfork/rfork_loader.py
++++ b/vllm_ascend/model_loader/rfork/rfork_loader.py
+@@ -108,6 +108,38 @@ def _make_fallback_load_config(load_config: LoadConfig) -> LoadConfig:
+     return fallback_load_config
+ 
+ 
++def _reset_process_global_model_state(vllm_config: VllmConfig) -> None:
++    """Clear process-global registries populated during ``initialize_model``.
++
++    RFork fallback re-runs ``get_model`` in the same worker process after
++    discarding a failed model. Layer ``__init__`` registers each prefix into
++    ``compilation_config.static_forward_context`` (used by Attention, FusedMoE,
++    DeepseekV32IndexerCache, Compressor, KDA, GDN, ...) and raises
++    ``Duplicate layer name`` if a prefix is already present. ``del model`` only
++    releases the module instance; the registries survive. Clear them before
++    re-initializing, mirroring ``vllm.v1.worker.gpu.shutdown.free_before_shutdown``.
++    """
++    compilation_config = getattr(vllm_config, "compilation_config", None)
++    if compilation_config is not None:
++        static_forward_context = getattr(compilation_config, "static_forward_context", None)
++        if isinstance(static_forward_context, dict):
++            static_forward_context.clear()
++        static_all_moe_layers = getattr(compilation_config, "static_all_moe_layers", None)
++        if isinstance(static_all_moe_layers, list):
++            static_all_moe_layers.clear()
++
++    # ROPE instances are cached globally and keyed by config; clear them so the
++    # re-initialized model builds fresh rope rather than reusing stale entries
++    # bound to the discarded model.
++    try:
++        from vllm.model_executor.layers.rotary_embedding import _ROPE_DICT
++
++        if isinstance(_ROPE_DICT, dict):
++            _ROPE_DICT.clear()
++    except Exception as e:  # pragma: no cover - best-effort across vLLM versions
++        logger.debug("RFork fallback: skip clearing _ROPE_DICT: %s", e)
++
++
+ @contextmanager
+ def _shared_expert_consistency_check_disabled(model: Module):
+     """Temporarily neutralize the FusedMoE shared-expert consistency check.
+@@ -343,6 +375,12 @@ class RForkModelLoader(BaseModelLoader):
+                         gc.collect()
+                         torch.npu.empty_cache()
+ 
++                # initialize_model populates process-global layer registries
++                # (compilation_config.static_forward_context, _ROPE_DICT) that
++                # survive `del model` and would raise "Duplicate layer name" on
++                # re-init. Clear them before rebuilding in the same process.
++                _reset_process_global_model_state(vllm_config)
++
+                 fallback_load_config = _make_fallback_load_config(self.load_config)
+ 
+                 from vllm.model_executor.model_loader import get_model
+-- 
+2.51.0.windows.1
+
