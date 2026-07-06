@@ -1,0 +1,580 @@
+From 80876f3488c026b571a6a58c595a421c660aa82b Mon Sep 17 00:00:00 2001
+From: yangsonglin13 <yangsonglin566@gmail.com>
+Date: Thu, 25 Jun 2026 15:54:48 +0800
+Subject: [PATCH 2/2] fix(rfork): isolate seeds across parallel ranks
+
+Include pipeline and expert parallel ranks in RFork seed identity, prefix optional ranks to avoid topology collisions, bypass RFork for dynamic EPLB, and document the compatibility boundaries.
+
+Signed-off-by: yangsonglin13 <yangsonglin566@gmail.com>
+---
+ docs/source/user_guide/feature_guide/rfork.md |   6 +-
+ .../model_loader/rfork/test_rfork_loader.py   | 311 ++++++++++++++++++
+ .../model_loader/rfork/rfork_loader.py        |  50 ++-
+ .../model_loader/rfork/rfork_worker.py        |   4 +
+ .../model_loader/rfork/seed_protocol.py       |  19 +-
+ 5 files changed, 383 insertions(+), 7 deletions(-)
+
+diff --git a/docs/source/user_guide/feature_guide/rfork.md b/docs/source/user_guide/feature_guide/rfork.md
+index a372e6662..443bf6382 100644
+--- a/docs/source/user_guide/feature_guide/rfork.md
++++ b/docs/source/user_guide/feature_guide/rfork.md
+@@ -25,7 +25,7 @@ The RFork loading flow in the current implementation is:
+ 
+ - **Scale-out after a first successful load**: The first instance may still load from storage, but later instances with the same deployment identity can reuse it as a seed and shorten startup time.
+ - **Elastic serving clusters**: Because RFork asks a planner for available seeds, it fits clusters where instances are created and reclaimed dynamically.
+-- **Topology-sensitive deployments**: RFork encodes `kv_role`, `node_rank`, `tp_rank`, and optional `draft` role into the seed key, so only topology-compatible instances are matched together.
++- **Topology-sensitive deployments**: RFork encodes `kv_role`, `node_rank`, optional `pp_rank`, `tp_rank`, optional `ep_rank`, and optional `draft` role into the seed key, so only topology-compatible instances are matched together.
+ 
+ ---
+ 
+@@ -56,10 +56,13 @@ RFork does not match instances by `model_url` alone. The local seed key is compo
+ - `model_deploy_strategy_name`
+ - disaggregation mode derived from `kv_transfer_config.kv_role` or `kv_both`
+ - `node_rank`
++- `pp_rank` when pipeline parallel size is greater than 1
+ - `tp_rank`
++- `ep_rank` when expert parallelism is enabled for an MoE model
+ - optional `draft` suffix when the worker runs as a draft model
+ 
+ This means two instances must agree on both model identity and deployment topology before the planner will treat them as interchangeable seeds.
++For deployments without pipeline or expert parallelism, the existing seed-key format is unchanged.
+ 
+ ### Quantized Models
+ 
+@@ -149,4 +152,5 @@ vllm serve <model_path> \
+ - RFork requires `YuanRong TransferEngine` at runtime. If the package is missing, RFork cannot initialize the transfer backend.
+ - If RFORK is used, **each worker process** must bind a listening port. That port is assigned randomly.
+ - RFork weight transfer does not support `additional_config.layer_sharding`. If `--load-format rfork` is used together with `layer_sharding`, RFork transfer is bypassed and the model is loaded through the default model loader.
++- RFork weight transfer does not support dynamic EPLB because expert weights and placement can change after the seed service starts. If `eplb_config.dynamic_eplb` or `eplb_config.expert_map_record_path` enables dynamic EPLB, RFork transfer is bypassed and the model is loaded through the default model loader.
+ - The example [`rfork_planner.py`](../../../../examples/rfork/rfork_planner.py) is only a simple mock implementation. If you need stronger scheduling, capacity management, or production-grade availability behavior, implement your own planner based on the RFork seed protocol.
+diff --git a/tests/ut/model_loader/rfork/test_rfork_loader.py b/tests/ut/model_loader/rfork/test_rfork_loader.py
+index 42f5fd912..6eb254cd1 100644
+--- a/tests/ut/model_loader/rfork/test_rfork_loader.py
++++ b/tests/ut/model_loader/rfork/test_rfork_loader.py
+@@ -21,11 +21,15 @@ import torch
+ 
+ from vllm_ascend.model_loader.rfork.rfork_loader import (
+     RForkModelLoader,
++    _get_ep_rank,
++    _get_pp_rank,
+     _get_rfork_worker_attr,
+     _is_draft_model,
++    _is_dynamic_eplb_enabled,
+     _is_layer_sharding_enabled,
+     _make_fallback_load_config,
+ )
++from vllm_ascend.model_loader.rfork.seed_protocol import get_local_seed_key
+ 
+ 
+ class DummyLoadConfig:
+@@ -75,6 +79,205 @@ def _vllm_config(model_config=None, scheduler_config=None):
+     )
+ 
+ 
++def _parallel_vllm_config(
++    enable_expert_parallel,
++    *,
++    pipeline_parallel_size=1,
++    is_moe_model=True,
++):
++    return SimpleNamespace(
++        parallel_config=SimpleNamespace(
++            enable_expert_parallel=enable_expert_parallel,
++            pipeline_parallel_size=pipeline_parallel_size,
++            is_moe_model=is_moe_model,
++        )
++    )
++
++
++def test_rfork_ep_rank_is_not_added_when_expert_parallel_is_disabled(monkeypatch):
++    def fail_if_ep_group_is_accessed():
++        pytest.fail("EP group should not be accessed when expert parallelism is disabled.")
++
++    monkeypatch.setattr(
++        "vllm_ascend.model_loader.rfork.rfork_loader.get_ep_group",
++        fail_if_ep_group_is_accessed,
++    )
++
++    assert _get_ep_rank(_parallel_vllm_config(False)) is None
++
++
++def test_rfork_ep_rank_comes_from_ep_group(monkeypatch):
++    monkeypatch.setattr(
++        "vllm_ascend.model_loader.rfork.rfork_loader.get_ep_group",
++        lambda: SimpleNamespace(rank_in_group=7),
++    )
++
++    assert _get_ep_rank(_parallel_vllm_config(True)) == 7
++
++
++def test_rfork_ep_rank_is_not_added_for_dense_model(monkeypatch):
++    def fail_if_ep_group_is_accessed():
++        pytest.fail("EP group should not be accessed for a dense model.")
++
++    monkeypatch.setattr(
++        "vllm_ascend.model_loader.rfork.rfork_loader.get_ep_group",
++        fail_if_ep_group_is_accessed,
++    )
++
++    assert _get_ep_rank(_parallel_vllm_config(True, is_moe_model=False)) is None
++
++
++def test_rfork_requires_initialized_ep_group(monkeypatch):
++    def raise_uninitialized_ep_group():
++        raise AssertionError("expert parallel group is not initialized")
++
++    monkeypatch.setattr(
++        "vllm_ascend.model_loader.rfork.rfork_loader.get_ep_group",
++        raise_uninitialized_ep_group,
++    )
++
++    with pytest.raises(RuntimeError, match="EP group is not initialized"):
++        _get_ep_rank(_parallel_vllm_config(True))
++
++
++def test_rfork_pp_rank_is_not_added_when_pipeline_parallelism_is_disabled(monkeypatch):
++    def fail_if_pp_group_is_accessed():
++        pytest.fail("PP group should not be accessed when pipeline parallelism is disabled.")
++
++    monkeypatch.setattr(
++        "vllm_ascend.model_loader.rfork.rfork_loader.get_pp_group",
++        fail_if_pp_group_is_accessed,
++    )
++
++    assert _get_pp_rank(_parallel_vllm_config(False)) is None
++
++
++def test_rfork_pp_rank_comes_from_pp_group(monkeypatch):
++    monkeypatch.setattr(
++        "vllm_ascend.model_loader.rfork.rfork_loader.get_pp_group",
++        lambda: SimpleNamespace(rank_in_group=3),
++    )
++
++    assert _get_pp_rank(_parallel_vllm_config(False, pipeline_parallel_size=2)) == 3
++
++
++def test_rfork_requires_initialized_pp_group(monkeypatch):
++    def raise_uninitialized_pp_group():
++        raise AssertionError("pipeline parallel group is not initialized")
++
++    monkeypatch.setattr(
++        "vllm_ascend.model_loader.rfork.rfork_loader.get_pp_group",
++        raise_uninitialized_pp_group,
++    )
++
++    with pytest.raises(RuntimeError, match="PP group is not initialized"):
++        _get_pp_rank(_parallel_vllm_config(False, pipeline_parallel_size=2))
++
++
++def test_rfork_seed_key_preserves_non_ep_format():
++    assert (
++        get_local_seed_key(
++            disaggregation_mode="kv_consumer",
++            node_rank=0,
++            tp_rank=3,
++            model_url="/models/dsv4",
++            model_deploy_strategy_name="decode",
++        )
++        == "/models/dsv4$decode$kv_consumer$0$3"
++    )
++
++
++def test_rfork_seed_key_isolated_by_ep_rank():
++    common_config = {
++        "disaggregation_mode": "kv_consumer",
++        "node_rank": 0,
++        "tp_rank": 0,
++        "model_url": "/models/dsv4",
++        "model_deploy_strategy_name": "decode",
++    }
++
++    assert get_local_seed_key(**common_config, ep_rank=0) == "/models/dsv4$decode$kv_consumer$0$0$ep0"
++    assert get_local_seed_key(**common_config, ep_rank=1) == "/models/dsv4$decode$kv_consumer$0$0$ep1"
++
++
++def test_rfork_seed_key_isolated_by_pp_rank():
++    common_config = {
++        "disaggregation_mode": "kv_consumer",
++        "node_rank": 0,
++        "tp_rank": 0,
++        "ep_rank": 0,
++        "model_url": "/models/dsv4",
++        "model_deploy_strategy_name": "decode",
++    }
++
++    assert get_local_seed_key(**common_config, pp_rank=0) == "/models/dsv4$decode$kv_consumer$0$pp0$0$ep0"
++    assert get_local_seed_key(**common_config, pp_rank=1) == "/models/dsv4$decode$kv_consumer$0$pp1$0$ep0"
++
++
++def test_rfork_seed_key_distinguishes_parallel_rank_types():
++    common_config = {
++        "disaggregation_mode": "kv_consumer",
++        "node_rank": 0,
++        "model_url": "/models/dsv4",
++        "model_deploy_strategy_name": "decode",
++    }
++
++    pp_key = get_local_seed_key(**common_config, pp_rank=3, tp_rank=1)
++    ep_key = get_local_seed_key(**common_config, tp_rank=3, ep_rank=1)
++
++    assert pp_key == "/models/dsv4$decode$kv_consumer$0$pp3$1"
++    assert ep_key == "/models/dsv4$decode$kv_consumer$0$3$ep1"
++    assert pp_key != ep_key
++
++
++def test_rfork_draft_seed_key_isolated_by_ep_rank():
++    assert (
++        get_local_seed_key(
++            disaggregation_mode="kv_consumer",
++            node_rank=0,
++            tp_rank=0,
++            model_url="/models/dsv4",
++            model_deploy_strategy_name="decode",
++            is_draft_worker=True,
++            ep_rank=5,
++        )
++        == "/models/dsv4$decode$kv_consumer$0$0$ep5$draft"
++    )
++
++
++def test_rfork_worker_receives_parallel_ranks(monkeypatch):
++    load_config = DummyLoadConfig({"model_url": "model", "model_deploy_strategy_name": "strategy"})
++    loader = RForkModelLoader(load_config)
++    model_config = SimpleNamespace()
++    vllm_config = SimpleNamespace(
++        kv_transfer_config=None,
++        model_config=model_config,
++        scheduler_config=SimpleNamespace(),
++        parallel_config=SimpleNamespace(node_rank=2),
++    )
++    captured = {}
++    expected_worker = SimpleNamespace()
++
++    def fake_rfork_worker(**kwargs):
++        captured.update(kwargs)
++        return expected_worker
++
++    monkeypatch.setattr("vllm_ascend.model_loader.rfork.rfork_loader.RForkWorker", fake_rfork_worker)
++    monkeypatch.setattr("vllm_ascend.model_loader.rfork.rfork_loader._get_pp_rank", lambda config: 3)
++    monkeypatch.setattr("vllm_ascend.model_loader.rfork.rfork_loader._get_ep_rank", lambda config: 7)
++    monkeypatch.setattr("vllm_ascend.model_loader.rfork.rfork_loader.get_tensor_model_parallel_rank", lambda: 5)
++    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 11)
++
++    worker = loader._ensure_rfork_worker(vllm_config, model_config)
++
++    assert worker is expected_worker
++    assert captured["node_rank"] == 2
++    assert captured["tp_rank"] == 5
++    assert captured["pp_rank"] == 3
++    assert captured["ep_rank"] == 7
++    assert captured["device_id"] == 11
++
++
+ @pytest.mark.parametrize(
+     "model_config",
+     [
+@@ -169,6 +372,47 @@ def test_rfork_detects_layer_sharding_config():
+     assert not _is_layer_sharding_enabled(SimpleNamespace(additional_config=None))
+ 
+ 
++def test_rfork_detects_dynamic_eplb_config():
++    assert _is_dynamic_eplb_enabled(
++        SimpleNamespace(
++            parallel_config=SimpleNamespace(enable_eplb=True),
++            additional_config=None,
++        )
++    )
++    assert _is_dynamic_eplb_enabled(
++        SimpleNamespace(
++            parallel_config=SimpleNamespace(enable_eplb=False),
++            additional_config={
++                "eplb_config": {
++                    "dynamic_eplb": True,
++                }
++            },
++        )
++    )
++    assert _is_dynamic_eplb_enabled(
++        SimpleNamespace(
++            parallel_config=SimpleNamespace(enable_eplb=False),
++            additional_config={
++                "eplb_config": {
++                    "expert_map_record_path": "/tmp/expert-map.json",
++                }
++            },
++        )
++    )
++    assert not _is_dynamic_eplb_enabled(
++        SimpleNamespace(
++            parallel_config=SimpleNamespace(enable_eplb=False),
++            additional_config={"eplb_config": {}},
++        )
++    )
++    assert not _is_dynamic_eplb_enabled(
++        SimpleNamespace(
++            parallel_config=SimpleNamespace(enable_eplb=False),
++            additional_config=None,
++        )
++    )
++
++
+ def test_rfork_layer_sharding_uses_default_loader(monkeypatch):
+     import vllm.model_executor.model_loader as model_loader
+ 
+@@ -200,3 +444,70 @@ def test_rfork_layer_sharding_uses_default_loader(monkeypatch):
+     assert captured["load_config"] is not load_config
+     assert captured["load_config"].load_format == "auto"
+     assert captured["load_config"].model_loader_extra_config == {}
++
++
++def test_rfork_dynamic_eplb_uses_default_loader(monkeypatch):
++    import vllm.model_executor.model_loader as model_loader
++
++    load_config = DummyLoadConfig({"model_url": "model", "model_deploy_strategy_name": "tp8"})
++    loader = RForkModelLoader(load_config)
++    model_config = SimpleNamespace(dtype=torch.float32, model="/models/test")
++    vllm_config = _vllm_config(model_config=model_config)
++    vllm_config.additional_config = {"eplb_config": {"dynamic_eplb": True}}
++
++    def fail_if_rfork_worker_is_created(*args, **kwargs):
++        raise AssertionError("RFork worker should not be initialized when dynamic EPLB is enabled.")
++
++    expected_model = SimpleNamespace()
++    captured = {}
++
++    def fake_get_model(**kwargs):
++        captured.update(kwargs)
++        return expected_model
++
++    monkeypatch.setattr(loader, "_ensure_rfork_worker", fail_if_rfork_worker_is_created)
++    monkeypatch.setattr(model_loader, "get_model", fake_get_model)
++
++    model = loader.load_model(vllm_config=vllm_config, model_config=model_config)
++
++    assert model is expected_model
++    assert captured["vllm_config"] is vllm_config
++    assert captured["model_config"] is model_config
++    assert captured["prefix"] == ""
++    assert captured["load_config"] is not load_config
++    assert captured["load_config"].load_format == "auto"
++    assert captured["load_config"].model_loader_extra_config == {}
++
++
++def test_rfork_native_eplb_uses_default_loader(monkeypatch):
++    import vllm.model_executor.model_loader as model_loader
++
++    load_config = DummyLoadConfig({"model_url": "model", "model_deploy_strategy_name": "tp8"})
++    loader = RForkModelLoader(load_config)
++    model_config = SimpleNamespace(dtype=torch.float32, model="/models/test")
++    vllm_config = _vllm_config(model_config=model_config)
++    vllm_config.parallel_config.enable_eplb = True
++    vllm_config.additional_config = None
++
++    def fail_if_rfork_worker_is_created(*args, **kwargs):
++        raise AssertionError("RFork worker should not be initialized when native EPLB is enabled.")
++
++    expected_model = SimpleNamespace()
++    captured = {}
++
++    def fake_get_model(**kwargs):
++        captured.update(kwargs)
++        return expected_model
++
++    monkeypatch.setattr(loader, "_ensure_rfork_worker", fail_if_rfork_worker_is_created)
++    monkeypatch.setattr(model_loader, "get_model", fake_get_model)
++
++    model = loader.load_model(vllm_config=vllm_config, model_config=model_config)
++
++    assert model is expected_model
++    assert captured["vllm_config"] is vllm_config
++    assert captured["model_config"] is model_config
++    assert captured["prefix"] == ""
++    assert captured["load_config"] is not load_config
++    assert captured["load_config"].load_format == "auto"
++    assert captured["load_config"].model_loader_extra_config == {}
+diff --git a/vllm_ascend/model_loader/rfork/rfork_loader.py b/vllm_ascend/model_loader/rfork/rfork_loader.py
+index f669656d6..6d21d7955 100644
+--- a/vllm_ascend/model_loader/rfork/rfork_loader.py
++++ b/vllm_ascend/model_loader/rfork/rfork_loader.py
+@@ -25,6 +25,7 @@ from torch.nn import Module
+ from vllm.config import ModelConfig, VllmConfig
+ from vllm.config.load import LoadConfig
+ from vllm.distributed import get_tensor_model_parallel_rank
++from vllm.distributed.parallel_state import get_ep_group, get_pp_group
+ from vllm.logger import logger
+ from vllm.model_executor.model_loader import register_model_loader
+ from vllm.model_executor.model_loader.base_loader import BaseModelLoader
+@@ -78,6 +79,27 @@ def _get_rfork_worker_attr(vllm_config: VllmConfig, model_config: ModelConfig) -
+     return "rfork_draft_worker" if _is_draft_model(vllm_config, model_config) else "rfork_worker"
+ 
+ 
++def _get_ep_rank(vllm_config: VllmConfig) -> int | None:
++    parallel_config = vllm_config.parallel_config
++    if not parallel_config.enable_expert_parallel or getattr(parallel_config, "is_moe_model", None) is False:
++        return None
++
++    try:
++        return get_ep_group().rank_in_group
++    except AssertionError as e:
++        raise RuntimeError("Expert parallelism is enabled, but the EP group is not initialized.") from e
++
++
++def _get_pp_rank(vllm_config: VllmConfig) -> int | None:
++    if getattr(vllm_config.parallel_config, "pipeline_parallel_size", 1) <= 1:
++        return None
++
++    try:
++        return get_pp_group().rank_in_group
++    except AssertionError as e:
++        raise RuntimeError("Pipeline parallelism is enabled, but the PP group is not initialized.") from e
++
++
+ def _make_fallback_load_config(load_config: LoadConfig) -> LoadConfig:
+     fallback_load_config = copy(load_config)
+     fallback_load_config.load_format = "auto"
+@@ -90,6 +112,18 @@ def _is_layer_sharding_enabled(vllm_config: VllmConfig) -> bool:
+     return bool(additional_config.get("layer_sharding"))
+ 
+ 
++def _is_dynamic_eplb_enabled(vllm_config: VllmConfig) -> bool:
++    parallel_config = getattr(vllm_config, "parallel_config", None)
++    if bool(getattr(parallel_config, "enable_eplb", False)):
++        return True
++
++    additional_config = getattr(vllm_config, "additional_config", None) or {}
++    eplb_config = additional_config.get("eplb_config", {})
++    if not isinstance(eplb_config, dict):
++        return False
++    return bool(eplb_config.get("dynamic_eplb") or eplb_config.get("expert_map_record_path"))
++
++
+ @register_model_loader("rfork")
+ class RForkModelLoader(BaseModelLoader):
+     def __init__(self, load_config: LoadConfig):
+@@ -158,6 +192,8 @@ class RForkModelLoader(BaseModelLoader):
+             disaggregation_mode = "kv_both" if kv_transfer_config is None else str(kv_transfer_config.kv_role)
+             is_draft_model = _is_draft_model(vllm_config, model_config)
+             device_id = torch.distributed.get_rank()
++            pp_rank = _get_pp_rank(vllm_config)
++            ep_rank = _get_ep_rank(vllm_config)
+             rfork_worker = RForkWorker(
+                 disaggregation_mode=disaggregation_mode,
+                 node_rank=vllm_config.parallel_config.node_rank,
+@@ -169,6 +205,8 @@ class RForkModelLoader(BaseModelLoader):
+                 seed_timeout_sec=self.seed_timeout_sec,
+                 seed_key_separator=self.seed_key_separator,
+                 is_draft_model=is_draft_model,
++                pp_rank=pp_rank,
++                ep_rank=ep_rank,
+             )
+             setattr(self.load_config, worker_attr, rfork_worker)
+             logger.info(
+@@ -194,10 +232,16 @@ class RForkModelLoader(BaseModelLoader):
+ 
+         with set_default_torch_dtype(model_config.dtype):
+             need_del = False
++            bypass_reason = None
+             if _is_layer_sharding_enabled(vllm_config):
++                bypass_reason = "additional_config.layer_sharding"
++            elif _is_dynamic_eplb_enabled(vllm_config):
++                bypass_reason = "dynamic EPLB"
++
++            if bypass_reason is not None:
+                 logger.warning(
+-                    "RFork transfer is disabled when additional_config.layer_sharding "
+-                    "is enabled; using the default model loader."
++                    "RFork transfer is disabled when %s is enabled; using the default model loader.",
++                    bypass_reason,
+                 )
+                 fallback_load_config = _make_fallback_load_config(self.load_config)
+ 
+@@ -211,7 +255,7 @@ class RForkModelLoader(BaseModelLoader):
+                         prefix=prefix,
+                     )
+                 except Exception:
+-                    logger.exception("RFork disabled for layer_sharding, but default loader failed.")
++                    logger.exception("RFork disabled for %s, but default loader failed.", bypass_reason)
+                     raise
+ 
+             rfork_worker = self._ensure_rfork_worker(vllm_config, model_config)
+diff --git a/vllm_ascend/model_loader/rfork/rfork_worker.py b/vllm_ascend/model_loader/rfork/rfork_worker.py
+index e9eff0b45..99148137a 100644
+--- a/vllm_ascend/model_loader/rfork/rfork_worker.py
++++ b/vllm_ascend/model_loader/rfork/rfork_worker.py
+@@ -38,6 +38,8 @@ class RForkWorker:
+         seed_timeout_sec: float = 30.0,
+         seed_key_separator: str = "$",
+         is_draft_model: bool = False,
++        pp_rank: int | None = None,
++        ep_rank: int | None = None,
+     ):
+         self.device_id = device_id
+         self.rfork_seed = None
+@@ -54,6 +56,8 @@ class RForkWorker:
+             model_deploy_strategy_name=model_deploy_strategy_name,
+             seed_key_separator=seed_key_separator,
+             is_draft_worker=is_draft_model,
++            pp_rank=pp_rank,
++            ep_rank=ep_rank,
+         )
+ 
+     def is_seed_available(self) -> bool:
+diff --git a/vllm_ascend/model_loader/rfork/seed_protocol.py b/vllm_ascend/model_loader/rfork/seed_protocol.py
+index 538430dd8..a4b4e80f6 100644
+--- a/vllm_ascend/model_loader/rfork/seed_protocol.py
++++ b/vllm_ascend/model_loader/rfork/seed_protocol.py
+@@ -33,6 +33,8 @@ def get_local_seed_key(
+     model_deploy_strategy_name: str,
+     seed_key_separator: str = "$",
+     is_draft_worker: bool = False,
++    pp_rank: int | None = None,
++    ep_rank: int | None = None,
+ ) -> str:
+     if not model_url or not model_deploy_strategy_name:
+         err_msg = (
+@@ -46,10 +48,15 @@ def get_local_seed_key(
+         raise RuntimeError(err_msg)
+ 
+     seed_key = f"{model_url}{seed_key_separator}{model_deploy_strategy_name}"
+-    key_suffix = f"{disaggregation_mode}{seed_key_separator}{node_rank}{seed_key_separator}{tp_rank}"
++    key_parts = [disaggregation_mode, str(node_rank)]
++    if pp_rank is not None:
++        key_parts.append(f"pp{pp_rank}")
++    key_parts.append(str(tp_rank))
++    if ep_rank is not None:
++        key_parts.append(f"ep{ep_rank}")
+     if is_draft_worker:
+-        key_suffix += f"{seed_key_separator}draft"
+-    return f"{seed_key}{seed_key_separator}{key_suffix}"
++        key_parts.append("draft")
++    return f"{seed_key}{seed_key_separator}{seed_key_separator.join(key_parts)}"
+ 
+ 
+ class RForkSeedProtocol:
+@@ -64,10 +71,14 @@ class RForkSeedProtocol:
+         model_deploy_strategy_name: str,
+         seed_key_separator: str = "$",
+         is_draft_worker: bool = False,
++        pp_rank: int | None = None,
++        ep_rank: int | None = None,
+     ):
+         self.disaggregation_mode = disaggregation_mode
+         self.node_rank = node_rank
+         self.tp_rank = tp_rank
++        self.pp_rank = pp_rank
++        self.ep_rank = ep_rank
+         self.scheduler_url = scheduler_url
+         self.model_url = model_url
+         self.model_deploy_strategy_name = model_deploy_strategy_name
+@@ -82,6 +93,8 @@ class RForkSeedProtocol:
+             model_deploy_strategy_name=self.model_deploy_strategy_name,
+             seed_key_separator=self.seed_key_separator,
+             is_draft_worker=self.is_draft_worker,
++            pp_rank=self.pp_rank,
++            ep_rank=self.ep_rank,
+         )
+ 
+     def get_local_seed_key(self) -> str:
+-- 
+2.51.0.windows.1
+
