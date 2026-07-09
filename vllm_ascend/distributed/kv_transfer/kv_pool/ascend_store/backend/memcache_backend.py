@@ -1,5 +1,6 @@
 # Standard
 import threading
+import time
 from enum import Enum
 from typing import Any
 
@@ -10,6 +11,10 @@ from vllm.logger import logger
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.backend import Backend
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
+
+
+def _sum_transfer_bytes(sizes: list[list[int]]) -> int:
+    return sum(sum(size_group) for size_group in sizes)
 
 
 class MmcDirect(Enum):
@@ -109,7 +114,13 @@ class MemcacheBackend(Backend):
             return
         assert self.store is not None
         try:
-            res = self.store.batch_get_into_layers(key, addr, size, MmcDirect.COPY_G2L.value)
+            res = None
+            start_time = time.perf_counter()
+            try:
+                res = self.store.batch_get_into_layers(key, addr, size, MmcDirect.COPY_G2L.value)
+            finally:
+                elapsed_ms = (time.perf_counter() - start_time) * 1000
+                logger.info("Memcache load_kvc took %.3f ms, bytes=%d", elapsed_ms, _sum_transfer_bytes(size))
             for value in res:
                 if value != 0:
                     logger.error("Failed to get key %s,res:%s", key, res)
@@ -120,7 +131,13 @@ class MemcacheBackend(Backend):
         try:
             self._ensure_initialized()
             assert self.store is not None
-            res = self.store.batch_put_from_layers(key, addr, size, MmcDirect.COPY_L2G.value)
+            res = None
+            start_time = time.perf_counter()
+            try:
+                res = self.store.batch_put_from_layers(key, addr, size, MmcDirect.COPY_L2G.value)
+            finally:
+                elapsed_ms = (time.perf_counter() - start_time) * 1000
+                logger.info("Memcache store_kvc took %.3f ms, bytes=%d", elapsed_ms, _sum_transfer_bytes(size))
             for value in res:
                 if value != 0:
                     logger.error("Failed to put key %s,res:%s", key, res)
