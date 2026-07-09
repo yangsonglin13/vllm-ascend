@@ -1,5 +1,6 @@
 import json
 import os
+import time
 from dataclasses import dataclass
 
 import torch
@@ -9,6 +10,10 @@ from vllm.logger import logger
 from vllm.utils.network_utils import split_host_port
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.backend import Backend
+
+
+def _sum_transfer_bytes(sizes: list[list[int]]) -> int:
+    return sum(sum(size_group) for size_group in sizes)
 
 
 @dataclass
@@ -121,7 +126,12 @@ class YuanrongBackend(Backend):
         assert self.store is not None
         failed_keys_for_log = keys
         try:
-            failed_keys = self.store.mget_h2d_from_multi_buffers(keys, addrs, sizes, self.config.get_sub_timeout_ms)
+            start_time = time.perf_counter()
+            try:
+                failed_keys = self.store.mget_h2d_from_multi_buffers(keys, addrs, sizes, self.config.get_sub_timeout_ms)
+            finally:
+                elapsed_ms = (time.perf_counter() - start_time) * 1000
+                logger.info("Yuanrong load_kvc took %.3f ms, bytes=%d", elapsed_ms, _sum_transfer_bytes(sizes))
             if failed_keys:
                 logger.error(
                     "Failed to get %d keys out of %d. Check key existence and memory state.",
@@ -149,7 +159,12 @@ class YuanrongBackend(Backend):
         assert self.store is not None
         failed_keys_for_log = keys
         try:
-            self.store.mset_d2h_from_multi_buffers(keys, addrs, sizes, self._ds_set_param)
+            start_time = time.perf_counter()
+            try:
+                self.store.mset_d2h_from_multi_buffers(keys, addrs, sizes, self._ds_set_param)
+            finally:
+                elapsed_ms = (time.perf_counter() - start_time) * 1000
+                logger.info("Yuanrong store_kvc took %.3f ms, bytes=%d", elapsed_ms, _sum_transfer_bytes(sizes))
         except Exception as exc:
             logger.error(
                 "Failed to put %d keys out of %d. Check network and yuanrong service.",
