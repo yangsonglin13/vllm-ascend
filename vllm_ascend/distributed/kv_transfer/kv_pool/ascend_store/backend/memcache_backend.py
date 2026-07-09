@@ -1,5 +1,6 @@
 # Standard
 import threading
+import time
 from enum import Enum
 from typing import Any
 
@@ -10,6 +11,10 @@ from vllm.logger import logger
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.backend import Backend
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
+
+
+def _sum_transfer_bytes(sizes: list[list[int]]) -> int:
+    return sum(sum(size_group) for size_group in sizes)
 
 
 class MmcDirect(Enum):
@@ -42,7 +47,7 @@ class MemcacheBackend(Backend):
             if self._store_initialized:
                 return
 
-            logger.info("Initializing Memcache store on first put.")
+            logger.info("Initializing Memcache store. local_rank=%d", self.local_rank)
             self.store = self._setup_store()
             self._store_initialized = True
             self._register_buffers_if_needed()
@@ -66,10 +71,10 @@ class MemcacheBackend(Backend):
             assert res == 0
             return store
         except ValueError as e:
-            logger.error("Configuration loading failed: %s", e)
+            logger.error("Configuration loading failed. error=%s. Check memcache config and environment.", e)
             raise
         except Exception as exc:
-            logger.error("An error occurred while loading the configuration: %s", exc)
+            logger.error("Store initialization failed. error=%s. Check memcache setup and dependencies.", exc)
             raise
 
     def set_device(self):
@@ -105,28 +110,82 @@ class MemcacheBackend(Backend):
 
     def get(self, key: list[str], addr: list[list[int]], size: list[list[int]]):
         if self._lazy_init and not self._store_initialized:
-            logger.error("MemcacheBackend.get called before store initialization, keys=%s", key)
+            logger.error(
+                "Failed to get %d keys out of %d. Store is not initialized; "
+                "call put() first to trigger initialization.",
+                len(key),
+                len(key),
+            )
+            logger.debug("Failed to get key details. keys=%s", key)
             return
         assert self.store is not None
         try:
-            res = self.store.batch_get_into_layers(key, addr, size, MmcDirect.COPY_G2L.value)
-            for value in res:
-                if value != 0:
-                    logger.error("Failed to get key %s,res:%s", key, res)
+            res = None
+            start_time = time.perf_counter()
+            try:
+                res = self.store.batch_get_into_layers(key, addr, size, MmcDirect.COPY_G2L.value)
+            finally:
+                elapsed_ms = (time.perf_counter() - start_time) * 1000
+                logger.info("Memcache load_kvc took %.3f ms, bytes=%d", elapsed_ms, _sum_transfer_bytes(size))
+            failed_codes = [int(value) for value in res if value != 0]
+            failed_count = len(failed_codes)
+            if failed_count:
+                error_codes = sorted(set(failed_codes))
+                logger.error(
+                    "Failed to get %d keys out of %d. error_codes=%s. Check key existence and memory state.",
+                    failed_count,
+                    len(key),
+                    error_codes,
+                )
+                logger.debug("Failed to get key details. keys=%s, result=%s", key, res)
+            return res
         except Exception as e:
-            logger.error("Failed to get key %s. %s", key, e)
+            logger.error(
+                "Failed to get %d keys out of %d. Check store state and network.",
+                len(key),
+                len(key),
+            )
+            logger.debug(
+                "Failed to get key details. keys=%s, type=%s, error=%s",
+                key,
+                type(e).__name__,
+                e,
+            )
+            return None
 
     def put(self, key: list[str], addr: list[list[int]], size: list[list[int]]):
         try:
             self._ensure_initialized()
             assert self.store is not None
-            res = self.store.batch_put_from_layers(key, addr, size, MmcDirect.COPY_L2G.value)
-            for value in res:
-                if value != 0:
-                    logger.error("Failed to put key %s,res:%s", key, res)
-                    if self._lazy_init:
-                        logger.error("If this is the first DSV4(compress) request, this failure is expected.")
+            res = None
+            start_time = time.perf_counter()
+            try:
+                res = self.store.batch_put_from_layers(key, addr, size, MmcDirect.COPY_L2G.value)
+            finally:
+                elapsed_ms = (time.perf_counter() - start_time) * 1000
+                logger.info("Memcache store_kvc took %.3f ms, bytes=%d", elapsed_ms, _sum_transfer_bytes(size))
+            failed_codes = [int(value) for value in res if value != 0]
+            failed_count = len(failed_codes)
+            if failed_count:
+                error_codes = sorted(set(failed_codes))
+                logger.error(
+                    "Failed to put %d keys out of %d. error_codes=%s. Check memory and store capacity.",
+                    failed_count,
+                    len(key),
+                    error_codes,
+                )
+                logger.debug("Failed to put key details. keys=%s, result=%s", key, res)
+                if self._lazy_init:
+                    logger.warning("First DSV4(compress) request failure is expected. This is normal behavior.")
         except Exception as e:
-            logger.error("Failed to put key %s,error:%s", key, e)
-            if self._lazy_init:
-                logger.error("If this is the first DSV4(compress) request, this failure is expected.")
+            logger.error(
+                "Failed to put %d keys out of %d. Check store state and memory.",
+                len(key),
+                len(key),
+            )
+            logger.debug(
+                "Failed to put key details. keys=%s, type=%s, error=%s",
+                key,
+                type(e).__name__,
+                e,
+            )
