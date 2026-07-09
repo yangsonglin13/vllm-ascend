@@ -1,5 +1,6 @@
 import hashlib
 import os
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -18,6 +19,10 @@ def _iter_slices(total: int, batch_size: int):
     for start in range(0, total, batch_size):
         end = min(start + batch_size, total)
         yield start, end
+
+
+def _sum_transfer_bytes(sizes: list[list[int]]) -> int:
+    return sum(sum(size_group) for size_group in sizes)
 
 
 @dataclass
@@ -176,18 +181,23 @@ class YuanrongBackend(Backend):
             failed_keys_for_log = keys
             blob_lists = self._helper.make_blob_lists(addrs, sizes)
             failed_keys: list[str] = []
-            if len(keys) <= self._DS_MAX_BATCH_KEYS:
-                failed_keys = self._hetero_client.mget_h2d(  # type: ignore[union-attr]
-                    keys, blob_lists, 0
-                )
-            else:
-                for start, end in _iter_slices(len(keys), self._DS_MAX_BATCH_KEYS):
-                    failed_keys_for_log = keys[start:end]
-                    failed_keys.extend(
-                        self._hetero_client.mget_h2d(  # type: ignore[union-attr]
-                            keys[start:end], blob_lists[start:end], 0
-                        )
+            start_time = time.perf_counter()
+            try:
+                if len(keys) <= self._DS_MAX_BATCH_KEYS:
+                    failed_keys = self._hetero_client.mget_h2d(  # type: ignore[union-attr]
+                        keys, blob_lists, 0
                     )
+                else:
+                    for start, end in _iter_slices(len(keys), self._DS_MAX_BATCH_KEYS):
+                        failed_keys_for_log = keys[start:end]
+                        failed_keys.extend(
+                            self._hetero_client.mget_h2d(  # type: ignore[union-attr]
+                                keys[start:end], blob_lists[start:end], 0
+                            )
+                        )
+            finally:
+                elapsed_ms = (time.perf_counter() - start_time) * 1000
+                logger.info("Yuanrong load_kvc took %.3f ms, bytes=%d", elapsed_ms, _sum_transfer_bytes(sizes))
             if failed_keys:
                 logger.error(
                     "Failed to get %d keys out of %d. Check key existence and memory state.",
@@ -220,16 +230,21 @@ class YuanrongBackend(Backend):
             keys = self._helper.normalize_keys(keys)
             failed_keys_for_log = keys
             blob_lists = self._helper.make_blob_lists(addrs, sizes)
-            if len(keys) <= self._DS_MAX_BATCH_KEYS:
-                self._hetero_client.mset_d2h(  # type: ignore[union-attr]
-                    keys, blob_lists, self._ds_set_param
-                )
-            else:
-                for start, end in _iter_slices(len(keys), self._DS_MAX_BATCH_KEYS):
-                    failed_keys_for_log = keys[start:end]
+            start_time = time.perf_counter()
+            try:
+                if len(keys) <= self._DS_MAX_BATCH_KEYS:
                     self._hetero_client.mset_d2h(  # type: ignore[union-attr]
-                        keys[start:end], blob_lists[start:end], self._ds_set_param
+                        keys, blob_lists, self._ds_set_param
                     )
+                else:
+                    for start, end in _iter_slices(len(keys), self._DS_MAX_BATCH_KEYS):
+                        failed_keys_for_log = keys[start:end]
+                        self._hetero_client.mset_d2h(  # type: ignore[union-attr]
+                            keys[start:end], blob_lists[start:end], self._ds_set_param
+                        )
+            finally:
+                elapsed_ms = (time.perf_counter() - start_time) * 1000
+                logger.info("Yuanrong store_kvc took %.3f ms, bytes=%d", elapsed_ms, _sum_transfer_bytes(sizes))
         except Exception as exc:
             logger.error(
                 "Failed to put %d keys out of %d. Check network and yuanrong service.",
