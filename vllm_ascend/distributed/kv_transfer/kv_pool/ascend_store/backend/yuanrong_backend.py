@@ -1,6 +1,4 @@
-import hashlib
 import os
-import re
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -71,29 +69,10 @@ class YuanrongConfig:
 
 
 class YuanrongHelper:
-    _DS_KEY_MAX_LEN = 255
-    _DS_KEY_ALLOWED_PATTERN = re.compile(r"^[a-zA-Z0-9\-_!@#%\^\*\(\)\+\=\:;]+$")
-    _DS_KEY_INVALID_CHAR_PATTERN = re.compile(r"[^a-zA-Z0-9\-_!@#%\^\*\(\)\+\=\:;]")
-    _DS_KEY_HASH_SUFFIX_LEN = 16
-
     def __init__(self, blob_cls, blob_list_cls):
         self._blob_cls = blob_cls
         self._blob_list_cls = blob_list_cls
         self._device_id: int | None = None
-
-    def normalize_keys(self, keys: list[str]) -> list[str]:
-        normalized: list[str] = []
-        for key in keys:
-            if len(key) <= self._DS_KEY_MAX_LEN and self._DS_KEY_ALLOWED_PATTERN.match(key):
-                normalized.append(key)
-                continue
-
-            sanitized = self._DS_KEY_INVALID_CHAR_PATTERN.sub("_", key)
-            hash_digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
-            suffix = f"__{hash_digest[: self._DS_KEY_HASH_SUFFIX_LEN]}"
-            max_prefix_len = self._DS_KEY_MAX_LEN - len(suffix)
-            normalized.append(sanitized[:max_prefix_len] + suffix)
-        return normalized
 
     @property
     def device_id(self) -> int:
@@ -176,7 +155,6 @@ class YuanrongBackend(Backend):
         if len(keys) == 0:
             return []
         try:
-            keys = self._helper.normalize_keys(keys)
             exists = self._hetero_client.exist(keys)  # type: ignore[union-attr]
             return [1 if value else 0 for value in exists]
         except Exception as exc:
@@ -188,7 +166,6 @@ class YuanrongBackend(Backend):
             return
         try:
             self._ensure_device_ready()
-            keys = self._helper.normalize_keys(keys)
             failed_keys: list[str]
             start_time = time.perf_counter()
             try:
@@ -212,7 +189,6 @@ class YuanrongBackend(Backend):
             return
         try:
             self._ensure_device_ready()
-            keys = self._helper.normalize_keys(keys)
             start_time = time.perf_counter()
             try:
                 if self._multi_buffer_put is not None:

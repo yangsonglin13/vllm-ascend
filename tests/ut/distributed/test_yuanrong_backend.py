@@ -29,7 +29,6 @@ def _make_backend():
     backend._ensure_device_ready = MagicMock()
     backend._helper = MagicMock()
     backend._helper.device_id = 3
-    backend._helper.normalize_keys.side_effect = lambda keys: [f"normalized-{key}" for key in keys]
     backend._helper.make_blob_lists.return_value = ["blob-list"]
     backend._hetero_client = MagicMock()
     backend._ds_set_param = object()
@@ -40,16 +39,17 @@ def test_multi_buffer_get_and_put_use_new_sdk_api():
     backend = _make_backend()
     backend._multi_buffer_get = MagicMock(return_value=[])
     backend._multi_buffer_put = MagicMock()
-    keys = ["key0"]
+    keys = ["Qwen2.5-7B@pcp0@dcp0@head_or_tp_rank:0@pp_rank:0@abcdef"]
     addrs = [[100, 200]]
     sizes = [[10, 20]]
 
     backend.get(keys, addrs, sizes)
     backend.put(keys, addrs, sizes)
 
-    normalized_keys = ["normalized-key0"]
-    backend._multi_buffer_get.assert_called_once_with(normalized_keys, 3, addrs, sizes, 0)
-    backend._multi_buffer_put.assert_called_once_with(normalized_keys, 3, addrs, sizes, backend._ds_set_param)
+    backend._multi_buffer_get.assert_called_once_with(keys, 3, addrs, sizes, 0)
+    backend._multi_buffer_put.assert_called_once_with(keys, 3, addrs, sizes, backend._ds_set_param)
+    assert backend._multi_buffer_get.call_args.args[0] is keys
+    assert backend._multi_buffer_put.call_args.args[0] is keys
     backend._helper.make_blob_lists.assert_not_called()
     backend._hetero_client.mget_h2d.assert_not_called()
     backend._hetero_client.mset_d2h.assert_not_called()
@@ -67,10 +67,21 @@ def test_old_sdk_falls_back_to_blob_wrappers():
     backend.get(keys, addrs, sizes)
     backend.put(keys, addrs, sizes)
 
-    normalized_keys = ["normalized-key0"]
     assert backend._helper.make_blob_lists.call_count == 2
-    backend._hetero_client.mget_h2d.assert_called_once_with(normalized_keys, ["blob-list"], 0)
-    backend._hetero_client.mset_d2h.assert_called_once_with(normalized_keys, ["blob-list"], backend._ds_set_param)
+    backend._hetero_client.mget_h2d.assert_called_once_with(keys, ["blob-list"], 0)
+    backend._hetero_client.mset_d2h.assert_called_once_with(keys, ["blob-list"], backend._ds_set_param)
+    assert backend._hetero_client.mget_h2d.call_args.args[0] is keys
+    assert backend._hetero_client.mset_d2h.call_args.args[0] is keys
+
+
+def test_exists_passes_keys_to_sdk_without_normalization():
+    backend = _make_backend()
+    backend._hetero_client.exist.return_value = [True, False]
+    keys = ["Qwen2.5-key0", "Qwen2.5-key1"]
+
+    assert backend.exists(keys) == [1, 0]
+    backend._hetero_client.exist.assert_called_once_with(keys)
+    assert backend._hetero_client.exist.call_args.args[0] is keys
 
 
 def test_device_id_requires_set_device():
