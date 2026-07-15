@@ -130,11 +130,13 @@ class YuanrongBackend(Backend):
         self._multi_buffer_get, self._multi_buffer_put = _resolve_multi_buffer_apis(
             self._hetero_client, self.config.multi_buffer_api
         )
+        self._batch_is_exist = getattr(self._hetero_client, "batch_is_exist", None)
         selected_api = "multi_buffer" if self._multi_buffer_get is not None else "legacy_blob"
         logger.info(
-            "Yuanrong descriptor API configured=%s, selected=%s",
+            "Yuanrong descriptor API configured=%s, selected=%s, batch_is_exist=%s",
             self.config.multi_buffer_api,
             selected_api,
+            self._batch_is_exist is not None,
         )
 
     def _ensure_device_ready(self):
@@ -155,6 +157,8 @@ class YuanrongBackend(Backend):
         if len(keys) == 0:
             return []
         try:
+            if self._batch_is_exist is not None:
+                return self._batch_is_exist(keys)
             exists = self._hetero_client.exist(keys)  # type: ignore[union-attr]
             return [1 if value else 0 for value in exists]
         except Exception as exc:

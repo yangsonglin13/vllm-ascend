@@ -31,6 +31,7 @@ def _make_backend():
     backend._helper.device_id = 3
     backend._helper.make_blob_lists.return_value = ["blob-list"]
     backend._hetero_client = MagicMock()
+    backend._batch_is_exist = None
     backend._ds_set_param = object()
     return backend
 
@@ -82,6 +83,17 @@ def test_exists_passes_keys_to_sdk_without_normalization():
     assert backend.exists(keys) == [1, 0]
     backend._hetero_client.exist.assert_called_once_with(keys)
     assert backend._hetero_client.exist.call_args.args[0] is keys
+
+
+def test_exists_uses_batch_is_exist_without_bool_to_int_copy():
+    backend = _make_backend()
+    result = [1, 0]
+    backend._batch_is_exist = MagicMock(return_value=result)
+    keys = ["Qwen2.5-key0", "Qwen2.5-key1"]
+
+    assert backend.exists(keys) is result
+    backend._batch_is_exist.assert_called_once_with(keys)
+    backend._hetero_client.exist.assert_not_called()
 
 
 def test_device_id_requires_set_device():
