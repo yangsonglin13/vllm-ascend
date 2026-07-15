@@ -103,6 +103,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_ENABLE_FUSED_MC2": lambda: int(os.getenv("VLLM_ASCEND_ENABLE_FUSED_MC2", "0")),
     # Whether to anbale balance scheduling
     "VLLM_ASCEND_BALANCE_SCHEDULING": lambda: bool(int(os.getenv("VLLM_ASCEND_BALANCE_SCHEDULING", "0"))),
+    # Select the Yuanrong HeteroClient descriptor API used by the KV Pool
+    # backend. Valid values are auto, on, and off. The default auto mode uses
+    # the multi-buffer API only when the installed Yuanrong SDK provides both
+    # Get and Set methods. The variable does not contain sensitive data.
+    "VLLM_ASCEND_YUANRONG_MULTI_BUFFER_API": lambda: os.getenv("VLLM_ASCEND_YUANRONG_MULTI_BUFFER_API", "auto").lower(),
     # use fused op transpose_kv_cache_by_block, default is True
     "VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK": lambda: bool(
         int(os.getenv("VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK", "1"))

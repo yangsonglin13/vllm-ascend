@@ -10,11 +10,37 @@ from vllm.config import ParallelConfig
 from vllm.logger import logger
 from vllm.utils.network_utils import split_host_port
 
+from vllm_ascend import envs
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.backend import Backend
+
+_MULTI_BUFFER_API_MODES = {"auto", "on", "off"}
 
 
 def _sum_transfer_bytes(sizes: list[list[int]]) -> int:
     return sum(sum(size_group) for size_group in sizes)
+
+
+def _resolve_multi_buffer_apis(client: Any, mode: str):
+    if mode == "off":
+        return None, None
+
+    get_api = getattr(client, "mget_h2d_from_multi_buffers", None)
+    put_api = getattr(client, "mset_d2h_from_multi_buffers", None)
+    if get_api is not None and put_api is not None:
+        return get_api, put_api
+
+    if mode == "on":
+        missing = []
+        if get_api is None:
+            missing.append("mget_h2d_from_multi_buffers")
+        if put_api is None:
+            missing.append("mset_d2h_from_multi_buffers")
+        raise RuntimeError(
+            "VLLM_ASCEND_YUANRONG_MULTI_BUFFER_API=on requires an "
+            f"openyuanrong-datasystem SDK with: {', '.join(missing)}"
+        )
+
+    return None, None
 
 
 @dataclass
@@ -22,17 +48,25 @@ class YuanrongConfig:
     worker_addr: str
     enable_exclusive_connection: bool
     enable_remote_h2d: bool
+    multi_buffer_api: str
 
     @staticmethod
     def load_from_env() -> "YuanrongConfig":
         worker_addr = os.getenv("DS_WORKER_ADDR")
         if not worker_addr:
             raise ValueError("Environment variable DS_WORKER_ADDR is required, expected format '<host>:<port>'.")
+        multi_buffer_api = envs.VLLM_ASCEND_YUANRONG_MULTI_BUFFER_API
+        if multi_buffer_api not in _MULTI_BUFFER_API_MODES:
+            raise ValueError(
+                "VLLM_ASCEND_YUANRONG_MULTI_BUFFER_API must be one of "
+                f"{sorted(_MULTI_BUFFER_API_MODES)}, got '{multi_buffer_api}'."
+            )
 
         return YuanrongConfig(
             worker_addr=worker_addr,
             enable_exclusive_connection=bool(int(os.getenv("DS_ENABLE_EXCLUSIVE_CONNECTION", "0"))),
             enable_remote_h2d=bool(int(os.getenv("DS_ENABLE_REMOTE_H2D", "0"))),
+            multi_buffer_api=multi_buffer_api,
         )
 
 
@@ -61,15 +95,18 @@ class YuanrongHelper:
             normalized.append(sanitized[:max_prefix_len] + suffix)
         return normalized
 
+    @property
+    def device_id(self) -> int:
+        if self._device_id is None:
+            raise RuntimeError("Yuanrong backend device id is not initialized.")
+        return self._device_id
+
     def make_blob_lists(self, addrs_list: list[list[int]], sizes_list: list[list[int]]) -> list[Any]:
         total = len(addrs_list)
         if total != len(sizes_list):
             raise ValueError("Address list and size list length mismatch.")
 
-        device_id = self._device_id
-        if device_id is None:
-            logger.error("Device id is not set. Call set_device() before using the yuanrong backend.")
-            raise RuntimeError("Yuanrong backend device id is not initialized.")
+        device_id = self.device_id
 
         blob_lists: list[Any] = []
         for addrs, sizes in zip(addrs_list, sizes_list):
@@ -111,6 +148,15 @@ class YuanrongBackend(Backend):
             enable_remote_h2d=self.config.enable_remote_h2d,
         )
         self._hetero_client.init()
+        self._multi_buffer_get, self._multi_buffer_put = _resolve_multi_buffer_apis(
+            self._hetero_client, self.config.multi_buffer_api
+        )
+        selected_api = "multi_buffer" if self._multi_buffer_get is not None else "legacy_blob"
+        logger.info(
+            "Yuanrong descriptor API configured=%s, selected=%s",
+            self.config.multi_buffer_api,
+            selected_api,
+        )
 
     def _ensure_device_ready(self):
         if self._helper._device_id is None:
@@ -143,13 +189,16 @@ class YuanrongBackend(Backend):
         try:
             self._ensure_device_ready()
             keys = self._helper.normalize_keys(keys)
-            blob_lists = self._helper.make_blob_lists(addrs, sizes)
-            failed_keys = None
+            failed_keys: list[str]
             start_time = time.perf_counter()
             try:
-                failed_keys = self._hetero_client.mget_h2d(  # type: ignore[union-attr]
-                    keys, blob_lists, 0
-                )
+                if self._multi_buffer_get is not None:
+                    failed_keys = self._multi_buffer_get(keys, self._helper.device_id, addrs, sizes, 0)
+                else:
+                    blob_lists = self._helper.make_blob_lists(addrs, sizes)
+                    failed_keys = self._hetero_client.mget_h2d(  # type: ignore[union-attr]
+                        keys, blob_lists, 0
+                    )
             finally:
                 elapsed_ms = (time.perf_counter() - start_time) * 1000
                 logger.info("Yuanrong load_kvc took %.3f ms, bytes=%d", elapsed_ms, _sum_transfer_bytes(sizes))
@@ -164,12 +213,15 @@ class YuanrongBackend(Backend):
         try:
             self._ensure_device_ready()
             keys = self._helper.normalize_keys(keys)
-            blob_lists = self._helper.make_blob_lists(addrs, sizes)
             start_time = time.perf_counter()
             try:
-                self._hetero_client.mset_d2h(  # type: ignore[union-attr]
-                    keys, blob_lists, self._ds_set_param
-                )
+                if self._multi_buffer_put is not None:
+                    self._multi_buffer_put(keys, self._helper.device_id, addrs, sizes, self._ds_set_param)
+                else:
+                    blob_lists = self._helper.make_blob_lists(addrs, sizes)
+                    self._hetero_client.mset_d2h(  # type: ignore[union-attr]
+                        keys, blob_lists, self._ds_set_param
+                    )
             finally:
                 elapsed_ms = (time.perf_counter() - start_time) * 1000
                 logger.info("Yuanrong store_kvc took %.3f ms, bytes=%d", elapsed_ms, _sum_transfer_bytes(sizes))

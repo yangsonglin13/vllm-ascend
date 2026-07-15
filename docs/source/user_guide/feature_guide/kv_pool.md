@@ -1181,7 +1181,19 @@ export DS_WORKER_ADDR="${WORKER_IP}:31501"
 # Optional (default: 0)
 export DS_ENABLE_EXCLUSIVE_CONNECTION=0
 export DS_ENABLE_REMOTE_H2D=0
+# Optional (default: auto; valid values: auto, on, off)
+export VLLM_ASCEND_YUANRONG_MULTI_BUFFER_API=auto
 ```
+
+`VLLM_ASCEND_YUANRONG_MULTI_BUFFER_API` selects the Yuanrong descriptor API:
+
+- `auto` uses the multi-buffer Get and Set APIs when both are available in the
+  installed Yuanrong SDK, and otherwise falls back to the legacy Blob wrapper
+  APIs.
+- `on` requires both multi-buffer APIs and fails during backend initialization
+  when the installed SDK does not provide them.
+- `off` always uses the legacy Blob wrapper APIs, which is useful for A/B
+  comparison or rollback.
 
 ### Run AscendStoreConnector with Yuanrong backend
 
