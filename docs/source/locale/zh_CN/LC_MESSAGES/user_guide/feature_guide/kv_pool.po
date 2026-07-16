@@ -968,9 +968,11 @@ msgstr "使用 `dscli` 在每个节点上启动一个数据系统工作节点：
 
 #: ../../source/user_guide/feature_guide/kv_pool.md:816
 msgid ""
-"The `--worker_address` value is consumed later by `DS_WORKER_ADDR`, so "
-"keep the host and port identical on the same node."
-msgstr "`--worker_address` 的值稍后会被 `DS_WORKER_ADDR` 使用，因此请确保同一节点上的主机和端口保持一致。"
+"The `--worker_address` value is consumed later as `worker_addr` in "
+"`yuanrong.json`, so keep the host and port identical on the same node."
+msgstr ""
+"`--worker_address` 的值稍后会作为 `yuanrong.json` 中的 `worker_addr` 使用，"
+"因此请确保同一节点上的主机和端口保持一致。"
 
 #: ../../source/user_guide/feature_guide/kv_pool.md:819
 msgid ""
@@ -1010,8 +1012,8 @@ msgid "Must be consistent across all nodes to guarantee uniform hash generation.
 msgstr "必须在所有节点上保持一致，以确保哈希生成的统一性。"
 
 #: ../../source/user_guide/feature_guide/kv_pool.md
-msgid "`DS_WORKER_ADDR`"
-msgstr "`DS_WORKER_ADDR`"
+msgid "`YR_CONFIG_PATH`"
+msgstr "`YR_CONFIG_PATH`"
 
 #: ../../source/user_guide/feature_guide/kv_pool.md
 msgid "N/A"
@@ -1019,35 +1021,8 @@ msgstr "不适用"
 
 #: ../../source/user_guide/feature_guide/kv_pool.md
 msgid ""
-"Datasystem worker address in `<host>:<port>` format. This must match the "
-"local `dscli start --worker_address` value."
-msgstr "数据系统工作节点地址，格式为 `<主机>:<端口>`。此值必须与本地 `dscli start --worker_address` 的值匹配。"
-
-#: ../../source/user_guide/feature_guide/kv_pool.md
-msgid "`DS_ENABLE_EXCLUSIVE_CONNECTION`"
-msgstr "`DS_ENABLE_EXCLUSIVE_CONNECTION`"
-
-#: ../../source/user_guide/feature_guide/kv_pool.md
-msgid "No"
-msgstr "否"
-
-#: ../../source/user_guide/feature_guide/kv_pool.md
-msgid ""
-"Passed to Yuanrong `HeteroClient.enable_exclusive_connection`. Use `1` to"
-" enable the exclusive connection mode when required by your deployment."
-msgstr ""
-"传递给元戎 `HeteroClient.enable_exclusive_connection`。当您的部署需要时，使用 `1` "
-"来启用独占连接模式。"
-
-#: ../../source/user_guide/feature_guide/kv_pool.md
-msgid "`DS_ENABLE_REMOTE_H2D`"
-msgstr "`DS_ENABLE_REMOTE_H2D`"
-
-#: ../../source/user_guide/feature_guide/kv_pool.md
-msgid ""
-"Passed to Yuanrong `HeteroClient.enable_remote_h2d`. Use `1` only after "
-"the Remote H2D requirements below are met."
-msgstr "传递给元戎 `HeteroClient.enable_remote_h2d`。仅当满足以下远程 H2D 要求后才使用 `1`。"
+"Full path to the `yuanrong.json` config file described below."
+msgstr "下文所述 `yuanrong.json` 配置文件的完整路径。"
 
 #: ../../source/user_guide/feature_guide/kv_pool.md:847
 msgid "Remote H2D Requirements"
@@ -1055,9 +1030,11 @@ msgstr "远程 H2D 要求"
 
 #: ../../source/user_guide/feature_guide/kv_pool.md:849
 msgid ""
-"Set `DS_ENABLE_REMOTE_H2D=1` only when Remote Host-to-Device transfer is "
+"Set `enable_remote_h2d` to `true` only when Remote Host-to-Device transfer is "
 "enabled and verified in the Yuanrong Datasystem deployment:"
-msgstr "仅在元戎数据系统部署中启用并验证了远程主机到设备传输时，才设置 `DS_ENABLE_REMOTE_H2D=1`："
+msgstr ""
+"仅在元戎数据系统部署中启用并验证了远程主机到设备传输时，才将 "
+"`enable_remote_h2d` 设为 `true`："
 
 #: ../../source/user_guide/feature_guide/kv_pool.md:852
 msgid ""
@@ -1090,15 +1067,22 @@ msgstr ""
 "smi`、`hccn_tool`、`/etc/hccn.conf`、`/etc/ascend_install.info` 以及所需的 "
 "`/dev/davinci*` 设备。"
 
-#: ../../source/user_guide/feature_guide/kv_pool.md:876
-msgid "Verify the NPU and RoCE environment before enabling the client flag:"
-msgstr "在启用客户端标志前验证 NPU 和 RoCE 环境："
+#: ../../source/user_guide/feature_guide/kv_pool.md:1002
+msgid ""
+"Verify the NPU environment before enabling the client flag. The RoCE checks "
+"below apply to `P2P_TRANSFER` and HIXL RoCE direct mode; HCCS buffer-pool mode "
+"does not require a reachable RoCE link:"
+msgstr ""
+"在启用客户端标志前验证 NPU 环境。以下 RoCE 检查适用于 `P2P_TRANSFER` 和 HIXL "
+"RoCE 直连模式；HCCS 缓冲池模式不要求 RoCE 链路可达："
 
 #: ../../source/user_guide/feature_guide/kv_pool.md:904
 msgid ""
-"If these checks fail, keep `DS_ENABLE_REMOTE_H2D=0` and use the default "
-"Datasystem transfer path."
-msgstr "如果这些检查失败，请保持 `DS_ENABLE_REMOTE_H2D=0` 并使用默认的数据系统传输路径。"
+"If these checks fail, keep `enable_remote_h2d` at `false` in `yuanrong.json` "
+"and use the default Datasystem transfer path."
+msgstr ""
+"如果这些检查失败，请在 `yuanrong.json` 中将 `enable_remote_h2d` 保持为 "
+"`false`，并使用默认的数据系统传输路径。"
 
 #: ../../source/user_guide/feature_guide/kv_pool.md:907
 msgid "Run AscendStoreConnector with Yuanrong backend"
@@ -1122,19 +1106,27 @@ msgstr "注意事项"
 
 #: ../../source/user_guide/feature_guide/kv_pool.md:940
 msgid ""
-"The Yuanrong backend normalizes KV keys before calling Datasystem. Keys "
-"longer than 255 characters or containing unsupported characters are "
-"rewritten, so do not rely on the raw key string when debugging backend "
-"storage."
+"The Yuanrong backend passes KV keys to the Datasystem SDK as-is, without "
+"rewriting them. Ensure keys are valid Datasystem keys in production."
 msgstr ""
-"元戎后端在调用数据系统之前会对 KV 键进行规范化处理。长度超过 255 "
-"个字符或包含不支持字符的键会被重写，因此在调试后端存储时，请勿依赖原始的键字符串。"
+"元戎后端将 KV 键原样传递给 Datasystem SDK，不做重写。请确保生产环境中的键是有效的 "
+"Datasystem 键。"
 
 #: ../../source/user_guide/feature_guide/kv_pool.md:943
 msgid ""
-"No extra buffer pre-registration step is required for Yuanrong. The "
-"backend uses device pointers directly when building blob lists."
-msgstr "元戎不需要额外的缓冲区预注册步骤。该后端在构建 blob 列表时直接使用设备指针。"
+"When `enable_remote_h2d` is `true` and `remote_h2d_transport_backend` is "
+"`HIXL` (with `enable_fabric_mem` `false`), the backend pre-registers device "
+"buffer pointers (`register_buffer`) with the Datasystem worker to enable "
+"Remote H2D transfer — but only if `enable_dev_mem_pregister` is `true`. "
+"`enable_dev_mem_pregister` defaults to `false`, so pre-registration is opt-in. "
+"Under `P2P_TRANSFER` or FabricMem mode the backend skips pre-registration and "
+"uses device pointers directly when building blob lists."
+msgstr ""
+"当 `enable_remote_h2d` 为 `true` 且 `remote_h2d_transport_backend` 为 `HIXL`（且 "
+"`enable_fabric_mem` 为 `false`）时，后端会向 Datasystem 工作进程预注册设备缓冲区指针"
+"（`register_buffer`）以启用远程 H2D 传输，但仅在 `enable_dev_mem_pregister` 为 "
+"`true` 时才执行。`enable_dev_mem_pregister` 默认为 `false`，因此预注册为按需开启。"
+"在 `P2P_TRANSFER` 或 FabricMem 模式下，后端会跳过预注册，并在构建 blob 列表时直接使用设备指针。"
 
 #: ../../source/user_guide/feature_guide/kv_pool.md:948
 msgid "FAQ"
