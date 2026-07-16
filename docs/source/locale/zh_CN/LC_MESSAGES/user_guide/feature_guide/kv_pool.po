@@ -1219,9 +1219,11 @@ msgstr "使用 `dscli` 在每个节点上启动数据系统工作节点。以下
 
 #: ../../source/user_guide/feature_guide/kv_pool.md:891
 msgid ""
-"The `--worker_address` value is consumed later by `DS_WORKER_ADDR`, so keep "
-"the host and port identical on the same node."
-msgstr "`--worker_address` 的值稍后会被 `DS_WORKER_ADDR` 使用，因此在同一节点上保持主机和端口一致。"
+"The `--worker_address` value is consumed later as `worker_addr` in "
+"`yuanrong.json`, so keep the host and port identical on the same node."
+msgstr ""
+"`--worker_address` 的值稍后会作为 `yuanrong.json` 中的 `worker_addr` 使用，"
+"因此请确保同一节点上的主机和端口保持一致。"
 
 #: ../../source/user_guide/feature_guide/kv_pool.md:894
 msgid "The tuning parameters above have the following effects:"
@@ -1436,9 +1438,11 @@ msgstr "远程 H2D 要求"
 
 #: ../../source/user_guide/feature_guide/kv_pool.md:962
 msgid ""
-"Set `DS_ENABLE_REMOTE_H2D=1` only when Remote Host-to-Device transfer is "
+"Set `enable_remote_h2d` to `true` only when Remote Host-to-Device transfer is\n"
 "enabled and verified in the Yuanrong Datasystem deployment:"
-msgstr "仅在元戎数据系统部署中启用并验证了远程主机到设备传输时，才设置 `DS_ENABLE_REMOTE_H2D=1`："
+msgstr ""
+"仅在元戎 Datasystem 部署中启用并验证了远程主机到设备传输时，才将"
+"`enable_remote_h2d` 设为 `true`："
 
 #: ../../source/user_guide/feature_guide/kv_pool.md:965
 msgid ""
@@ -1476,9 +1480,11 @@ msgstr "在启用客户端标志前验证 NPU 和 RoCE 环境："
 
 #: ../../source/user_guide/feature_guide/kv_pool.md:1022
 msgid ""
-"If these checks fail, keep `DS_ENABLE_REMOTE_H2D=0` and use the default "
-"Datasystem transfer path."
-msgstr "如果这些检查失败，请保持 `DS_ENABLE_REMOTE_H2D=0` 并使用默认的数据系统传输路径。"
+"If these checks fail, keep `enable_remote_h2d` at `false` in `yuanrong.json` "
+"and use the default Datasystem transfer path."
+msgstr ""
+"如果这些检查失败，请在 `yuanrong.json` 中将 `enable_remote_h2d` 保持为 "
+"`false` 并使用默认的 Datasystem 传输路径。"
 
 #: ../../source/user_guide/feature_guide/kv_pool.md:1025
 msgid "Run AscendStoreConnector with Yuanrong backend"
@@ -1501,14 +1507,25 @@ msgstr "说明"
 
 #: ../../source/user_guide/feature_guide/kv_pool.md:1058
 msgid ""
-"The Yuanrong backend normalizes KV keys before calling Datasystem. Supported"
-" ASCII keys up to 1024 bytes are preserved. Longer keys or keys containing "
-"unsupported characters are rewritten to a maximum of 1024 characters with a "
-"hash suffix, so do not rely on the raw key string when debugging backend "
-"storage."
+"* The Yuanrong backend passes KV keys to the Datasystem SDK as-is, without\n"
+"  rewriting them. Ensure keys are valid Datasystem keys in production.\n"
+"* When `enable_remote_h2d` is `true` and `remote_h2d_transport_backend` is\n"
+"  `HIXL` (with `enable_fabric_mem` `false`), the backend pre-registers device\n"
+"  buffer pointers (`register_buffer`) with the Datasystem worker to enable\n"
+"  Remote H2D transfer — but only if `enable_dev_mem_pregister` is `true`.\n"
+"  `enable_dev_mem_pregister` defaults to `false`, so pre-registration is opt-in.\n"
+"  Under `P2P_TRANSFER` or FabricMem mode the backend skips pre-registration and\n"
+"  uses device pointers directly when building blob lists."
 msgstr ""
-"元戎后端在调用数据系统前会对 KV 键进行规范化。支持的最长 1024 字节的 ASCII 键会被保留。更长的键或包含不支持字符的键会被重写为最多 "
-"1024 个字符并附加哈希后缀，因此在调试后端存储时不要依赖原始键字符串。"
+"* 元戎后端将 KV 键原样传递给 Datasystem SDK，不做重写。请确保生产环境中的键是有效的"
+"  Datasystem 键。\n"
+"* 当 `enable_remote_h2d` 为 `true` 且 `remote_h2d_transport_backend` 为"
+"  `HIXL`（且 `enable_fabric_mem` 为 `false`）时，后端会向 Datasystem 工作进程"
+"  预注册设备缓冲区指针（`register_buffer`）以启用远程 H2D 传输——但仅在"
+"  `enable_dev_mem_pregister` 为 `true` 时才执行。"
+"  `enable_dev_mem_pregister` 默认为 `false`，因此预注册为按需开启。在"
+"  `P2P_TRANSFER` 或 FabricMem 模式下，后端跳过预注册，在构建 blob 列表时"
+"  直接使用设备指针。"
 
 #: ../../source/user_guide/feature_guide/kv_pool.md:1063
 msgid ""
