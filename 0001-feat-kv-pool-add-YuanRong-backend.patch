@@ -1,0 +1,187 @@
+From bd02659f976dad87ac2d60e45f16768e85501708 Mon Sep 17 00:00:00 2001
+From: yangsonglin13 <yangsonglin566@gmail.com>
+Date: Sat, 18 Jul 2026 11:41:36 +0800
+Subject: [PATCH 1/2] feat(kv-pool): add YuanRong backend
+
+Port the YuanRong KV pool backend from yuanrong_op to v0.18.0. Register the backend in the release branch architecture and use the PR #1412 multi-buffer APIs with file-based client configuration.
+
+Signed-off-by: yangsonglin13 <yangsonglin566@gmail.com>
+---
+ .../ascend_store/backend/yuanrong_backend.py  | 149 ++++++++++++++++++
+ .../kv_pool/ascend_store/pool_worker.py       |   4 +
+ 2 files changed, 153 insertions(+)
+ create mode 100644 vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/yuanrong_backend.py
+
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/yuanrong_backend.py b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/yuanrong_backend.py
+new file mode 100644
+index 000000000..08b9924bf
+--- /dev/null
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/yuanrong_backend.py
+@@ -0,0 +1,149 @@
++import json
++import os
++from dataclasses import dataclass
++
++import torch
++from vllm.config import ParallelConfig
++from vllm.distributed.parallel_state import get_world_group
++from vllm.logger import logger
++from vllm.utils.network_utils import split_host_port
++
++from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.backend import Backend
++
++
++@dataclass
++class YuanrongConfig:
++    worker_addr: str
++    enable_remote_h2d: bool
++    remote_h2d_transport_backend: str
++    enable_fabric_mem: bool
++
++    @staticmethod
++    def from_file(file_path: str) -> "YuanrongConfig":
++        with open(file_path) as file:
++            config = json.load(file)
++        return YuanrongConfig(
++            worker_addr=config.get("worker_addr", ""),
++            enable_remote_h2d=bool(config.get("enable_remote_h2d", False)),
++            remote_h2d_transport_backend=config.get("remote_h2d_transport_backend", "HIXL"),
++            enable_fabric_mem=bool(config.get("enable_fabric_mem", False)),
++        )
++
++    @staticmethod
++    def load_from_env() -> "YuanrongConfig":
++        config_path = os.getenv("YR_CONFIG_PATH")
++        if not config_path:
++            raise ValueError("The environment variable 'YR_CONFIG_PATH' is not set.")
++        return YuanrongConfig.from_file(config_path)
++
++
++class YuanrongBackend(Backend):
++    def __init__(self, parallel_config: ParallelConfig):
++        try:
++            from yr.datasystem.hetero_client import HeteroClient  # type: ignore[import-not-found]
++            from yr.datasystem.kv_client import SetParam  # type: ignore[import-not-found]
++            from yr.datasystem.object_client import WriteMode  # type: ignore[import-not-found]
++        except ImportError as exc:
++            raise ImportError(
++                "Please install openyuanrong-datasystem by following the instructions at "
++                "https://atomgit.com/openeuler/yuanrong-datasystem/blob/master/docs/source_zh_cn/installation/installation_linux.md "  # noqa: E501
++                "to run vLLM with AscendStoreConnector."
++            ) from exc
++
++        self._ds_set_param = SetParam()
++        self._ds_set_param.write_mode = WriteMode.NONE_L2_CACHE_EVICT
++
++        self.config = YuanrongConfig.load_from_env()
++        try:
++            host, port = split_host_port(self.config.worker_addr)
++        except Exception as exc:
++            raise ValueError(
++                f"Invalid worker_addr {self.config.worker_addr} in yuanrong config, expected '<host>:<port>'."
++            ) from exc
++        self.store = HeteroClient(
++            host,
++            int(port),
++            enable_remote_h2d=self.config.enable_remote_h2d,
++        )
++        self.store.init()
++        self._needs_dev_mem_pregister = (
++            self.config.enable_remote_h2d
++            and self.config.remote_h2d_transport_backend == "HIXL"
++            and not self.config.enable_fabric_mem
++        )
++        self._registered_buffers: tuple[list[int], list[int]] | None = None
++        self._buffers_registered = False
++
++    def set_device(self):
++        local_rank = get_world_group().local_rank
++        device = torch.device(f"npu:{local_rank}")
++        torch.npu.set_device(device)
++
++    def register_buffer(self, ptrs: list[int], lengths: list[int]):
++        self._registered_buffers = (list(ptrs), list(lengths))
++        self._register_buffers_if_needed()
++
++    def _register_buffers_if_needed(self):
++        if not self._needs_dev_mem_pregister:
++            return
++        if self._registered_buffers is None or self._buffers_registered:
++            return
++        ptrs, lengths = self._registered_buffers
++        self.store.pre_register_device_memory(ptrs, lengths)
++        self._buffers_registered = True
++
++    def exists(self, keys: list[str]) -> list[int]:
++        try:
++            return self.store.batch_is_exist(keys)
++        except Exception as exc:
++            logger.error(
++                "Failed to check keys. keys_count=%d, type=%s, error=%s. Check network and yuanrong service.",
++                len(keys),
++                type(exc).__name__,
++                exc,
++            )
++            return [0] * len(keys)
++
++    def get(self, keys: list[str], addrs: list[list[int]], sizes: list[list[int]]) -> list[int] | None:
++        failed_keys_for_log = keys
++        try:
++            failed_keys = self.store.mget_h2d_from_multi_buffers(keys, addrs, sizes, 0)
++            if failed_keys:
++                logger.error(
++                    "Failed to get %d keys out of %d. Check key existence and memory state.",
++                    len(failed_keys),
++                    len(keys),
++                )
++                logger.debug("Failed to get key details. failed_keys=%s", failed_keys)
++            failed_set = set(failed_keys)
++            return [1 if key in failed_set else 0 for key in keys]
++        except Exception as exc:
++            logger.error(
++                "Failed to get %d keys out of %d. Check network and yuanrong service.",
++                len(failed_keys_for_log),
++                len(keys),
++            )
++            logger.debug(
++                "Failed to get key details. keys=%s, type=%s, error=%s",
++                failed_keys_for_log,
++                type(exc).__name__,
++                exc,
++            )
++            return None
++
++    def put(self, keys: list[str], addrs: list[list[int]], sizes: list[list[int]]):
++        failed_keys_for_log = keys
++        try:
++            self.store.mset_d2h_from_multi_buffers(keys, addrs, sizes, self._ds_set_param)
++        except Exception as exc:
++            logger.error(
++                "Failed to put %d keys out of %d. Check network and yuanrong service.",
++                len(failed_keys_for_log),
++                len(keys),
++            )
++            logger.debug(
++                "Failed to put key details. keys=%s, type=%s, error=%s",
++                failed_keys_for_log,
++                type(exc).__name__,
++                exc,
++            )
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py
+index a9dd0c2b6..e0b693aff 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py
+@@ -40,6 +40,10 @@ backend_map = {
+         "name": "MemcacheBackend",
+         "path": "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.memcache_backend",
+     },
++    "yuanrong": {
++        "name": "YuanrongBackend",
++        "path": "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.yuanrong_backend",
++    },
+ }
+ 
+ 
+-- 
+2.51.0.windows.1
+
