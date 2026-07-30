@@ -1,0 +1,1254 @@
+From e262020c31d3998a26221acbd44fe344dfe8ca42 Mon Sep 17 00:00:00 2001
+From: yangsonglin13 <yangsonglin566@gmail.com>
+Date: Thu, 16 Jul 2026 21:16:46 +0800
+Subject: [PATCH] perf: use Yuanrong multi-buffer APIs with configurable
+ timeouts
+
+Switch the Yuanrong backend to the synchronous multi-buffer APIs introduced by openyuanrong-datasystem.
+
+Load Yuanrong client settings from the YR_CONFIG_PATH JSON file.
+
+Remove the obsolete environment-variable configuration, compatibility helpers, and redundant device/empty-key handling.
+
+Signed-off-by: yangsonglin13 <yangsonglin566@gmail.com>
+---
+ .../user_guide/feature_guide/kv_pool.po       |  94 +++----
+ .../user_guide/feature_guide/kv_pool.md       | 134 +++++++--
+ .../distributed/ascend_store/test_backend.py  | 258 ++++++++----------
+ tests/ut/distributed/test_yuanrong_backend.py | 245 +++++++++++++++++
+ .../ascend_store/backend/yuanrong_backend.py  | 184 ++++---------
+ 5 files changed, 568 insertions(+), 347 deletions(-)
+ create mode 100644 tests/ut/distributed/test_yuanrong_backend.py
+
+diff --git a/docs/source/locale/zh_CN/LC_MESSAGES/user_guide/feature_guide/kv_pool.po b/docs/source/locale/zh_CN/LC_MESSAGES/user_guide/feature_guide/kv_pool.po
+index 46d1e3a6b..32b2fbb31 100644
+--- a/docs/source/locale/zh_CN/LC_MESSAGES/user_guide/feature_guide/kv_pool.po
++++ b/docs/source/locale/zh_CN/LC_MESSAGES/user_guide/feature_guide/kv_pool.po
+@@ -968,9 +968,11 @@ msgstr "使用 `dscli` 在每个节点上启动一个数据系统工作节点：
+ 
+ #: ../../source/user_guide/feature_guide/kv_pool.md:816
+ msgid ""
+-"The `--worker_address` value is consumed later by `DS_WORKER_ADDR`, so "
+-"keep the host and port identical on the same node."
+-msgstr "`--worker_address` 的值稍后会被 `DS_WORKER_ADDR` 使用，因此请确保同一节点上的主机和端口保持一致。"
++"The `--worker_address` value is consumed later as `worker_addr` in "
++"`yuanrong.json`, so keep the host and port identical on the same node."
++msgstr ""
++"`--worker_address` 的值稍后会作为 `yuanrong.json` 中的 `worker_addr` 使用，"
++"因此请确保同一节点上的主机和端口保持一致。"
+ 
+ #: ../../source/user_guide/feature_guide/kv_pool.md:819
+ msgid ""
+@@ -1010,8 +1012,8 @@ msgid "Must be consistent across all nodes to guarantee uniform hash generation.
+ msgstr "必须在所有节点上保持一致，以确保哈希生成的统一性。"
+ 
+ #: ../../source/user_guide/feature_guide/kv_pool.md
+-msgid "`DS_WORKER_ADDR`"
+-msgstr "`DS_WORKER_ADDR`"
++msgid "`YR_CONFIG_PATH`"
++msgstr "`YR_CONFIG_PATH`"
+ 
+ #: ../../source/user_guide/feature_guide/kv_pool.md
+ msgid "N/A"
+@@ -1019,35 +1021,8 @@ msgstr "不适用"
+ 
+ #: ../../source/user_guide/feature_guide/kv_pool.md
+ msgid ""
+-"Datasystem worker address in `<host>:<port>` format. This must match the "
+-"local `dscli start --worker_address` value."
+-msgstr "数据系统工作节点地址，格式为 `<主机>:<端口>`。此值必须与本地 `dscli start --worker_address` 的值匹配。"
+-
+-#: ../../source/user_guide/feature_guide/kv_pool.md
+-msgid "`DS_ENABLE_EXCLUSIVE_CONNECTION`"
+-msgstr "`DS_ENABLE_EXCLUSIVE_CONNECTION`"
+-
+-#: ../../source/user_guide/feature_guide/kv_pool.md
+-msgid "No"
+-msgstr "否"
+-
+-#: ../../source/user_guide/feature_guide/kv_pool.md
+-msgid ""
+-"Passed to Yuanrong `HeteroClient.enable_exclusive_connection`. Use `1` to"
+-" enable the exclusive connection mode when required by your deployment."
+-msgstr ""
+-"传递给元戎 `HeteroClient.enable_exclusive_connection`。当您的部署需要时，使用 `1` "
+-"来启用独占连接模式。"
+-
+-#: ../../source/user_guide/feature_guide/kv_pool.md
+-msgid "`DS_ENABLE_REMOTE_H2D`"
+-msgstr "`DS_ENABLE_REMOTE_H2D`"
+-
+-#: ../../source/user_guide/feature_guide/kv_pool.md
+-msgid ""
+-"Passed to Yuanrong `HeteroClient.enable_remote_h2d`. Use `1` only after "
+-"the Remote H2D requirements below are met."
+-msgstr "传递给元戎 `HeteroClient.enable_remote_h2d`。仅当满足以下远程 H2D 要求后才使用 `1`。"
++"Full path to the `yuanrong.json` config file described below."
++msgstr "下文所述 `yuanrong.json` 配置文件的完整路径。"
+ 
+ #: ../../source/user_guide/feature_guide/kv_pool.md:847
+ msgid "Remote H2D Requirements"
+@@ -1055,9 +1030,11 @@ msgstr "远程 H2D 要求"
+ 
+ #: ../../source/user_guide/feature_guide/kv_pool.md:849
+ msgid ""
+-"Set `DS_ENABLE_REMOTE_H2D=1` only when Remote Host-to-Device transfer is "
++"Set `enable_remote_h2d` to `true` only when Remote Host-to-Device transfer is "
+ "enabled and verified in the Yuanrong Datasystem deployment:"
+-msgstr "仅在元戎数据系统部署中启用并验证了远程主机到设备传输时，才设置 `DS_ENABLE_REMOTE_H2D=1`："
++msgstr ""
++"仅在元戎数据系统部署中启用并验证了远程主机到设备传输时，才将 "
++"`enable_remote_h2d` 设为 `true`："
+ 
+ #: ../../source/user_guide/feature_guide/kv_pool.md:852
+ msgid ""
+@@ -1090,15 +1067,22 @@ msgstr ""
+ "smi`、`hccn_tool`、`/etc/hccn.conf`、`/etc/ascend_install.info` 以及所需的 "
+ "`/dev/davinci*` 设备。"
+ 
+-#: ../../source/user_guide/feature_guide/kv_pool.md:876
+-msgid "Verify the NPU and RoCE environment before enabling the client flag:"
+-msgstr "在启用客户端标志前验证 NPU 和 RoCE 环境："
++#: ../../source/user_guide/feature_guide/kv_pool.md:1002
++msgid ""
++"Verify the NPU environment before enabling the client flag. The RoCE checks "
++"below apply to `P2P_TRANSFER` and HIXL RoCE direct mode; HCCS buffer-pool mode "
++"does not require a reachable RoCE link:"
++msgstr ""
++"在启用客户端标志前验证 NPU 环境。以下 RoCE 检查适用于 `P2P_TRANSFER` 和 HIXL "
++"RoCE 直连模式；HCCS 缓冲池模式不要求 RoCE 链路可达："
+ 
+ #: ../../source/user_guide/feature_guide/kv_pool.md:904
+ msgid ""
+-"If these checks fail, keep `DS_ENABLE_REMOTE_H2D=0` and use the default "
+-"Datasystem transfer path."
+-msgstr "如果这些检查失败，请保持 `DS_ENABLE_REMOTE_H2D=0` 并使用默认的数据系统传输路径。"
++"If these checks fail, keep `enable_remote_h2d` at `false` in `yuanrong.json` "
++"and use the default Datasystem transfer path."
++msgstr ""
++"如果这些检查失败，请在 `yuanrong.json` 中将 `enable_remote_h2d` 保持为 "
++"`false`，并使用默认的数据系统传输路径。"
+ 
+ #: ../../source/user_guide/feature_guide/kv_pool.md:907
+ msgid "Run AscendStoreConnector with Yuanrong backend"
+@@ -1122,19 +1106,27 @@ msgstr "注意事项"
+ 
+ #: ../../source/user_guide/feature_guide/kv_pool.md:940
+ msgid ""
+-"The Yuanrong backend normalizes KV keys before calling Datasystem. Keys "
+-"longer than 255 characters or containing unsupported characters are "
+-"rewritten, so do not rely on the raw key string when debugging backend "
+-"storage."
++"The Yuanrong backend passes KV keys to the Datasystem SDK as-is, without "
++"rewriting them. Ensure keys are valid Datasystem keys in production."
+ msgstr ""
+-"元戎后端在调用数据系统之前会对 KV 键进行规范化处理。长度超过 255 "
+-"个字符或包含不支持字符的键会被重写，因此在调试后端存储时，请勿依赖原始的键字符串。"
++"元戎后端将 KV 键原样传递给 Datasystem SDK，不做重写。请确保生产环境中的键是有效的 "
++"Datasystem 键。"
+ 
+ #: ../../source/user_guide/feature_guide/kv_pool.md:943
+ msgid ""
+-"No extra buffer pre-registration step is required for Yuanrong. The "
+-"backend uses device pointers directly when building blob lists."
+-msgstr "元戎不需要额外的缓冲区预注册步骤。该后端在构建 blob 列表时直接使用设备指针。"
++"When `enable_remote_h2d` is `true` and `remote_h2d_transport_backend` is "
++"`HIXL` (with `enable_fabric_mem` `false`), the backend pre-registers device "
++"buffer pointers (`register_buffer`) with the Datasystem worker to enable "
++"Remote H2D transfer — but only if `enable_dev_mem_pregister` is `true`. "
++"`enable_dev_mem_pregister` defaults to `false`, so pre-registration is opt-in. "
++"Under `P2P_TRANSFER` or FabricMem mode the backend skips pre-registration and "
++"uses device pointers directly when building blob lists."
++msgstr ""
++"当 `enable_remote_h2d` 为 `true` 且 `remote_h2d_transport_backend` 为 `HIXL`（且 "
++"`enable_fabric_mem` 为 `false`）时，后端会向 Datasystem 工作进程预注册设备缓冲区指针"
++"（`register_buffer`）以启用远程 H2D 传输，但仅在 `enable_dev_mem_pregister` 为 "
++"`true` 时才执行。`enable_dev_mem_pregister` 默认为 `false`，因此预注册为按需开启。"
++"在 `P2P_TRANSFER` 或 FabricMem 模式下，后端会跳过预注册，并在构建 blob 列表时直接使用设备指针。"
+ 
+ #: ../../source/user_guide/feature_guide/kv_pool.md:948
+ msgid "FAQ"
+diff --git a/docs/source/user_guide/feature_guide/kv_pool.md b/docs/source/user_guide/feature_guide/kv_pool.md
+index dfa363dda..5b7ad7a8d 100644
+--- a/docs/source/user_guide/feature_guide/kv_pool.md
++++ b/docs/source/user_guide/feature_guide/kv_pool.md
+@@ -798,8 +798,8 @@ dscli start -w \
+   --sc_stream_socket_num 0
+ ```
+ 
+-The `--worker_address` value is consumed later by `DS_WORKER_ADDR`, so keep
+-the host and port identical on the same node.
++The `--worker_address` value is consumed later as `worker_addr` in
++`yuanrong.json`, so keep the host and port identical on the same node.
+ 
+ The tuning parameters above have the following effects:
+ 
+@@ -848,17 +848,13 @@ Set the following environment variables on each node before starting vLLM:
+ | Variable | Required | Default | Description |
+ | :--- | :--- | :--- | :--- |
+ | `PYTHONHASHSEED` | Yes | `0` | Must be consistent across all nodes to guarantee uniform hash generation. |
+-| `DS_WORKER_ADDR` | Yes | N/A | Datasystem worker address in `<host>:<port>` format. This must match the local `dscli start --worker_address` value. |
++| `YR_CONFIG_PATH` | Yes | N/A | Full path to the `yuanrong.json` config file described below. |
+ | `DATASYSTEM_CLIENT_LOG_DIR` | No | `~/.datasystem/logs` | Directory for Yuanrong client SDK logs created by the vLLM process. Use a directory separate from the worker logs. |
+-| `DS_ENABLE_EXCLUSIVE_CONNECTION` | No | `0` | Passed to Yuanrong `HeteroClient.enable_exclusive_connection`. Use `1` to enable the exclusive connection mode when required by your deployment. |
+-| `DS_ENABLE_REMOTE_H2D` | No | `0` | Passed to Yuanrong `HeteroClient.enable_remote_h2d`. Use `1` only after the Remote H2D requirements below are met. |
+ 
+ ```bash
+ export PYTHONHASHSEED=0
+-export DS_WORKER_ADDR="${WORKER_IP}:31501"
++export YR_CONFIG_PATH="/xxxxxx/yuanrong.json"
+ export DATASYSTEM_CLIENT_LOG_DIR="/var/log/yuanrong/client"
+-export DS_ENABLE_EXCLUSIVE_CONNECTION=0
+-export DS_ENABLE_REMOTE_H2D=0
+ 
+ mkdir -p "${DATASYSTEM_CLIENT_LOG_DIR}"
+ ```
+@@ -867,9 +863,70 @@ Set `DATASYSTEM_CLIENT_LOG_DIR` before starting vLLM because the Yuanrong
+ client reads it during logging initialization. Client SDK logs, whose base
+ name is normally `ds_client`, are written to this directory.
+ 
++#### Configure yuanrong.json
++
++The `yuanrong.json` file pointed to by `YR_CONFIG_PATH` carries the Yuanrong
++client connection options:
++
++```json
++{
++    "worker_addr": "1.2.3.4:31501",
++    "connect_timeout_ms": 9000,
++    "request_timeout_ms": 0,
++    "get_sub_timeout_ms": 0,
++    "enable_remote_h2d": false,
++    "remote_h2d_transport_backend": "HIXL",
++    "enable_fabric_mem": false,
++    "enable_dev_mem_pregister": false
++}
++```
++
++**worker_addr**: Datasystem worker address in `<host>:<port>` format. This
++must match the local `dscli start --worker_address` value.
++**connect_timeout_ms**: Maximum time in milliseconds for the Yuanrong client
++to establish a connection. Yuanrong requires an integer greater than or equal
++to `500`. Defaults to `9000`.
++**request_timeout_ms**: Timeout in milliseconds for Yuanrong client requests.
++Defaults to `0`, which preserves the Yuanrong SDK behavior of using
++`connect_timeout_ms` as the request timeout. Set a positive value to control
++request timeout independently.
++**get_sub_timeout_ms**: Maximum time in milliseconds for each
++`mget_h2d_from_multi_buffers` request to wait for objects to become ready. `0`
++means that no waiting is allowed. Defaults to `0`. Yuanrong validates this
++value when the Get request runs. It may be greater than `request_timeout_ms`;
++the Yuanrong Get path expands that call's RPC timeout to accommodate the
++configured object-ready wait.
++**enable_remote_h2d**: Passed to Yuanrong `HeteroClient.enable_remote_h2d`.
++Use `true` only after the Remote H2D requirements below are met. Defaults to
++`false`.
++**remote_h2d_transport_backend**: vLLM-side transport name, used by the
++Yuanrong backend to decide whether to pre-register device memory. `HIXL`
++(default) for HIXL HCCS (covers buffer-pool, HIXL RoCE direct, and FabricMem
++sub-modes); `P2P_TRANSFER` for datasystem P2P-Transfer over RoCE. Must
++correspond to the worker-side `--remote_h2d_link_type` (see the
++[Remote H2D link parameters](#remote-h2d-link-parameters) table below for
++the `HIXL` ↔ `HCCS` / `P2P_TRANSFER` ↔ `ROCE` mapping). Under `HIXL` the
++backend pre-registers device memory unless `enable_fabric_mem` is `true`;
++under `P2P_TRANSFER` it skips pre-registration.
++**enable_fabric_mem**: Selects HIXL FabricMem mode, where HIXL
++`OPTION_ENABLE_USE_FABRIC_MEM` handles Fabric shareable handle exchange
++automatically and the backend skips client-side `pre_register_device_memory`.
++Only meaningful when `remote_h2d_transport_backend="HIXL"`. Defaults to `false`.
++FabricMem requires datasystem-side support (HIXL FabricMem build and the
++corresponding datasystem environment variable); check the datasystem
++documentation before enabling this flag.
++**enable_dev_mem_pregister**: Master toggle for client-side device memory
++pre-registration (`pre_register_device_memory`). Defaults to `false`, so the
++backend does **not** pre-register device buffer pointers by default. To actually
++pre-register, this flag must be `true` **and** the automatic conditions must
++hold: `enable_remote_h2d=true`, `remote_h2d_transport_backend="HIXL"`, and
++`enable_fabric_mem=false`. Under `P2P_TRANSFER` or FabricMem mode pre-registration
++is always skipped regardless of this toggle. Set this to `true` for HIXL HCCS
++Remote H2D deployments that require client-side device memory registration.
++
+ #### Remote H2D Requirements
+ 
+-Set `DS_ENABLE_REMOTE_H2D=1` only when Remote Host-to-Device transfer is
++Set `enable_remote_h2d` to `true` only when Remote Host-to-Device transfer is
+ enabled and verified in the Yuanrong Datasystem deployment:
+ 
+ * Reserve enough 2 MiB HugeTLB pages before starting the worker. For 40 GiB
+@@ -894,14 +951,51 @@ dscli start -w \
+   --enable_worker_worker_batch_get true \
+   --sc_regular_socket_num 0 \
+   --sc_stream_socket_num 0 \
+-  --remote_h2d_device_ids "0,1,2,3,4,5,6,7"
++  --remote_h2d_device_ids "0,1,2,3,4,5,6,7" \
++  --remote_h2d_link_type "ROCE"
++```
++
++For HIXL HCCS links (Atlas A3 with HCCS reachability), set
++`--remote_h2d_link_type "HCCS"` and the HIXL buffer-pool parameter. The IP in
++`--worker_address` is also used as the HIXL endpoint IP, so use a reachable
++address rather than `127.0.0.1` or `0.0.0.0`. HIXL RoCE direct mode is a
++sub-mode of HCCS selected by `HCCL_INTRA_ROCE_ENABLE=1` on both sides and
++additionally requires a reachable RoCE link:
++
++```bash
++dscli start -w \
++  --worker_address "${WORKER_IP}:31501" \
++  --etcd_address "${ETCD_IP}:2379" \
++  --log_dir "/var/log/yuanrong/worker" \
++  --shared_memory_size_mb 40960 \
++  --arena_per_tenant 1 \
++  --enable_huge_tlb true \
++  --enable_fallocate false \
++  --rpc_thread_num 64 \
++  --oc_thread_num 64 \
++  --enable_worker_worker_batch_get true \
++  --sc_regular_socket_num 0 \
++  --sc_stream_socket_num 0 \
++  --remote_h2d_device_ids "0,1,2,3,4,5,6,7" \
++  --remote_h2d_link_type "HCCS" \
++  --remote_h2d_hccs_buffer_pool "4:8"
+ ```
+ 
++#### Remote H2D link parameters
++
++| Parameter | Default | Description |
++| :--- | :--- | :--- |
++| `remote_h2d_device_ids` | empty | Non-empty enables worker-side RH2D. Comma-separated device IDs, e.g. `"0,1,2,3,4,5,6,7"`. |
++| `remote_h2d_link_type` | `ROCE` | Link type, case-sensitive. `ROCE` for P2P-Transfer over RoCE; `HCCS` for HIXL HCCS (covers buffer-pool, HIXL RoCE direct, and FabricMem sub-modes). Must correspond to the client-side `remote_h2d_transport_backend` in `yuanrong.json` (`ROCE` ↔ `P2P_TRANSFER`, `HCCS` ↔ `HIXL`). For `HCCS`, the client process must also export `DS_RH2D_LINK_TYPE=HCCS` before starting vLLM (the backend does not export it automatically); `ROCE` is the datasystem default and needs no env var. |
++| `remote_h2d_hccs_buffer_pool` | `4:8` | HIXL buffer-pool parameter `<count>:<size>`, only used when `remote_h2d_link_type=HCCS`. Ignored under HIXL RoCE direct mode (`HCCL_INTRA_ROCE_ENABLE=1`). |
++
+ * Make sure the NPU driver, firmware, and CANN toolkit required by Yuanrong
+   Remote H2D are installed and visible to the worker process. In containers,
+   mount the Ascend driver path, `npu-smi`, `hccn_tool`, `/etc/hccn.conf`,
+   `/etc/ascend_install.info`, and the required `/dev/davinci*` devices.
+-* Verify the NPU and RoCE environment before enabling the client flag:
++* Verify the NPU environment before enabling the client flag. The RoCE
++  checks below apply to `P2P_TRANSFER` and HIXL RoCE direct mode; HCCS
++  buffer-pool mode does not require a reachable RoCE link:
+ 
+ ```bash
+ # Check the current 2 MiB HugeTLB page size, total count, and free count.
+@@ -929,8 +1023,8 @@ hccn_tool -i <local_npu_id> -ip -g
+ hccn_tool -i <local_npu_id> -ping -g address <remote_npu_ip>
+ ```
+ 
+-If these checks fail, keep `DS_ENABLE_REMOTE_H2D=0` and use the default
+-Datasystem transfer path.
++If these checks fail, keep `enable_remote_h2d` at `false` in `yuanrong.json`
++and use the default Datasystem transfer path.
+ 
+ ### Run AscendStoreConnector with Yuanrong backend
+ 
+@@ -965,12 +1059,14 @@ and the worker process. Each instance must use a unique port value.
+ 
+ ### Notes
+ 
+-* The Yuanrong backend normalizes KV keys before calling Datasystem. Supported
+-  ASCII keys up to 1024 bytes are preserved. Longer keys or keys containing
+-  unsupported characters are rewritten to a maximum of 1024 characters with a
+-  hash suffix, so do not rely on the raw key string when debugging backend
+-  storage.
+-* No extra buffer pre-registration step is required for Yuanrong. The backend
++* The Yuanrong backend passes KV keys to the Datasystem SDK as-is, without
++  rewriting them. Ensure keys are valid Datasystem keys in production.
++* When `enable_remote_h2d` is `true` and `remote_h2d_transport_backend` is
++  `HIXL` (with `enable_fabric_mem` `false`), the backend pre-registers device
++  buffer pointers (`register_buffer`) with the Datasystem worker to enable
++  Remote H2D transfer — but only if `enable_dev_mem_pregister` is `true`.
++  `enable_dev_mem_pregister` defaults to `false`, so pre-registration is opt-in.
++  Under `P2P_TRANSFER` or FabricMem mode the backend skips pre-registration and
+   uses device pointers directly when building blob lists.
+ 
+ #### [2. Run Inference](#2-run-inference)
+diff --git a/tests/ut/distributed/ascend_store/test_backend.py b/tests/ut/distributed/ascend_store/test_backend.py
+index a4eff9fdf..cb3ef53f1 100644
+--- a/tests/ut/distributed/ascend_store/test_backend.py
++++ b/tests/ut/distributed/ascend_store/test_backend.py
+@@ -31,7 +31,6 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.mooncake_b
+ )
+ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.yuanrong_backend import (
+     YuanrongConfig,
+-    YuanrongHelper,
+ )
+ 
+ 
+@@ -246,91 +245,52 @@ class TestConvertToBytes(unittest.TestCase):
+ # YuanrongConfig
+ # =========================================================================
+ class TestYuanrongConfig(unittest.TestCase):
+-    def test_load_from_env(self):
+-        with patch.dict(
+-            os.environ,
+-            {
+-                "DS_WORKER_ADDR": "host:1234",
+-                "DS_ENABLE_EXCLUSIVE_CONNECTION": "1",
+-                "DS_ENABLE_REMOTE_H2D": "0",
+-            },
+-        ):
+-            cfg = YuanrongConfig.load_from_env()
+-            self.assertEqual(cfg.worker_addr, "host:1234")
+-            self.assertTrue(cfg.enable_exclusive_connection)
+-            self.assertFalse(cfg.enable_remote_h2d)
+-
+-    def test_load_from_env_missing(self):
+-        with patch.dict(os.environ, {}, clear=True):
+-            os.environ.pop("DS_WORKER_ADDR", None)
+-            with self.assertRaises(ValueError):
+-                YuanrongConfig.load_from_env()
+-
+-    def test_load_from_env_defaults(self):
+-        with patch.dict(os.environ, {"DS_WORKER_ADDR": "h:1"}):
+-            cfg = YuanrongConfig.load_from_env()
+-            self.assertFalse(cfg.enable_exclusive_connection)
+-            self.assertFalse(cfg.enable_remote_h2d)
++    def _write_config(self, **overrides):
++        fd, path = tempfile.mkstemp(suffix=".json")
++        with os.fdopen(fd, "w") as f:
++            json.dump(overrides, f)
++        self.addCleanup(os.remove, path)
++        return path
+ 
++    def test_from_file(self):
++        path = self._write_config(
++            worker_addr="host:1234",
++            enable_remote_h2d=False,
++            remote_h2d_transport_backend="HIXL",
++            connect_timeout_ms=12000,
++            request_timeout_ms=8000,
++            get_sub_timeout_ms=3000,
++            enable_dev_mem_pregister=True,
++        )
++        cfg = YuanrongConfig.from_file(path)
++        self.assertEqual(cfg.worker_addr, "host:1234")
++        self.assertFalse(cfg.enable_remote_h2d)
++        self.assertEqual(cfg.remote_h2d_transport_backend, "HIXL")
++        self.assertFalse(cfg.enable_fabric_mem)
++        self.assertEqual(cfg.connect_timeout_ms, 12000)
++        self.assertEqual(cfg.request_timeout_ms, 8000)
++        self.assertEqual(cfg.get_sub_timeout_ms, 3000)
++        self.assertTrue(cfg.enable_dev_mem_pregister)
+ 
+-# =========================================================================
+-# YuanrongHelper
+-# =========================================================================
+-class TestYuanrongHelper(unittest.TestCase):
+-    def setUp(self):
+-        self.blob_cls = MagicMock()
+-        self.blob_list_cls = MagicMock()
+-        self.helper = YuanrongHelper(self.blob_cls, self.blob_list_cls)
+-
+-    def test_normalize_keys_short_valid(self):
+-        keys = ["abc-123", "key_2"]
+-        result = self.helper.normalize_keys(keys)
+-        self.assertEqual(result, keys)
+-
+-    def test_normalize_keys_with_invalid_chars(self):
+-        keys = ["key with spaces/and.dots"]
+-        result = self.helper.normalize_keys(keys)
+-        self.assertEqual(len(result), 1)
+-        # Should not contain the original invalid chars
+-        self.assertNotIn(" ", result[0])
+-        self.assertNotIn("/", result[0])
+-        # Should have hash suffix
+-        self.assertIn("__", result[0])
+-
+-    def test_normalize_keys_at_max_length(self):
+-        max_length_key = "a" * 1024
+-        result = self.helper.normalize_keys([max_length_key])
+-        self.assertEqual(result, [max_length_key])
+-
+-    def test_normalize_keys_over_max_length(self):
+-        long_key = "a" * 1025
+-        result = self.helper.normalize_keys([long_key])
+-        self.assertEqual(len(result), 1)
+-        self.assertEqual(len(result[0]), 1024)
+-        self.assertIn("__", result[0])
+-
+-    def test_make_blob_lists(self):
+-        self.helper._device_id = 0
+-        addrs = [[100, 200], [300, 400]]
+-        sizes = [[10, 20], [30, 40]]
+-        result = self.helper.make_blob_lists(addrs, sizes)
+-        self.assertEqual(len(result), 2)
+-        self.assertEqual(self.blob_cls.call_count, 4)
+-
+-    def test_make_blob_lists_length_mismatch(self):
+-        self.helper._device_id = 0
+-        with self.assertRaises(ValueError):
+-            self.helper.make_blob_lists([[1]], [[1, 2], [3, 4]])
+-
+-    def test_make_blob_lists_inner_length_mismatch(self):
+-        self.helper._device_id = 0
+-        with self.assertRaises(ValueError):
+-            self.helper.make_blob_lists([[1, 2]], [[1]])
+-
+-    def test_make_blob_lists_no_device(self):
+-        self.helper._device_id = None
+-        with self.assertRaises(RuntimeError):
+-            self.helper.make_blob_lists([[1]], [[1]])
++    def test_from_file_defaults(self):
++        path = self._write_config(worker_addr="h:1")
++        cfg = YuanrongConfig.from_file(path)
++        self.assertFalse(cfg.enable_remote_h2d)
++        self.assertEqual(cfg.remote_h2d_transport_backend, "HIXL")
++        self.assertFalse(cfg.enable_fabric_mem)
++        self.assertEqual(cfg.connect_timeout_ms, 9000)
++        self.assertEqual(cfg.request_timeout_ms, 0)
++        self.assertEqual(cfg.get_sub_timeout_ms, 0)
++        self.assertFalse(cfg.enable_dev_mem_pregister)
++
++    def test_from_file_fabric_mem_with_hixl(self):
++        path = self._write_config(
++            worker_addr="h:1",
++            remote_h2d_transport_backend="HIXL",
++            enable_fabric_mem=True,
++        )
++        cfg = YuanrongConfig.from_file(path)
++        self.assertTrue(cfg.enable_fabric_mem)
+ 
+ 
+ # =========================================================================
+@@ -414,147 +374,155 @@ class TestYuanrongBackendMethods(unittest.TestCase):
+ 
+         with patch.object(YuanrongBackend, "__init__", lambda self, pc: None):
+             backend = YuanrongBackend.__new__(YuanrongBackend)
+-            backend._helper = MagicMock()
+-            backend._helper._device_id = 0
+-            backend._helper.normalize_keys = lambda keys: keys
+-            backend._helper.make_blob_lists = lambda a, s: [MagicMock() for _ in a]
+-            backend._hetero_client = MagicMock()
++            backend.store = MagicMock()
++            backend.store.mget_h2d_from_multi_buffers.return_value = []
++            backend.store.mset_d2h_from_multi_buffers.return_value = None
++            backend.store.batch_is_exist.return_value = [1, 0]
+             backend._ds_set_param = MagicMock()
+-            backend._is_a2 = False
++            backend._needs_dev_mem_pregister = False
+             backend._registered_buffers = None
+             backend._buffers_registered = False
+             backend.config = YuanrongConfig(
+                 worker_addr="127.0.0.1:0",
+-                enable_exclusive_connection=False,
+                 enable_remote_h2d=False,
++                remote_h2d_transport_backend="P2P_TRANSFER",
++                enable_fabric_mem=False,
++                get_sub_timeout_ms=1234,
++                enable_dev_mem_pregister=False,
+             )
+             backend.rank = 0
+             return backend
+ 
+-    def test_exists_empty(self):
+-        b = self._make_backend()
+-        result = b.exists([])
+-        self.assertEqual(result, [])
+-
+     def test_exists(self):
+         b = self._make_backend()
+-        b._hetero_client.exist.return_value = [True, False]
++        b.store.batch_is_exist.return_value = [1, 0]
+         result = b.exists(["k1", "k2"])
+         self.assertEqual(result, [1, 0])
++        b.store.batch_is_exist.assert_called_once_with(["k1", "k2"])
+ 
+     def test_exists_exception(self):
+         b = self._make_backend()
+-        b._hetero_client.exist.side_effect = Exception("fail")
++        b.store.batch_is_exist.side_effect = Exception("fail")
+         result = b.exists(["k1"])
+         self.assertEqual(result, [0])
+ 
+-    def test_get_empty(self):
+-        b = self._make_backend()
+-        result = b.get([], [], [])
+-        self.assertEqual(result, [])
+-        b._hetero_client.mget_h2d.assert_not_called()
+-
+     def test_get(self):
+         b = self._make_backend()
+-        b._hetero_client.mget_h2d.return_value = []
++        b.store.mget_h2d_from_multi_buffers.return_value = []
+         result = b.get(["k1"], [[100]], [[10]])
+         self.assertEqual(result, [0])
+-        b._hetero_client.mget_h2d.assert_called_once()
++        b.store.mget_h2d_from_multi_buffers.assert_called_once_with(["k1"], [[100]], [[10]], 1234)
+ 
+     def test_get_partial_failure(self):
+         b = self._make_backend()
+-        b._hetero_client.mget_h2d.return_value = ["k2"]
++        b.store.mget_h2d_from_multi_buffers.return_value = ["k2"]
+         result = b.get(["k1", "k2", "k3"], [[100], [200], [300]], [[10], [20], [30]])
+         self.assertEqual(result, [0, 1, 0])
+ 
+     def test_get_failed_keys(self):
+         b = self._make_backend()
+-        b._hetero_client.mget_h2d.return_value = ["k1"]
++        b.store.mget_h2d_from_multi_buffers.return_value = ["k1"]
+         result = b.get(["k1"], [[100]], [[10]])  # Should log error
+         self.assertEqual(result, [1])
+ 
+     def test_get_exception(self):
+         b = self._make_backend()
+-        b._hetero_client.mget_h2d.side_effect = Exception("fail")
++        b.store.mget_h2d_from_multi_buffers.side_effect = Exception("fail")
+         result = b.get(["k1"], [[100]], [[10]])
+         self.assertIsNone(result)
+ 
+-    def test_put_empty(self):
+-        b = self._make_backend()
+-        b.put([], [], [])
+-        b._hetero_client.mset_d2h.assert_not_called()
+-
+     def test_put(self):
+         b = self._make_backend()
+         b.put(["k1"], [[100]], [[10]])
+-        b._hetero_client.mset_d2h.assert_called_once()
++        b.store.mset_d2h_from_multi_buffers.assert_called_once_with(["k1"], [[100]], [[10]], b._ds_set_param)
+ 
+     def test_put_exception(self):
+         b = self._make_backend()
+-        b._hetero_client.mset_d2h.side_effect = Exception("fail")
++        b.store.mset_d2h_from_multi_buffers.side_effect = Exception("fail")
+         b.put(["k1"], [[100]], [[10]])
+ 
+     def test_register_buffer_noop_when_remote_h2d_disabled(self):
+         b = self._make_backend()
+         b.register_buffer([100], [200])
+-        b._hetero_client.pre_register_device_memory.assert_not_called()
++        b.store.pre_register_device_memory.assert_not_called()
+ 
+-    def test_register_buffer_when_remote_h2d_enabled(self):
++    def test_register_buffer_noop_when_pregister_toggle_off(self):
++        # HIXL conditions all met, but the enable_dev_mem_pregister toggle is
++        # false by default -> pre-registration is skipped. Mirrors the
++        # __init__ gating expression that ANDs in the toggle.
+         b = self._make_backend()
+         b.config.enable_remote_h2d = True
++        b.config.remote_h2d_transport_backend = "HIXL"
++        b.config.enable_fabric_mem = False
++        b.config.enable_dev_mem_pregister = False
++        b._needs_dev_mem_pregister = (
++            b.config.enable_remote_h2d
++            and b.config.remote_h2d_transport_backend == "HIXL"
++            and not b.config.enable_fabric_mem
++            and b.config.enable_dev_mem_pregister
++        )
+         b.register_buffer([100], [200])
+-        b._hetero_client.pre_register_device_memory.assert_called_once_with([100], [200])
++        b.store.pre_register_device_memory.assert_not_called()
+ 
+-    def test_register_buffer_noop_on_a2(self):
+-        # A2 must not register (opposite of memcache_backend's _is_a2 gating).
++    def test_register_buffer_when_remote_h2d_enabled_hixl(self):
++        b = self._make_backend()
++        b._needs_dev_mem_pregister = True
++        b.register_buffer([100], [200])
++        b.store.pre_register_device_memory.assert_called_once_with([100], [200])
++
++    def test_register_buffer_noop_when_p2p_transfer_link(self):
++        # P2P-Transfer RoCE transport backend does not use device memory pre-registration.
+         b = self._make_backend()
+-        b._is_a2 = True
+         b.config.enable_remote_h2d = True
++        b.config.remote_h2d_transport_backend = "P2P_TRANSFER"
++        b._needs_dev_mem_pregister = False
+         b.register_buffer([100], [200])
+-        b._hetero_client.pre_register_device_memory.assert_not_called()
++        b.store.pre_register_device_memory.assert_not_called()
+ 
+-    def test_register_buffer_idempotent(self):
++    def test_register_buffer_noop_when_fabric_mem(self):
++        # FabricMem mode relies on HIXL OPTION_ENABLE_USE_FABRIC_MEM for
++        # automatic Fabric handle exchange; no client-side MEM_DEVICE
++        # pre-registration. Mirrors the __init__ gating expression.
+         b = self._make_backend()
+         b.config.enable_remote_h2d = True
++        b.config.remote_h2d_transport_backend = "HIXL"
++        b.config.enable_fabric_mem = True
++        b._needs_dev_mem_pregister = (
++            b.config.enable_remote_h2d
++            and b.config.remote_h2d_transport_backend == "HIXL"
++            and not b.config.enable_fabric_mem
++        )
++        b.register_buffer([100], [200])
++        b.store.pre_register_device_memory.assert_not_called()
++
++    def test_register_buffer_idempotent(self):
++        b = self._make_backend()
++        b._needs_dev_mem_pregister = True
+         b.register_buffer([100], [200])
+         b.register_buffer([300], [400])
+-        b._hetero_client.pre_register_device_memory.assert_called_once_with([100], [200])
++        b.store.pre_register_device_memory.assert_called_once_with([100], [200])
+ 
+     def test_register_buffers_if_needed_no_buffers(self):
+         b = self._make_backend()
+-        b.config.enable_remote_h2d = True
++        b._needs_dev_mem_pregister = True
+         b._registered_buffers = None
+         b._register_buffers_if_needed()
+-        b._hetero_client.pre_register_device_memory.assert_not_called()
++        b.store.pre_register_device_memory.assert_not_called()
+ 
+     def test_register_buffers_if_needed_already_registered(self):
+         b = self._make_backend()
+-        b.config.enable_remote_h2d = True
++        b._needs_dev_mem_pregister = True
+         b._registered_buffers = ([100], [200])
+         b._buffers_registered = True
+         b._register_buffers_if_needed()
+-        b._hetero_client.pre_register_device_memory.assert_not_called()
++        b.store.pre_register_device_memory.assert_not_called()
+ 
+     def test_register_buffers_if_needed_disabled(self):
+         b = self._make_backend()
+-        b.config.enable_remote_h2d = False
++        b._needs_dev_mem_pregister = False
+         b._registered_buffers = ([100], [200])
+         b._register_buffers_if_needed()
+-        b._hetero_client.pre_register_device_memory.assert_not_called()
+-
+-    def test_ensure_device_ready(self):
+-        b = self._make_backend()
+-        b._helper._device_id = None
+-        b.set_device = MagicMock()
+-        b._ensure_device_ready()
+-        b.set_device.assert_called_once()
+-
+-    def test_ensure_device_ready_already_set(self):
+-        b = self._make_backend()
+-        b._helper._device_id = 0
+-        b.set_device = MagicMock()
+-        b._ensure_device_ready()
+-        b.set_device.assert_not_called()
++        b.store.pre_register_device_memory.assert_not_called()
+ 
+ 
+ # =========================================================================
+diff --git a/tests/ut/distributed/test_yuanrong_backend.py b/tests/ut/distributed/test_yuanrong_backend.py
+new file mode 100644
+index 000000000..63eaadf55
+--- /dev/null
++++ b/tests/ut/distributed/test_yuanrong_backend.py
+@@ -0,0 +1,245 @@
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++# http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++import json
++import sys
++from types import SimpleNamespace
++from unittest.mock import MagicMock
++
++import pytest
++
++from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.yuanrong_backend import (
++    YuanrongBackend,
++    YuanrongConfig,
++)
++
++
++def _make_backend():
++    backend = YuanrongBackend.__new__(YuanrongBackend)
++    backend._ds_set_param = object()
++    backend.config = SimpleNamespace(get_sub_timeout_ms=1234)
++    backend.store = MagicMock()
++    backend.store.mget_h2d_from_multi_buffers.return_value = []
++    backend.store.mset_d2h_from_multi_buffers.return_value = None
++    backend.store.batch_is_exist.return_value = [1, 0]
++    return backend
++
++
++def test_get_and_put_use_multi_buffer_apis():
++    backend = _make_backend()
++    keys = ["Qwen2.5-7B@pcp0@dcp0@head_or_tp_rank:0@pp_rank:0@abcdef"]
++    addrs = [[100, 200]]
++    sizes = [[10, 20]]
++
++    assert backend.get(keys, addrs, sizes) == [0]
++    backend.put(keys, addrs, sizes)
++
++    backend.store.mget_h2d_from_multi_buffers.assert_called_once_with(keys, addrs, sizes, 1234)
++    backend.store.mset_d2h_from_multi_buffers.assert_called_once_with(keys, addrs, sizes, backend._ds_set_param)
++    assert backend.store.mget_h2d_from_multi_buffers.call_args.args[0] is keys
++    assert backend.store.mset_d2h_from_multi_buffers.call_args.args[0] is keys
++
++
++def test_get_forwards_empty_keys_to_sdk():
++    backend = _make_backend()
++    backend.store.mget_h2d_from_multi_buffers.return_value = []
++    assert backend.get([], [], []) == []
++    backend.store.mget_h2d_from_multi_buffers.assert_called_once_with([], [], [], 1234)
++
++
++def test_get_marks_failed_keys():
++    backend = _make_backend()
++    keys = ["k1", "k2", "k3"]
++    addrs = [[100], [200], [300]]
++    sizes = [[10], [20], [30]]
++    backend.store.mget_h2d_from_multi_buffers.return_value = ["k2"]
++
++    assert backend.get(keys, addrs, sizes) == [0, 1, 0]
++    backend.store.mget_h2d_from_multi_buffers.assert_called_once_with(keys, addrs, sizes, 1234)
++
++
++def test_get_returns_none_on_exception():
++    backend = _make_backend()
++    backend.store.mget_h2d_from_multi_buffers.side_effect = Exception("fail")
++    assert backend.get(["k1"], [[100]], [[10]]) is None
++
++
++def test_put_forwards_empty_keys_to_sdk():
++    backend = _make_backend()
++    backend.put([], [], [])
++    backend.store.mset_d2h_from_multi_buffers.assert_called_once_with([], [], [], backend._ds_set_param)
++
++
++def test_put_logs_on_exception():
++    backend = _make_backend()
++    backend.store.mset_d2h_from_multi_buffers.side_effect = Exception("fail")
++    backend.put(["k1"], [[100]], [[10]])  # Should log but not raise
++
++
++def test_exists_returns_native_int_list():
++    backend = _make_backend()
++    keys = ["Qwen2.5-key0", "Qwen2.5-key1"]
++    result = backend.exists(keys)
++
++    assert result == [1, 0]
++    backend.store.batch_is_exist.assert_called_once_with(keys)
++    assert backend.store.batch_is_exist.call_args.args[0] is keys
++
++
++def test_exists_forwards_empty_keys_to_sdk():
++    backend = _make_backend()
++    backend.store.batch_is_exist.return_value = []
++    assert backend.exists([]) == []
++    backend.store.batch_is_exist.assert_called_once_with([])
++
++
++def test_exists_exception_returns_zeros():
++    backend = _make_backend()
++    backend.store.batch_is_exist.side_effect = Exception("fail")
++    assert backend.exists(["k1", "k2"]) == [0, 0]
++
++
++def test_yuanrong_config_loads_from_file(tmp_path):
++    cfg_path = tmp_path / "yuanrong.json"
++    cfg_path.write_text(
++        json.dumps(
++            {
++                "worker_addr": "127.0.0.1:31501",
++                "enable_remote_h2d": False,
++                "connect_timeout_ms": 12000,
++                "request_timeout_ms": 8000,
++                "get_sub_timeout_ms": 3000,
++                "enable_dev_mem_pregister": True,
++            }
++        )
++    )
++
++    cfg = YuanrongConfig.from_file(str(cfg_path))
++
++    assert cfg.worker_addr == "127.0.0.1:31501"
++    assert cfg.enable_remote_h2d is False
++    assert cfg.connect_timeout_ms == 12000
++    assert cfg.request_timeout_ms == 8000
++    assert cfg.get_sub_timeout_ms == 3000
++    assert cfg.enable_dev_mem_pregister is True
++
++
++def test_yuanrong_config_defaults_from_file(tmp_path):
++    cfg_path = tmp_path / "yuanrong.json"
++    cfg_path.write_text(json.dumps({"worker_addr": "h:1"}))
++
++    cfg = YuanrongConfig.from_file(str(cfg_path))
++
++    assert cfg.enable_remote_h2d is False
++    assert cfg.connect_timeout_ms == 9000
++    assert cfg.request_timeout_ms == 0
++    assert cfg.get_sub_timeout_ms == 0
++    assert cfg.enable_dev_mem_pregister is False
++
++
++def test_yuanrong_config_load_from_env_requires_path(monkeypatch):
++    monkeypatch.delenv("YR_CONFIG_PATH", raising=False)
++
++    with pytest.raises(ValueError, match="YR_CONFIG_PATH"):
++        YuanrongConfig.load_from_env()
++
++
++def test_backend_forwards_configured_timeouts(tmp_path, monkeypatch):
++    cfg_path = tmp_path / "yuanrong.json"
++    cfg_path.write_text(
++        json.dumps(
++            {
++                "worker_addr": "127.0.0.1:31501",
++                "connect_timeout_ms": 12000,
++                "request_timeout_ms": 8000,
++                "get_sub_timeout_ms": 3000,
++            }
++        )
++    )
++    monkeypatch.setenv("YR_CONFIG_PATH", str(cfg_path))
++
++    native_client = MagicMock()
++    native_client.mget_h2d_from_multi_buffers.return_value = []
++    hetero_client = MagicMock(return_value=native_client)
++    monkeypatch.setattr(sys.modules["yr.datasystem.hetero_client"], "HeteroClient", hetero_client)
++    backend_module = sys.modules[YuanrongBackend.__module__]
++    monkeypatch.setattr(backend_module, "split_host_port", lambda _: ("127.0.0.1", 31501))
++
++    backend = YuanrongBackend(MagicMock())
++
++    hetero_client.assert_called_once_with(
++        "127.0.0.1",
++        31501,
++        connect_timeout_ms=12000,
++        req_timeout_ms=8000,
++        enable_remote_h2d=False,
++    )
++    native_client.init.assert_called_once_with()
++    backend.get(["k1"], [[100]], [[10]])
++    native_client.mget_h2d_from_multi_buffers.assert_called_once_with(["k1"], [[100]], [[10]], 3000)
++
++
++def _make_full_backend(tmp_path, monkeypatch, **overrides):
++    """Build a real YuanrongBackend (with mocked HeteroClient) from JSON config."""
++    cfg = {
++        "worker_addr": "127.0.0.1:31501",
++        "enable_remote_h2d": True,
++        "remote_h2d_transport_backend": "HIXL",
++        "enable_fabric_mem": False,
++        "enable_dev_mem_pregister": False,
++    }
++    cfg.update(overrides)
++    cfg_path = tmp_path / "yuanrong.json"
++    cfg_path.write_text(json.dumps(cfg))
++    monkeypatch.setenv("YR_CONFIG_PATH", str(cfg_path))
++
++    native_client = MagicMock()
++    hetero_client = MagicMock(return_value=native_client)
++    monkeypatch.setattr(sys.modules["yr.datasystem.hetero_client"], "HeteroClient", hetero_client)
++    backend_module = sys.modules[YuanrongBackend.__module__]
++    monkeypatch.setattr(backend_module, "split_host_port", lambda _: ("127.0.0.1", 31501))
++    return YuanrongBackend(MagicMock())
++
++
++def test_dev_mem_pregister_disabled_by_default(tmp_path, monkeypatch):
++    # All HIXL conditions met, but the new toggle defaults to false -> no pre-registration.
++    backend = _make_full_backend(tmp_path, monkeypatch)
++    assert backend._needs_dev_mem_pregister is False
++
++
++def test_dev_mem_pregister_enabled_triggers_registration(tmp_path, monkeypatch):
++    backend = _make_full_backend(tmp_path, monkeypatch, enable_dev_mem_pregister=True)
++    assert backend._needs_dev_mem_pregister is True
++    backend.register_buffer([100], [200])
++    backend.store.pre_register_device_memory.assert_called_once_with([100], [200])
++
++
++def test_dev_mem_pregister_skipped_when_fabric_mem(tmp_path, monkeypatch):
++    # FabricMem mode still skips pre-registration even if the toggle is on.
++    backend = _make_full_backend(
++        tmp_path, monkeypatch, enable_dev_mem_pregister=True, enable_fabric_mem=True
++    )
++    assert backend._needs_dev_mem_pregister is False
++    backend.register_buffer([100], [200])
++    backend.store.pre_register_device_memory.assert_not_called()
++
++
++def test_dev_mem_pregister_skipped_for_p2p_transfer(tmp_path, monkeypatch):
++    # P2P_TRANSFER transport never uses device memory pre-registration.
++    backend = _make_full_backend(
++        tmp_path, monkeypatch, enable_dev_mem_pregister=True, remote_h2d_transport_backend="P2P_TRANSFER"
++    )
++    assert backend._needs_dev_mem_pregister is False
++    backend.register_buffer([100], [200])
++    backend.store.pre_register_device_memory.assert_not_called()
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/yuanrong_backend.py b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/yuanrong_backend.py
+index 7864f9b05..cc8eb3307 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/yuanrong_backend.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/yuanrong_backend.py
+@@ -1,9 +1,7 @@
+-import hashlib
++import json
+ import os
+ from dataclasses import dataclass
+-from typing import Any
+ 
+-import regex as re
+ import torch
+ from vllm.config import ParallelConfig
+ from vllm.distributed.parallel_state import get_world_group
+@@ -11,95 +9,55 @@ from vllm.logger import logger
+ from vllm.utils.network_utils import split_host_port
+ 
+ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.backend import Backend
+-from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
+-
+-
+-def _iter_slices(total: int, batch_size: int):
+-    for start in range(0, total, batch_size):
+-        end = min(start + batch_size, total)
+-        yield start, end
+ 
+ 
+ @dataclass
+ class YuanrongConfig:
+     worker_addr: str
+-    enable_exclusive_connection: bool
+     enable_remote_h2d: bool
++    remote_h2d_transport_backend: str
++    enable_fabric_mem: bool
++    connect_timeout_ms: int = 9000
++    request_timeout_ms: int = 0
++    get_sub_timeout_ms: int = 0
++    enable_dev_mem_pregister: bool = False
+ 
+     @staticmethod
+-    def load_from_env() -> "YuanrongConfig":
+-        worker_addr = os.getenv("DS_WORKER_ADDR")
+-        if not worker_addr:
+-            raise ValueError("Environment variable DS_WORKER_ADDR is required, expected format '<host>:<port>'.")
+-
++    def from_file(file_path: str) -> "YuanrongConfig":
++        with open(file_path) as f:
++            config = json.load(f)
+         return YuanrongConfig(
+-            worker_addr=worker_addr,
+-            enable_exclusive_connection=bool(int(os.getenv("DS_ENABLE_EXCLUSIVE_CONNECTION", "0"))),
+-            enable_remote_h2d=bool(int(os.getenv("DS_ENABLE_REMOTE_H2D", "0"))),
++            worker_addr=config.get("worker_addr", ""),
++            enable_remote_h2d=bool(config.get("enable_remote_h2d", False)),
++            remote_h2d_transport_backend=config.get("remote_h2d_transport_backend", "HIXL"),
++            enable_fabric_mem=bool(config.get("enable_fabric_mem", False)),
++            connect_timeout_ms=config.get("connect_timeout_ms", 9000),
++            request_timeout_ms=config.get("request_timeout_ms", 0),
++            get_sub_timeout_ms=config.get("get_sub_timeout_ms", 0),
++            enable_dev_mem_pregister=bool(config.get("enable_dev_mem_pregister", False)),
+         )
+ 
+-
+-class YuanrongHelper:
+-    _DS_KEY_MAX_LEN = 1024
+-    _DS_KEY_ALLOWED_PATTERN = re.compile(r"^[a-zA-Z0-9\-_!@#%\^\*\(\)\+\=\:;]+$")
+-    _DS_KEY_INVALID_CHAR_PATTERN = re.compile(r"[^a-zA-Z0-9\-_!@#%\^\*\(\)\+\=\:;]")
+-    _DS_KEY_HASH_SUFFIX_LEN = 16
+-
+-    def __init__(self, blob_cls, blob_list_cls):
+-        self._blob_cls = blob_cls
+-        self._blob_list_cls = blob_list_cls
+-        self._device_id: int | None = None
+-
+-    def normalize_keys(self, keys: list[str]) -> list[str]:
+-        normalized: list[str] = []
+-        for key in keys:
+-            if len(key) <= self._DS_KEY_MAX_LEN and self._DS_KEY_ALLOWED_PATTERN.match(key):
+-                normalized.append(key)
+-                continue
+-
+-            sanitized = self._DS_KEY_INVALID_CHAR_PATTERN.sub("_", key)
+-            hash_digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+-            suffix = f"__{hash_digest[: self._DS_KEY_HASH_SUFFIX_LEN]}"
+-            max_prefix_len = self._DS_KEY_MAX_LEN - len(suffix)
+-            normalized.append(sanitized[:max_prefix_len] + suffix)
+-        return normalized
+-
+-    def make_blob_lists(self, addrs_list: list[list[int]], sizes_list: list[list[int]]) -> list[Any]:
+-        total = len(addrs_list)
+-        if total != len(sizes_list):
+-            raise ValueError("Address list and size list length mismatch.")
+-
+-        device_id = self._device_id
+-        if device_id is None:
+-            logger.error("Device id is not set. Check device initialization and configuration.")
+-            raise RuntimeError("Yuanrong backend device id is not initialized.")
+-
+-        blob_lists: list[Any] = []
+-        for addrs, sizes in zip(addrs_list, sizes_list):
+-            if len(addrs) != len(sizes):
+-                raise ValueError("Address list and size list length mismatch.")
+-            blobs = [
+-                self._blob_cls(addr, size)  # type: ignore[misc]
+-                for addr, size in zip(addrs, sizes)
+-            ]
+-            blob_lists.append(
+-                self._blob_list_cls(device_id, blobs)  # type: ignore[misc]
+-            )
+-        return blob_lists
++    @staticmethod
++    def load_from_env() -> "YuanrongConfig":
++        config_path = os.getenv("YR_CONFIG_PATH")
++        if not config_path:
++            raise ValueError("The environment variable 'YR_CONFIG_PATH' is not set.")
++        return YuanrongConfig.from_file(config_path)
+ 
+ 
+ class YuanrongBackend(Backend):
+-    _DS_MAX_BATCH_KEYS = 10000
+-
+     def __init__(self, parallel_config: ParallelConfig):
+         try:
+-            from yr.datasystem.hetero_client import Blob, DeviceBlobList, HeteroClient  # type: ignore[import-not-found]
++            from yr.datasystem.hetero_client import HeteroClient  # type: ignore[import-not-found]
+             from yr.datasystem.kv_client import SetParam  # type: ignore[import-not-found]
+             from yr.datasystem.object_client import WriteMode  # type: ignore[import-not-found]
+         except ImportError as exc:
+-            raise ImportError("Please install openyuanrong-datasystem to use the yuanrong backend.") from exc
++            raise ImportError(
++                "Please install openyuanrong-datasystem by following the instructions at "
++                "https://atomgit.com/openeuler/yuanrong-datasystem/blob/master/docs/source_zh_cn/installation/installation_linux.md "  # noqa: E501
++                "to run vLLM with AscendStoreConnector."
++            ) from exc
+ 
+-        self._helper = YuanrongHelper(Blob, DeviceBlobList)
+         self._ds_set_param = SetParam()
+         self._ds_set_param.write_mode = WriteMode.NONE_L2_CACHE_EVICT
+ 
+@@ -107,56 +65,49 @@ class YuanrongBackend(Backend):
+         try:
+             host, port = split_host_port(self.config.worker_addr)
+         except Exception as exc:
+-            raise ValueError(f"Invalid DS_WORKER_ADDR '{self.config.worker_addr}', expected '<host>:<port>'.") from exc
+-        self._hetero_client = HeteroClient(
++            raise ValueError(
++                f"Invalid worker_addr {self.config.worker_addr} in yuanrong config, expected '<host>:<port>'."
++            ) from exc
++        self.store = HeteroClient(
+             host,
+             int(port),
+-            enable_exclusive_connection=self.config.enable_exclusive_connection,
++            connect_timeout_ms=self.config.connect_timeout_ms,
++            req_timeout_ms=self.config.request_timeout_ms,
+             enable_remote_h2d=self.config.enable_remote_h2d,
+         )
+-        self._hetero_client.init()
+-        self._is_a2 = get_ascend_device_type() in {AscendDeviceType.A2}
++        self.store.init()
++        self._needs_dev_mem_pregister = (
++            self.config.enable_remote_h2d
++            and self.config.remote_h2d_transport_backend == "HIXL"
++            and not self.config.enable_fabric_mem
++            and self.config.enable_dev_mem_pregister
++        )
+         self._registered_buffers: tuple[list[int], list[int]] | None = None
+         self._buffers_registered = False
+ 
+-    def _ensure_device_ready(self):
+-        if self._helper._device_id is None:
+-            self.set_device()
+-
+     def set_device(self):
+         local_rank = get_world_group().local_rank
+         device = torch.device(f"npu:{local_rank}")
+         torch.npu.set_device(device)
+-        self._helper._device_id = int(torch.npu.current_device())
+ 
+     def register_buffer(self, ptrs: list[int], lengths: list[int]):
+         self._registered_buffers = (list(ptrs), list(lengths))
+         self._register_buffers_if_needed()
+ 
+     def _register_buffers_if_needed(self):
+-        if self._is_a2:
+-            return
+-        if not self.config.enable_remote_h2d:
++        if not self._needs_dev_mem_pregister:
+             return
+         if self._registered_buffers is None or self._buffers_registered:
+             return
+         ptrs, lengths = self._registered_buffers
+-        self._hetero_client.pre_register_device_memory(ptrs, lengths)  # type: ignore[union-attr]
++        assert self.store is not None
++        self.store.pre_register_device_memory(ptrs, lengths)
+         self._buffers_registered = True
+ 
+     def exists(self, keys: list[str]) -> list[int]:
+-        if len(keys) == 0:
+-            return []
++        assert self.store is not None
+         try:
+-            keys = self._helper.normalize_keys(keys)
+-            if len(keys) <= self._DS_MAX_BATCH_KEYS:
+-                exists = self._hetero_client.exist(keys)  # type: ignore[union-attr]
+-                return [1 if value else 0 for value in exists]
+-            results: list[int] = []
+-            for start, end in _iter_slices(len(keys), self._DS_MAX_BATCH_KEYS):
+-                exists = self._hetero_client.exist(keys[start:end])  # type: ignore[union-attr]
+-                results.extend(1 if value else 0 for value in exists)
+-            return results
++            return self.store.batch_is_exist(keys)
+         except Exception as exc:
+             logger.error(
+                 "Failed to check keys. keys_count=%d, type=%s, error=%s. Check network and yuanrong service.",
+@@ -167,27 +118,10 @@ class YuanrongBackend(Backend):
+             return [0] * len(keys)
+ 
+     def get(self, keys: list[str], addrs: list[list[int]], sizes: list[list[int]]) -> list[int] | None:
+-        if len(keys) == 0:
+-            return []
++        assert self.store is not None
+         failed_keys_for_log = keys
+         try:
+-            self._ensure_device_ready()
+-            keys = self._helper.normalize_keys(keys)
+-            failed_keys_for_log = keys
+-            blob_lists = self._helper.make_blob_lists(addrs, sizes)
+-            failed_keys: list[str] = []
+-            if len(keys) <= self._DS_MAX_BATCH_KEYS:
+-                failed_keys = self._hetero_client.mget_h2d(  # type: ignore[union-attr]
+-                    keys, blob_lists, 0
+-                )
+-            else:
+-                for start, end in _iter_slices(len(keys), self._DS_MAX_BATCH_KEYS):
+-                    failed_keys_for_log = keys[start:end]
+-                    failed_keys.extend(
+-                        self._hetero_client.mget_h2d(  # type: ignore[union-attr]
+-                            keys[start:end], blob_lists[start:end], 0
+-                        )
+-                    )
++            failed_keys = self.store.mget_h2d_from_multi_buffers(keys, addrs, sizes, self.config.get_sub_timeout_ms)
+             if failed_keys:
+                 logger.error(
+                     "Failed to get %d keys out of %d. Check key existence and memory state.",
+@@ -212,24 +146,10 @@ class YuanrongBackend(Backend):
+             return None
+ 
+     def put(self, keys: list[str], addrs: list[list[int]], sizes: list[list[int]]):
+-        if len(keys) == 0:
+-            return
++        assert self.store is not None
+         failed_keys_for_log = keys
+         try:
+-            self._ensure_device_ready()
+-            keys = self._helper.normalize_keys(keys)
+-            failed_keys_for_log = keys
+-            blob_lists = self._helper.make_blob_lists(addrs, sizes)
+-            if len(keys) <= self._DS_MAX_BATCH_KEYS:
+-                self._hetero_client.mset_d2h(  # type: ignore[union-attr]
+-                    keys, blob_lists, self._ds_set_param
+-                )
+-            else:
+-                for start, end in _iter_slices(len(keys), self._DS_MAX_BATCH_KEYS):
+-                    failed_keys_for_log = keys[start:end]
+-                    self._hetero_client.mset_d2h(  # type: ignore[union-attr]
+-                        keys[start:end], blob_lists[start:end], self._ds_set_param
+-                    )
++            self.store.mset_d2h_from_multi_buffers(keys, addrs, sizes, self._ds_set_param)
+         except Exception as exc:
+             logger.error(
+                 "Failed to put %d keys out of %d. Check network and yuanrong service.",
+-- 
+2.51.0.windows.1
+
