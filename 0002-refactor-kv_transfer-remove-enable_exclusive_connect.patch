@@ -1,0 +1,127 @@
+From f44d38499475bfec321f779fe8c07616af2f885a Mon Sep 17 00:00:00 2001
+From: yangsonglin13 <yangsonglin566@gmail.com>
+Date: Thu, 6 Aug 2026 20:44:26 +0800
+Subject: [PATCH 2/2] refactor(kv_transfer): remove enable_exclusive_connection
+ from yuanrong backend
+
+Remove the unused enable_exclusive_connection parameter and its DS_ENABLE_EXCLUSIVE_CONNECTION environment variable from the yuanrong backend, config, tests, and docs.
+
+Signed-off-by: yangsonglin13 <yangsonglin566@gmail.com>
+---
+ .../LC_MESSAGES/user_guide/feature_guide/kv_pool.po  | 12 ------------
+ docs/source/user_guide/feature_guide/kv_pool.md      |  2 --
+ tests/ut/distributed/ascend_store/test_backend.py    |  4 ----
+ .../kv_pool/ascend_store/backend/yuanrong_backend.py |  3 ---
+ 4 files changed, 21 deletions(-)
+
+diff --git a/docs/source/locale/zh_CN/LC_MESSAGES/user_guide/feature_guide/kv_pool.po b/docs/source/locale/zh_CN/LC_MESSAGES/user_guide/feature_guide/kv_pool.po
+index 46d1e3a6b..b4e5686b9 100644
+--- a/docs/source/locale/zh_CN/LC_MESSAGES/user_guide/feature_guide/kv_pool.po
++++ b/docs/source/locale/zh_CN/LC_MESSAGES/user_guide/feature_guide/kv_pool.po
+@@ -1023,22 +1023,10 @@ msgid ""
+ "local `dscli start --worker_address` value."
+ msgstr "数据系统工作节点地址，格式为 `<主机>:<端口>`。此值必须与本地 `dscli start --worker_address` 的值匹配。"
+ 
+-#: ../../source/user_guide/feature_guide/kv_pool.md
+-msgid "`DS_ENABLE_EXCLUSIVE_CONNECTION`"
+-msgstr "`DS_ENABLE_EXCLUSIVE_CONNECTION`"
+-
+ #: ../../source/user_guide/feature_guide/kv_pool.md
+ msgid "No"
+ msgstr "否"
+ 
+-#: ../../source/user_guide/feature_guide/kv_pool.md
+-msgid ""
+-"Passed to Yuanrong `HeteroClient.enable_exclusive_connection`. Use `1` to"
+-" enable the exclusive connection mode when required by your deployment."
+-msgstr ""
+-"传递给元戎 `HeteroClient.enable_exclusive_connection`。当您的部署需要时，使用 `1` "
+-"来启用独占连接模式。"
+-
+ #: ../../source/user_guide/feature_guide/kv_pool.md
+ msgid "`DS_ENABLE_REMOTE_H2D`"
+ msgstr "`DS_ENABLE_REMOTE_H2D`"
+diff --git a/docs/source/user_guide/feature_guide/kv_pool.md b/docs/source/user_guide/feature_guide/kv_pool.md
+index dfa363dda..b9f265e70 100644
+--- a/docs/source/user_guide/feature_guide/kv_pool.md
++++ b/docs/source/user_guide/feature_guide/kv_pool.md
+@@ -850,14 +850,12 @@ Set the following environment variables on each node before starting vLLM:
+ | `PYTHONHASHSEED` | Yes | `0` | Must be consistent across all nodes to guarantee uniform hash generation. |
+ | `DS_WORKER_ADDR` | Yes | N/A | Datasystem worker address in `<host>:<port>` format. This must match the local `dscli start --worker_address` value. |
+ | `DATASYSTEM_CLIENT_LOG_DIR` | No | `~/.datasystem/logs` | Directory for Yuanrong client SDK logs created by the vLLM process. Use a directory separate from the worker logs. |
+-| `DS_ENABLE_EXCLUSIVE_CONNECTION` | No | `0` | Passed to Yuanrong `HeteroClient.enable_exclusive_connection`. Use `1` to enable the exclusive connection mode when required by your deployment. |
+ | `DS_ENABLE_REMOTE_H2D` | No | `0` | Passed to Yuanrong `HeteroClient.enable_remote_h2d`. Use `1` only after the Remote H2D requirements below are met. |
+ 
+ ```bash
+ export PYTHONHASHSEED=0
+ export DS_WORKER_ADDR="${WORKER_IP}:31501"
+ export DATASYSTEM_CLIENT_LOG_DIR="/var/log/yuanrong/client"
+-export DS_ENABLE_EXCLUSIVE_CONNECTION=0
+ export DS_ENABLE_REMOTE_H2D=0
+ 
+ mkdir -p "${DATASYSTEM_CLIENT_LOG_DIR}"
+diff --git a/tests/ut/distributed/ascend_store/test_backend.py b/tests/ut/distributed/ascend_store/test_backend.py
+index a4eff9fdf..bc639cb3c 100644
+--- a/tests/ut/distributed/ascend_store/test_backend.py
++++ b/tests/ut/distributed/ascend_store/test_backend.py
+@@ -251,13 +251,11 @@ class TestYuanrongConfig(unittest.TestCase):
+             os.environ,
+             {
+                 "DS_WORKER_ADDR": "host:1234",
+-                "DS_ENABLE_EXCLUSIVE_CONNECTION": "1",
+                 "DS_ENABLE_REMOTE_H2D": "0",
+             },
+         ):
+             cfg = YuanrongConfig.load_from_env()
+             self.assertEqual(cfg.worker_addr, "host:1234")
+-            self.assertTrue(cfg.enable_exclusive_connection)
+             self.assertFalse(cfg.enable_remote_h2d)
+ 
+     def test_load_from_env_missing(self):
+@@ -269,7 +267,6 @@ class TestYuanrongConfig(unittest.TestCase):
+     def test_load_from_env_defaults(self):
+         with patch.dict(os.environ, {"DS_WORKER_ADDR": "h:1"}):
+             cfg = YuanrongConfig.load_from_env()
+-            self.assertFalse(cfg.enable_exclusive_connection)
+             self.assertFalse(cfg.enable_remote_h2d)
+ 
+ 
+@@ -425,7 +422,6 @@ class TestYuanrongBackendMethods(unittest.TestCase):
+             backend._buffers_registered = False
+             backend.config = YuanrongConfig(
+                 worker_addr="127.0.0.1:0",
+-                enable_exclusive_connection=False,
+                 enable_remote_h2d=False,
+             )
+             backend.rank = 0
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/yuanrong_backend.py b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/yuanrong_backend.py
+index 3a6768b61..b2049a5c5 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/yuanrong_backend.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/yuanrong_backend.py
+@@ -28,7 +28,6 @@ def _sum_transfer_bytes(sizes: list[list[int]]) -> int:
+ @dataclass
+ class YuanrongConfig:
+     worker_addr: str
+-    enable_exclusive_connection: bool
+     enable_remote_h2d: bool
+ 
+     @staticmethod
+@@ -39,7 +38,6 @@ class YuanrongConfig:
+ 
+         return YuanrongConfig(
+             worker_addr=worker_addr,
+-            enable_exclusive_connection=bool(int(os.getenv("DS_ENABLE_EXCLUSIVE_CONNECTION", "0"))),
+             enable_remote_h2d=bool(int(os.getenv("DS_ENABLE_REMOTE_H2D", "0"))),
+         )
+ 
+@@ -116,7 +114,6 @@ class YuanrongBackend(Backend):
+         self._hetero_client = HeteroClient(
+             host,
+             int(port),
+-            enable_exclusive_connection=self.config.enable_exclusive_connection,
+             enable_remote_h2d=self.config.enable_remote_h2d,
+         )
+         self._hetero_client.init()
+-- 
+2.51.0.windows.1
+
