@@ -850,14 +850,12 @@ Set the following environment variables on each node before starting vLLM:
 | `PYTHONHASHSEED` | Yes | `0` | Must be consistent across all nodes to guarantee uniform hash generation. |
 | `DS_WORKER_ADDR` | Yes | N/A | Datasystem worker address in `<host>:<port>` format. This must match the local `dscli start --worker_address` value. |
 | `DATASYSTEM_CLIENT_LOG_DIR` | No | `~/.datasystem/logs` | Directory for Yuanrong client SDK logs created by the vLLM process. Use a directory separate from the worker logs. |
-| `DS_ENABLE_EXCLUSIVE_CONNECTION` | No | `0` | Passed to Yuanrong `HeteroClient.enable_exclusive_connection`. Use `1` to enable the exclusive connection mode when required by your deployment. |
 | `DS_ENABLE_REMOTE_H2D` | No | `0` | Passed to Yuanrong `HeteroClient.enable_remote_h2d`. Use `1` only after the Remote H2D requirements below are met. |
 
 ```bash
 export PYTHONHASHSEED=0
 export DS_WORKER_ADDR="${WORKER_IP}:31501"
 export DATASYSTEM_CLIENT_LOG_DIR="/var/log/yuanrong/client"
-export DS_ENABLE_EXCLUSIVE_CONNECTION=0
 export DS_ENABLE_REMOTE_H2D=0
 
 mkdir -p "${DATASYSTEM_CLIENT_LOG_DIR}"

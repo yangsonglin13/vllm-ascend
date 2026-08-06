@@ -28,7 +28,6 @@ def _sum_transfer_bytes(sizes: list[list[int]]) -> int:
 @dataclass
 class YuanrongConfig:
     worker_addr: str
-    enable_exclusive_connection: bool
     enable_remote_h2d: bool
 
     @staticmethod
@@ -39,7 +38,6 @@ class YuanrongConfig:
 
         return YuanrongConfig(
             worker_addr=worker_addr,
-            enable_exclusive_connection=bool(int(os.getenv("DS_ENABLE_EXCLUSIVE_CONNECTION", "0"))),
             enable_remote_h2d=bool(int(os.getenv("DS_ENABLE_REMOTE_H2D", "0"))),
         )
 
@@ -116,7 +114,6 @@ class YuanrongBackend(Backend):
         self._hetero_client = HeteroClient(
             host,
             int(port),
-            enable_exclusive_connection=self.config.enable_exclusive_connection,
             enable_remote_h2d=self.config.enable_remote_h2d,
         )
         self._hetero_client.init()

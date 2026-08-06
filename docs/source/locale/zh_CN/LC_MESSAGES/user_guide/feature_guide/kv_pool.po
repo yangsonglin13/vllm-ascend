@@ -1024,20 +1024,8 @@ msgid ""
 msgstr "数据系统工作节点地址，格式为 `<主机>:<端口>`。此值必须与本地 `dscli start --worker_address` 的值匹配。"
 
 #: ../../source/user_guide/feature_guide/kv_pool.md
-msgid "`DS_ENABLE_EXCLUSIVE_CONNECTION`"
-msgstr "`DS_ENABLE_EXCLUSIVE_CONNECTION`"
-
-#: ../../source/user_guide/feature_guide/kv_pool.md
 msgid "No"
 msgstr "否"
-
-#: ../../source/user_guide/feature_guide/kv_pool.md
-msgid ""
-"Passed to Yuanrong `HeteroClient.enable_exclusive_connection`. Use `1` to"
-" enable the exclusive connection mode when required by your deployment."
-msgstr ""
-"传递给元戎 `HeteroClient.enable_exclusive_connection`。当您的部署需要时，使用 `1` "
-"来启用独占连接模式。"
 
 #: ../../source/user_guide/feature_guide/kv_pool.md
 msgid "`DS_ENABLE_REMOTE_H2D`"

@@ -251,13 +251,11 @@ class TestYuanrongConfig(unittest.TestCase):
             os.environ,
             {
                 "DS_WORKER_ADDR": "host:1234",
-                "DS_ENABLE_EXCLUSIVE_CONNECTION": "1",
                 "DS_ENABLE_REMOTE_H2D": "0",
             },
         ):
             cfg = YuanrongConfig.load_from_env()
             self.assertEqual(cfg.worker_addr, "host:1234")
-            self.assertTrue(cfg.enable_exclusive_connection)
             self.assertFalse(cfg.enable_remote_h2d)
 
     def test_load_from_env_missing(self):
@@ -269,7 +267,6 @@ class TestYuanrongConfig(unittest.TestCase):
     def test_load_from_env_defaults(self):
         with patch.dict(os.environ, {"DS_WORKER_ADDR": "h:1"}):
             cfg = YuanrongConfig.load_from_env()
-            self.assertFalse(cfg.enable_exclusive_connection)
             self.assertFalse(cfg.enable_remote_h2d)
 
 
@@ -425,7 +422,6 @@ class TestYuanrongBackendMethods(unittest.TestCase):
             backend._buffers_registered = False
             backend.config = YuanrongConfig(
                 worker_addr="127.0.0.1:0",
-                enable_exclusive_connection=False,
                 enable_remote_h2d=False,
             )
             backend.rank = 0
