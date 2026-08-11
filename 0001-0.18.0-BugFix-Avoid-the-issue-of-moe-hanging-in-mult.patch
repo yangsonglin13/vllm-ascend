@@ -1,0 +1,52 @@
+From eef884dd5e6811ac60588cda1e71d2639674b8ac Mon Sep 17 00:00:00 2001
+From: drslark <96540755+drslark@users.noreply.github.com>
+Date: Mon, 29 Jun 2026 10:00:08 +0800
+Subject: [PATCH] [0.18.0][BugFix] Avoid the issue of moe hanging in multi-DP
+ scenarios without introducing new problems (#10112)
+
+### What this PR does / why we need it?
+It is a problem descibbed in
+https://github.com/vllm-project/vllm/issues/44185.
+
+We solved it in vllm-ascend, by dropping problematic
+`input_fits_in_drafter`.
+
+Also, we changed the mask to fill `1` to solve the original problem
+solved in https://github.com/vllm-project/vllm-ascend/pull/9235.
+
+### Does this PR introduce _any_ user-facing change?
+No
+
+### How was this patch tested?
+By ci.
+
+---------
+
+Signed-off-by: drslark <slarksblood@qq.com>
+---
+ vllm_ascend/spec_decode/eagle_proposer.py | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/vllm_ascend/spec_decode/eagle_proposer.py b/vllm_ascend/spec_decode/eagle_proposer.py
+index b43383457..7a4b329ab 100644
+--- a/vllm_ascend/spec_decode/eagle_proposer.py
++++ b/vllm_ascend/spec_decode/eagle_proposer.py
+@@ -1215,11 +1215,12 @@ class SpecDecodeBaseProposer(EagleProposer):
+         common_attn_metadata.seq_lens[:batch_size] += 1
+         # For the requests that exceed the max model length, we set the
+         # sequence length to 1 to minimize their overheads in attention.
+-        common_attn_metadata.seq_lens[:batch_size].masked_fill_(exceeds_max_model_len, 1)
++        exceeds_mask = common_attn_metadata.seq_lens[:batch_size] > self.max_model_len
++        common_attn_metadata.seq_lens[:batch_size].masked_fill_(exceeds_mask, 1)
+ 
+         common_attn_metadata.seq_lens_cpu[:batch_size] = common_attn_metadata.seq_lens_cpu[:batch_size] + 1
+-        exceeds_mask = common_attn_metadata.seq_lens_cpu[:batch_size] >= self.max_model_len
+-        common_attn_metadata.seq_lens_cpu[:batch_size].masked_fill_(exceeds_mask, 1)
++        exceeds_mask_cpu = common_attn_metadata.seq_lens_cpu[:batch_size] > self.max_model_len
++        common_attn_metadata.seq_lens_cpu[:batch_size].masked_fill_(exceeds_mask_cpu, 1)
+         common_attn_metadata.num_computed_tokens_cpu[:batch_size] += 1
+         if self.uses_mrope:
+             common_attn_metadata.positions[:batch_size].copy_(clamped_positions[0])
+-- 
+2.51.0.windows.1
+
