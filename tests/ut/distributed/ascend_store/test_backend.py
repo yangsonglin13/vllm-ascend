@@ -266,6 +266,11 @@ class TestYuanrongConfig(unittest.TestCase):
             request_timeout_ms=8000,
             get_sub_timeout_ms=3000,
             enable_dev_mem_pregister=True,
+            d2h_placement_policy="PREFERRED_LOCAL_THEN_TARGET_GROUP_LOWEST_UTILIZATION",
+            d2h_transport_policy="PREFER_HIXL",
+            d2h_target_workers=["decode-a:31501", "decode-b:31501"],
+            d2h_target_worker_group="decode",
+            d2h_local_reserve_bytes=4096,
         )
         cfg = YuanrongConfig.from_file(path)
         self.assertEqual(cfg.worker_addr, "host:1234")
@@ -276,6 +281,11 @@ class TestYuanrongConfig(unittest.TestCase):
         self.assertEqual(cfg.request_timeout_ms, 8000)
         self.assertEqual(cfg.get_sub_timeout_ms, 3000)
         self.assertTrue(cfg.enable_dev_mem_pregister)
+        self.assertEqual(cfg.d2h_placement_policy, "PREFERRED_LOCAL_THEN_TARGET_GROUP_LOWEST_UTILIZATION")
+        self.assertEqual(cfg.d2h_transport_policy, "PREFER_HIXL")
+        self.assertEqual(cfg.d2h_target_workers, ["decode-a:31501", "decode-b:31501"])
+        self.assertEqual(cfg.d2h_target_worker_group, "decode")
+        self.assertEqual(cfg.d2h_local_reserve_bytes, 4096)
 
     def test_from_file_defaults(self):
         path = self._write_config(worker_addr="h:1")
@@ -287,6 +297,20 @@ class TestYuanrongConfig(unittest.TestCase):
         self.assertEqual(cfg.request_timeout_ms, 0)
         self.assertEqual(cfg.get_sub_timeout_ms, 0)
         self.assertFalse(cfg.enable_dev_mem_pregister)
+        self.assertEqual(cfg.d2h_placement_policy, "LOCAL_WORKER_ONLY")
+        self.assertEqual(cfg.d2h_transport_policy, "TCP_ONLY")
+        self.assertEqual(cfg.d2h_target_workers, [])
+        self.assertEqual(cfg.d2h_local_reserve_bytes, 0)
+
+    def test_rejects_target_group_policy_without_members(self):
+        path = self._write_config(d2h_placement_policy="PREFERRED_LOCAL_THEN_TARGET_GROUP_LOWEST_UTILIZATION")
+        with self.assertRaisesRegex(ValueError, "d2h_target_workers"):
+            YuanrongConfig.from_file(path)
+
+    def test_rejects_fixed_policy_without_worker(self):
+        path = self._write_config(d2h_placement_policy="FIXED_WORKER")
+        with self.assertRaisesRegex(ValueError, "d2h_target_worker"):
+            YuanrongConfig.from_file(path)
 
     def test_from_file_fabric_mem_with_hixl(self):
         path = self._write_config(
@@ -394,6 +418,7 @@ class TestYuanrongBackendMethods(unittest.TestCase):
             backend.store = MagicMock()
             backend.store.mget_h2d_from_multi_buffers.return_value = []
             backend.store.mset_d2h_from_multi_buffers.return_value = None
+            backend.store.mset_d2h_remote_from_multi_buffers.return_value = MagicMock(failed_keys=[])
             backend.store.batch_is_exist.return_value = [1, 0]
             backend._ds_set_param = MagicMock()
             backend._needs_dev_mem_pregister = False
@@ -408,6 +433,7 @@ class TestYuanrongBackendMethods(unittest.TestCase):
                 enable_dev_mem_pregister=False,
             )
             backend.rank = 0
+            backend._use_remote_d2h = False
             return backend
 
     def test_exists(self):
@@ -458,6 +484,54 @@ class TestYuanrongBackendMethods(unittest.TestCase):
         b = self._make_backend()
         b.put(["k1"], [[100]], [[10]])
         b.store.mset_d2h_from_multi_buffers.assert_called_once_with(["k1"], [[100]], [[10]], b._ds_set_param)
+
+    def test_remote_put_uses_configured_decode_group(self):
+        b = self._make_backend()
+        b._use_remote_d2h = True
+        b.config.d2h_placement_policy = "PREFERRED_LOCAL_THEN_TARGET_GROUP_LOWEST_UTILIZATION"
+        b.config.d2h_transport_policy = "PREFER_HIXL"
+        b.config.d2h_target_workers = ["decode-a:31501", "decode-b:31501"]
+        b.config.d2h_target_worker_group = "decode"
+        b.config.d2h_local_reserve_bytes = 4096
+
+        b.put(["k1"], [[100]], [[10]])
+
+        b.store.mset_d2h_remote_from_multi_buffers.assert_called_once_with(
+            ["k1"],
+            [[100]],
+            [[10]],
+            b._ds_set_param,
+            placement_policy="PREFERRED_LOCAL_THEN_TARGET_GROUP_LOWEST_UTILIZATION",
+            transport_policy="PREFER_HIXL",
+            target_workers=["decode-a:31501", "decode-b:31501"],
+            target_worker_group="decode",
+            target_worker="",
+            local_reserve_bytes=4096,
+        )
+
+    def test_fixed_worker_put_passes_hard_target(self):
+        b = self._make_backend()
+        b._use_remote_d2h = True
+        b.config.d2h_placement_policy = "FIXED_WORKER"
+        b.config.d2h_target_worker = "decode-a:31501"
+
+        b.put(["k1"], [[100]], [[10]])
+
+        _, kwargs = b.store.mset_d2h_remote_from_multi_buffers.call_args
+        self.assertEqual(kwargs["target_worker"], "decode-a:31501")
+
+    def test_remote_put_exception(self):
+        b = self._make_backend()
+        b._use_remote_d2h = True
+        b.config.d2h_placement_policy = "LOWEST_UTILIZATION"
+        b.store.mset_d2h_remote_from_multi_buffers.side_effect = RuntimeError("remote backend fail")
+        with patch(
+            "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.yuanrong_backend.logger"
+        ) as mock_logger:
+            b.put(["k1"], [[100]], [[10]])
+        error_log = _format_log_call(mock_logger.error.call_args)
+        self.assertIn("RuntimeError", error_log)
+        self.assertIn("remote backend fail", error_log)
 
     def test_put_exception(self):
         b = self._make_backend()

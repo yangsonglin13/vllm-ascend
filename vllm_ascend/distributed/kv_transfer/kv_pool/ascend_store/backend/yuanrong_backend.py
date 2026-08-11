@@ -1,6 +1,6 @@
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 from vllm.config import ParallelConfig
@@ -21,6 +21,12 @@ class YuanrongConfig:
     request_timeout_ms: int = 0
     get_sub_timeout_ms: int = 0
     enable_dev_mem_pregister: bool = False
+    d2h_placement_policy: str = "LOCAL_WORKER_ONLY"
+    d2h_transport_policy: str = "TCP_ONLY"
+    d2h_target_workers: list[str] = field(default_factory=list)
+    d2h_target_worker_group: str = ""
+    d2h_target_worker: str = ""
+    d2h_local_reserve_bytes: int = 0
 
     @staticmethod
     def from_file(file_path: str) -> "YuanrongConfig":
@@ -28,6 +34,32 @@ class YuanrongConfig:
             config = json.load(f)
         if not isinstance(config, dict):
             raise ValueError(f"Invalid JSON content in {file_path}, expected a dictionary/object.")
+        target_workers = config.get("d2h_target_workers", [])
+        if not isinstance(target_workers, list) or not all(isinstance(worker, str) for worker in target_workers):
+            raise ValueError("d2h_target_workers must be a list of '<host>:<port>' strings")
+        placement_policy = config.get("d2h_placement_policy", "LOCAL_WORKER_ONLY")
+        transport_policy = config.get("d2h_transport_policy", "TCP_ONLY")
+        valid_placement_policies = {
+            "LOCAL_WORKER_ONLY",
+            "PREFERRED_META_OWNER",
+            "PREFERRED_LOCAL_THEN_LOWEST_UTILIZATION",
+            "PREFERRED_LOCAL_THEN_TARGET_GROUP_LOWEST_UTILIZATION",
+            "LOWEST_UTILIZATION",
+            "FIXED_WORKER",
+        }
+        valid_transport_policies = {"TCP_ONLY", "HIXL_ONLY", "PREFER_HIXL"}
+        if placement_policy not in valid_placement_policies:
+            raise ValueError(f"Invalid d2h_placement_policy: {placement_policy}")
+        if transport_policy not in valid_transport_policies:
+            raise ValueError(f"Invalid d2h_transport_policy: {transport_policy}")
+        target_worker = config.get("d2h_target_worker", "")
+        if placement_policy == "FIXED_WORKER" and not target_worker:
+            raise ValueError("d2h_target_worker is required for FIXED_WORKER")
+        if placement_policy == "PREFERRED_LOCAL_THEN_TARGET_GROUP_LOWEST_UTILIZATION" and not target_workers:
+            raise ValueError("d2h_target_workers is required for the target-group placement policy")
+        local_reserve_bytes = config.get("d2h_local_reserve_bytes", 0)
+        if not isinstance(local_reserve_bytes, int) or local_reserve_bytes < 0:
+            raise ValueError("d2h_local_reserve_bytes must be a non-negative integer")
         return YuanrongConfig(
             worker_addr=config.get("worker_addr", ""),
             enable_remote_h2d=bool(config.get("enable_remote_h2d", False)),
@@ -37,6 +69,12 @@ class YuanrongConfig:
             request_timeout_ms=config.get("request_timeout_ms", 0),
             get_sub_timeout_ms=config.get("get_sub_timeout_ms", 0),
             enable_dev_mem_pregister=bool(config.get("enable_dev_mem_pregister", False)),
+            d2h_placement_policy=placement_policy,
+            d2h_transport_policy=transport_policy,
+            d2h_target_workers=target_workers,
+            d2h_target_worker_group=config.get("d2h_target_worker_group", ""),
+            d2h_target_worker=target_worker,
+            d2h_local_reserve_bytes=local_reserve_bytes,
         )
 
     @staticmethod
@@ -86,6 +124,9 @@ class YuanrongBackend(Backend):
         )
         self._registered_buffers: tuple[list[int], list[int]] | None = None
         self._buffers_registered = False
+        self._use_remote_d2h = (
+            self.config.d2h_placement_policy != "LOCAL_WORKER_ONLY" or self.config.d2h_transport_policy != "TCP_ONLY"
+        )
 
     def set_device(self):
         local_rank = get_world_group().local_rank
@@ -148,7 +189,29 @@ class YuanrongBackend(Backend):
         assert self.store is not None
         failed_keys_for_log = keys
         try:
-            self.store.mset_d2h_from_multi_buffers(keys, addrs, sizes, self._ds_set_param)
+            if not self._use_remote_d2h:
+                self.store.mset_d2h_from_multi_buffers(keys, addrs, sizes, self._ds_set_param)
+                return
+            result = self.store.mset_d2h_remote_from_multi_buffers(
+                keys,
+                addrs,
+                sizes,
+                self._ds_set_param,
+                placement_policy=self.config.d2h_placement_policy,
+                transport_policy=self.config.d2h_transport_policy,
+                target_workers=self.config.d2h_target_workers,
+                target_worker_group=self.config.d2h_target_worker_group,
+                target_worker=self.config.d2h_target_worker,
+                local_reserve_bytes=self.config.d2h_local_reserve_bytes,
+            )
+            if result.failed_keys:
+                logger.error(
+                    "Failed to remotely put %d keys out of %d. targets=%s, transport=%s.",
+                    len(result.failed_keys),
+                    len(keys),
+                    result.target_workers,
+                    result.actual_transport,
+                )
         except Exception as exc:
             logger.error(
                 "Failed to put %d keys out of %d. type=%s, error=%s. Check network and yuanrong service.",

@@ -963,10 +963,16 @@ client connection options:
     "connect_timeout_ms": 9000,
     "request_timeout_ms": 0,
     "get_sub_timeout_ms": 0,
-    "enable_remote_h2d": false,
+    "enable_remote_h2d": true,
     "remote_h2d_transport_backend": "HIXL",
     "enable_fabric_mem": false,
-    "enable_dev_mem_pregister": false
+    "enable_dev_mem_pregister": false,
+    "d2h_placement_policy": "PREFERRED_LOCAL_THEN_TARGET_GROUP_LOWEST_UTILIZATION",
+    "d2h_transport_policy": "PREFER_HIXL",
+    "d2h_target_workers": ["10.0.0.21:31501", "10.0.0.22:31501"],
+    "d2h_target_worker_group": "decode",
+    "d2h_target_worker": "",
+    "d2h_local_reserve_bytes": 4294967296
 }
 ```
 
@@ -1012,6 +1018,38 @@ hold: `enable_remote_h2d=true`, `remote_h2d_transport_backend="HIXL"`, and
 `enable_fabric_mem=false`. Under `P2P_TRANSFER` or FabricMem mode pre-registration
 is always skipped regardless of this toggle. Set this to `true` for HIXL HCCS
 Remote H2D deployments that require client-side device memory registration.
+
+**d2h_placement_policy**: Controls where Yuanrong stores new D2H objects. The
+default `LOCAL_WORKER_ONLY` preserves the existing behavior. For PD separation,
+use `PREFERRED_LOCAL_THEN_TARGET_GROUP_LOWEST_UTILIZATION`: the P-side Worker is
+used while its high-watermark-aware capacity still covers the request and
+`d2h_local_reserve_bytes`; otherwise the SDK selects the least utilized Worker
+from `d2h_target_workers`. Equal-utilization ties use a stable client/key hash,
+so multiple P processes do not all select the first D Worker. Other values are
+`PREFERRED_META_OWNER`, `PREFERRED_LOCAL_THEN_LOWEST_UTILIZATION`,
+`LOWEST_UTILIZATION`, and `FIXED_WORKER`.
+
+**d2h_transport_policy**: `TCP_ONLY` stages data in P-side Host memory and sends
+it to the selected Worker. `HIXL_ONLY` requires HIXL D2rH on both endpoints.
+`PREFER_HIXL` uses HIXL when available and otherwise selects TCP before data
+transfer starts. It never replays a transfer over TCP after HIXL WRITE begins.
+
+**d2h_target_workers**: Datasystem Worker RPC addresses eligible to receive the
+write. In a 4P/4D deployment, configure the same four D Worker addresses on all
+P processes. This is required by the target-group placement policy.
+
+**d2h_target_worker_group**: Stable group label used in tie-breaking and
+diagnostics, for example `decode`. Membership comes from `d2h_target_workers`.
+
+**d2h_target_worker**: Hard target Worker for `FIXED_WORKER`. No other Worker is
+selected if its reservation fails.
+
+**d2h_local_reserve_bytes**: Additional P-side DRAM headroom kept above
+Datasystem's allocator high-watermark reserve. Capacity-aware reservations do
+not wait for eviction: a raced local allocation fails fast and the request
+continues to a D candidate, preventing fast eviction from swallowing spill
+traffic. Size this for concurrent spill/staging demand and validate it under
+production batch sizes.
 
 #### Remote H2D Requirements
 
