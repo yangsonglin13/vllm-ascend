@@ -1,0 +1,495 @@
+From 2f446655bad120d6705b97e59936c87ca0729a41 Mon Sep 17 00:00:00 2001
+From: yangsonglin13 <yangsonglin566@gmail.com>
+Date: Tue, 18 Aug 2026 12:11:40 +0800
+Subject: [PATCH 2/2] perf: add KVC latency stats
+
+Log Yuanrong, Mooncake, and Memcache load, store, and exists latency with transfer bytes or queried key counts. Add an offline parser that summarizes latency percentiles and throughput, with regression coverage.
+
+Signed-off-by: yangsonglin13 <yangsonglin566@gmail.com>
+---
+ tests/ut/_tools/test_load_kvc_stats.py        |  26 +++
+ .../distributed/ascend_store/test_backend.py  |  36 +++-
+ tools/load_kvc_stats.py                       | 181 ++++++++++++++++++
+ .../ascend_store/backend/memcache_backend.py  |  27 ++-
+ .../ascend_store/backend/mooncake_backend.py  |  28 ++-
+ .../ascend_store/backend/yuanrong_backend.py  |  26 ++-
+ 6 files changed, 312 insertions(+), 12 deletions(-)
+ create mode 100644 tests/ut/_tools/test_load_kvc_stats.py
+ create mode 100644 tools/load_kvc_stats.py
+
+diff --git a/tests/ut/_tools/test_load_kvc_stats.py b/tests/ut/_tools/test_load_kvc_stats.py
+new file mode 100644
+index 000000000..bdcd805b7
+--- /dev/null
++++ b/tests/ut/_tools/test_load_kvc_stats.py
+@@ -0,0 +1,26 @@
++from tools.load_kvc_stats import parse_lines, summarize
++
++
++def test_parse_exists_timing_for_all_backends():
++    records = parse_lines(
++        [
++            "Yuanrong exists took 1.250 ms, keys=2",
++            "MooncakeBackend exists took 2.500 ms, keys=3",
++            "Memcache exists took 3.750 ms, keys=4",
++        ]
++    )
++
++    assert records == {
++        "Yuanrong/exists": [{"elapsed_ms": 1.25}],
++        "Mooncake/exists": [{"elapsed_ms": 2.5}],
++        "Memcache/exists": [{"elapsed_ms": 3.75}],
++    }
++
++
++def test_exists_summary_has_latency_without_transfer_throughput():
++    summary = summarize([{"elapsed_ms": 1.0}, {"elapsed_ms": 3.0}])
++
++    assert summary["count"] == 2
++    assert summary["avg_ms"] == 2.0
++    assert summary["total_mb"] == 0.0
++    assert summary["throughput_mb_s"] == 0.0
+diff --git a/tests/ut/distributed/ascend_store/test_backend.py b/tests/ut/distributed/ascend_store/test_backend.py
+index 10d750af2..f35c142e3 100644
+--- a/tests/ut/distributed/ascend_store/test_backend.py
++++ b/tests/ut/distributed/ascend_store/test_backend.py
+@@ -323,8 +323,18 @@ class TestMooncakeBackendMethods(unittest.TestCase):
+     def test_exists(self):
+         b = self._make_backend()
+         b.store.batch_is_exist.return_value = [1, 0]
+-        result = b.exists(["k1", "k2"])
++        with (
++            patch(
++                "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.mooncake_backend.time.perf_counter",
++                side_effect=[10.0, 10.012],
++            ),
++            patch(
++                "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.mooncake_backend.logger"
++            ) as mock_logger,
++        ):
++            result = b.exists(["k1", "k2"])
+         self.assertEqual(result, [1, 0])
++        self.assertEqual(_format_log_call(mock_logger.info.call_args), "Mooncake exists took 12.000 ms, keys=2")
+ 
+     def test_put(self):
+         b = self._make_backend()
+@@ -413,9 +423,19 @@ class TestYuanrongBackendMethods(unittest.TestCase):
+     def test_exists(self):
+         b = self._make_backend()
+         b.store.batch_is_exist.return_value = [1, 0]
+-        result = b.exists(["k1", "k2"])
++        with (
++            patch(
++                "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.yuanrong_backend.time.perf_counter",
++                side_effect=[10.0, 10.012],
++            ),
++            patch(
++                "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.yuanrong_backend.logger"
++            ) as mock_logger,
++        ):
++            result = b.exists(["k1", "k2"])
+         self.assertEqual(result, [1, 0])
+         b.store.batch_is_exist.assert_called_once_with(["k1", "k2"])
++        self.assertEqual(_format_log_call(mock_logger.info.call_args), "Yuanrong exists took 12.000 ms, keys=2")
+ 
+     def test_exists_exception(self):
+         b = self._make_backend()
+@@ -576,7 +596,17 @@ class TestMemcacheBackendMethods(unittest.TestCase):
+     def test_exists(self):
+         b = self._make_backend()
+         b.store.batch_is_exist.return_value = [1]
+-        self.assertEqual(b.exists(["k1"]), [1])
++        with (
++            patch(
++                "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.memcache_backend.time.perf_counter",
++                side_effect=[10.0, 10.012],
++            ),
++            patch(
++                "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.memcache_backend.logger"
++            ) as mock_logger,
++        ):
++            self.assertEqual(b.exists(["k1"]), [1])
++        self.assertEqual(_format_log_call(mock_logger.info.call_args), "Memcache exists took 12.000 ms, keys=1")
+ 
+     def test_register_buffer(self):
+         b = self._make_backend()
+diff --git a/tools/load_kvc_stats.py b/tools/load_kvc_stats.py
+new file mode 100644
+index 000000000..1b8202e17
+--- /dev/null
++++ b/tools/load_kvc_stats.py
+@@ -0,0 +1,181 @@
++import argparse
++import glob
++import json
++import math
++import re
++import sys
++from collections import defaultdict
++from collections.abc import Iterable
++from pathlib import Path
++
++KVC_TIMING_PATTERN = re.compile(
++    r"(?P<backend>Yuanrong(?:Backend)?|Mooncake(?:Backend)?|Memcache(?:Backend)?)\s+"
++    r"(?P<op>load_kvc|store_kvc|exists)\s+took\s+"
++    r"(?P<elapsed_ms>\d+(?:\.\d+)?)\s+ms"
++    r"(?:,\s+bytes=(?P<bytes>\d+))?"
++)
++
++BYTES_PER_MB = 1000 * 1000
++
++
++def normalize_backend_name(name: str) -> str:
++    return name.removesuffix("Backend")
++
++
++def group_key(backend: str, op: str) -> str:
++    return f"{backend}/{op}"
++
++
++def iter_input_paths(patterns: list[str], recursive: bool) -> Iterable[Path]:
++    for pattern in patterns:
++        path = Path(pattern)
++        if path.exists():
++            if path.is_dir():
++                glob_pattern = "**/*" if recursive else "*"
++                yield from (p for p in path.glob(glob_pattern) if p.is_file())
++            else:
++                yield path
++            continue
++
++        matched_paths = [Path(p) for p in glob.glob(pattern) if Path(p).is_file()]
++        if not matched_paths:
++            raise FileNotFoundError(f"No files matched: {pattern}")
++        yield from matched_paths
++
++
++def parse_lines(lines: Iterable[str]) -> dict[str, list[dict[str, int | float]]]:
++    records: dict[str, list[dict[str, int | float]]] = defaultdict(list)
++    for line in lines:
++        match = KVC_TIMING_PATTERN.search(line)
++        if match is None:
++            continue
++        backend = normalize_backend_name(match.group("backend"))
++        key = group_key(backend, match.group("op"))
++        record: dict[str, int | float] = {"elapsed_ms": float(match.group("elapsed_ms"))}
++        if match.group("bytes") is not None:
++            record["bytes"] = int(match.group("bytes"))
++        records[key].append(record)
++    return dict(records)
++
++
++def percentile(values: list[float], percent: float) -> float:
++    if not values:
++        return 0.0
++    sorted_values = sorted(values)
++    rank = math.ceil(percent / 100 * len(sorted_values))
++    index = min(max(rank - 1, 0), len(sorted_values) - 1)
++    return sorted_values[index]
++
++
++def summarize(records: list[dict[str, int | float]]) -> dict[str, int | float]:
++    elapsed_values = [float(record["elapsed_ms"]) for record in records]
++    total_elapsed = sum(elapsed_values)
++    total_bytes = sum(int(record.get("bytes", 0)) for record in records)
++    count = len(elapsed_values)
++    throughput_mb_s = 0.0
++    if total_elapsed > 0:
++        throughput_mb_s = total_bytes / BYTES_PER_MB / (total_elapsed / 1000)
++    return {
++        "count": count,
++        "avg_ms": total_elapsed / count if count else 0.0,
++        "p50_ms": percentile(elapsed_values, 50),
++        "p90_ms": percentile(elapsed_values, 90),
++        "p95_ms": percentile(elapsed_values, 95),
++        "p99_ms": percentile(elapsed_values, 99),
++        "max_ms": max(elapsed_values) if elapsed_values else 0.0,
++        "total_mb": total_bytes / BYTES_PER_MB,
++        "throughput_mb_s": throughput_mb_s,
++    }
++
++
++def merge_records(records_by_backend: dict[str, list[dict[str, int | float]]]) -> list[dict[str, int | float]]:
++    merged: list[dict[str, int | float]] = []
++    for records in records_by_backend.values():
++        merged.extend(records)
++    return merged
++
++
++def format_table(summaries: dict[str, dict[str, int | float]]) -> str:
++    headers = [
++        "backend/op",
++        "count",
++        "avg_ms",
++        "p50_ms",
++        "p90_ms",
++        "p95_ms",
++        "p99_ms",
++        "max_ms",
++        "total_mb",
++        "throughput_mb_s",
++    ]
++    rows = []
++    for backend, summary in summaries.items():
++        rows.append(
++            [
++                backend,
++                str(summary["count"]),
++                f"{summary['avg_ms']:.3f}",
++                f"{summary['p50_ms']:.3f}",
++                f"{summary['p90_ms']:.3f}",
++                f"{summary['p95_ms']:.3f}",
++                f"{summary['p99_ms']:.3f}",
++                f"{summary['max_ms']:.3f}",
++                f"{summary['total_mb']:.3f}",
++                f"{summary['throughput_mb_s']:.3f}",
++            ]
++        )
++    widths = [len(header) for header in headers]
++    for row in rows:
++        widths = [max(width, len(cell)) for width, cell in zip(widths, row)]
++    lines = ["  ".join(header.ljust(width) for header, width in zip(headers, widths))]
++    lines.append("  ".join("-" * width for width in widths))
++    lines.extend("  ".join(cell.ljust(width) for cell, width in zip(row, widths)) for row in rows)
++    return "\n".join(lines)
++
++
++def read_file_lines(path: Path) -> Iterable[str]:
++    with path.open("r", encoding="utf-8", errors="ignore") as file:
++        yield from file
++
++
++def collect_records(args: argparse.Namespace) -> dict[str, list[dict[str, int | float]]]:
++    records_by_backend: dict[str, list[dict[str, int | float]]] = defaultdict(list)
++    if not args.paths or args.paths == ["-"]:
++        parsed = parse_lines(sys.stdin)
++        for backend, records in parsed.items():
++            records_by_backend[backend].extend(records)
++        return dict(records_by_backend)
++
++    for path in iter_input_paths(args.paths, args.recursive):
++        parsed = parse_lines(read_file_lines(path))
++        for backend, records in parsed.items():
++            records_by_backend[backend].extend(records)
++    return dict(records_by_backend)
++
++
++def main() -> int:
++    parser = argparse.ArgumentParser(
++        description="Summarize Yuanrong/Mooncake/Memcache load_kvc, store_kvc, and exists latency from service logs."
++    )
++    parser.add_argument("paths", nargs="*", help="Log files, directories, globs, or '-' for stdin.")
++    parser.add_argument("--recursive", action="store_true", help="Recursively scan directories.")
++    parser.add_argument("--json", action="store_true", help="Print JSON instead of a table.")
++    args = parser.parse_args()
++
++    records_by_backend = collect_records(args)
++    if not records_by_backend:
++        print("No KVC timing records found.", file=sys.stderr)
++        return 1
++
++    summaries = {backend: summarize(records) for backend, records in sorted(records_by_backend.items())}
++    summaries["overall"] = summarize(merge_records(records_by_backend))
++
++    if args.json:
++        print(json.dumps(summaries, indent=2, sort_keys=True))
++    else:
++        print(format_table(summaries))
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/memcache_backend.py b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/memcache_backend.py
+index d58029573..d43372a5f 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/memcache_backend.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/memcache_backend.py
+@@ -30,6 +30,10 @@ def _is_device_sdma() -> bool:
+     return False
+ 
+ 
++def _sum_transfer_bytes(sizes: list[list[int]]) -> int:
++    return sum(sum(size_group) for size_group in sizes)
++
++
+ class MmcDirect(Enum):
+     COPY_L2G = 0
+     COPY_G2L = 1
+@@ -136,7 +140,12 @@ class MemcacheBackend(Backend):
+             )
+             return [0] * len(keys)
+         assert self.store is not None
+-        return self.store.batch_is_exist(keys)
++        start_time = time.perf_counter()
++        try:
++            return self.store.batch_is_exist(keys)
++        finally:
++            elapsed_ms = (time.perf_counter() - start_time) * 1000
++            logger.info("Memcache exists took %.3f ms, keys=%d", elapsed_ms, len(keys))
+ 
+     def batch_get_key_info(self, keys: list[str]) -> list[Any]:
+         if self._lazy_init and not self._store_initialized:
+@@ -178,7 +187,13 @@ class MemcacheBackend(Backend):
+             return
+         assert self.store is not None
+         try:
+-            res = self.store.batch_get_into_layers(key, addr, size, MmcDirect.COPY_G2L.value)
++            res = None
++            start_time = time.perf_counter()
++            try:
++                res = self.store.batch_get_into_layers(key, addr, size, MmcDirect.COPY_G2L.value)
++            finally:
++                elapsed_ms = (time.perf_counter() - start_time) * 1000
++                logger.info("Memcache load_kvc took %.3f ms, bytes=%d", elapsed_ms, _sum_transfer_bytes(size))
+             failed_codes = [int(value) for value in res if value != 0]
+             failed_count = len(failed_codes)
+             if failed_count:
+@@ -206,7 +221,13 @@ class MemcacheBackend(Backend):
+         self.ensure_initialized()
+         assert self.store is not None
+         try:
+-            res = self.store.batch_put_from_layers(key, addr, size, MmcDirect.COPY_L2G.value)
++            res = None
++            start_time = time.perf_counter()
++            try:
++                res = self.store.batch_put_from_layers(key, addr, size, MmcDirect.COPY_L2G.value)
++            finally:
++                elapsed_ms = (time.perf_counter() - start_time) * 1000
++                logger.info("Memcache store_kvc took %.3f ms, bytes=%d", elapsed_ms, _sum_transfer_bytes(size))
+             failed_codes = [int(value) for value in res if value != 0]
+             failed_count = len(failed_codes)
+             if failed_count:
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/mooncake_backend.py b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/mooncake_backend.py
+index bd186c449..bb9524818 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/mooncake_backend.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/mooncake_backend.py
+@@ -3,6 +3,7 @@ import functools
+ import json
+ import os
+ import threading
++import time
+ from dataclasses import dataclass
+ from typing import Any
+ 
+@@ -24,6 +25,10 @@ DEFAULT_GLOBAL_SEGMENT_SIZE = 1073741824  # 1.0 GiB
+ DEFAULT_LOCAL_BUFFER_SIZE = 1073741824  # 1.0 GiB
+ 
+ 
++def _sum_transfer_bytes(sizes: list[list[int]]) -> int:
++    return sum(sum(size_group) for size_group in sizes)
++
++
+ @functools.lru_cache(maxsize=1)
+ def _mooncake_setup_supports_ssd_offload() -> bool:
+     """True when installed Mooncake exposes SSD kwargs on setup() (v0.3.11+)."""
+@@ -191,7 +196,12 @@ class MooncakeBackend(Backend):
+             )
+             return [0] * len(keys)
+         assert self.store is not None
+-        return self.store.batch_is_exist(keys)
++        start_time = time.perf_counter()
++        try:
++            return self.store.batch_is_exist(keys)
++        finally:
++            elapsed_ms = (time.perf_counter() - start_time) * 1000
++            logger.info("Mooncake exists took %.3f ms, keys=%d", elapsed_ms, len(keys))
+ 
+     def put(self, keys: list[str], addrs: list[list[int]], sizes: list[list[int]]):
+         self.ensure_initialized()
+@@ -201,7 +211,13 @@ class MooncakeBackend(Backend):
+             if self.config.preferred_segment:
+                 config.preferred_segment = self.local_seg
+             config.prefer_alloc_in_same_node = self.config.prefer_alloc_in_same_node
+-            res = self.store.batch_put_from_multi_buffers(keys, addrs, sizes, config)
++            res = None
++            start_time = time.perf_counter()
++            try:
++                res = self.store.batch_put_from_multi_buffers(keys, addrs, sizes, config)
++            finally:
++                elapsed_ms = (time.perf_counter() - start_time) * 1000
++                logger.info("Mooncake store_kvc took %.3f ms, bytes=%d", elapsed_ms, _sum_transfer_bytes(sizes))
+             failed_codes = [int(value) for value in res if value < 0]
+             failed_count = len(failed_codes)
+             if failed_count:
+@@ -244,7 +260,13 @@ class MooncakeBackend(Backend):
+             keys[:3],
+         )
+         try:
+-            res = self.store.batch_get_into_multi_buffers(keys, addrs, sizes)
++            res = None
++            start_time = time.perf_counter()
++            try:
++                res = self.store.batch_get_into_multi_buffers(keys, addrs, sizes)
++            finally:
++                elapsed_ms = (time.perf_counter() - start_time) * 1000
++                logger.info("Mooncake load_kvc took %.3f ms, bytes=%d", elapsed_ms, _sum_transfer_bytes(sizes))
+             res_list = list(res)
+             failed_codes = [int(value) for value in res_list if value < 0]
+             failed_count = len(failed_codes)
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/yuanrong_backend.py b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/yuanrong_backend.py
+index c3d4aab48..112fcc23b 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/yuanrong_backend.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/yuanrong_backend.py
+@@ -1,5 +1,6 @@
+ import json
+ import os
++import time
+ from dataclasses import dataclass
+ 
+ import torch
+@@ -11,6 +12,10 @@ from vllm.utils.network_utils import split_host_port
+ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.backend import Backend
+ 
+ 
++def _sum_transfer_bytes(sizes: list[list[int]]) -> int:
++    return sum(sum(size_group) for size_group in sizes)
++
++
+ @dataclass
+ class YuanrongConfig:
+     worker_addr: str
+@@ -111,7 +116,12 @@ class YuanrongBackend(Backend):
+     def exists(self, keys: list[str]) -> list[int]:
+         assert self.store is not None
+         try:
+-            return self.store.batch_is_exist(keys)
++            start_time = time.perf_counter()
++            try:
++                return self.store.batch_is_exist(keys)
++            finally:
++                elapsed_ms = (time.perf_counter() - start_time) * 1000
++                logger.info("Yuanrong exists took %.3f ms, keys=%d", elapsed_ms, len(keys))
+         except Exception as exc:
+             logger.error(
+                 "Failed to check keys. keys_count=%d, type=%s, error=%s. Check network and yuanrong service.",
+@@ -125,7 +135,12 @@ class YuanrongBackend(Backend):
+         assert self.store is not None
+         failed_keys_for_log = keys
+         try:
+-            failed_keys = self.store.mget_h2d_from_multi_buffers(keys, addrs, sizes, self.config.get_sub_timeout_ms)
++            start_time = time.perf_counter()
++            try:
++                failed_keys = self.store.mget_h2d_from_multi_buffers(keys, addrs, sizes, self.config.get_sub_timeout_ms)
++            finally:
++                elapsed_ms = (time.perf_counter() - start_time) * 1000
++                logger.info("Yuanrong load_kvc took %.3f ms, bytes=%d", elapsed_ms, _sum_transfer_bytes(sizes))
+             if failed_keys:
+                 logger.error(
+                     "Failed to get %d keys out of %d. Check key existence and memory state.",
+@@ -150,7 +165,12 @@ class YuanrongBackend(Backend):
+         assert self.store is not None
+         failed_keys_for_log = keys
+         try:
+-            self.store.mset_d2h_from_multi_buffers(keys, addrs, sizes, self._ds_set_param)
++            start_time = time.perf_counter()
++            try:
++                self.store.mset_d2h_from_multi_buffers(keys, addrs, sizes, self._ds_set_param)
++            finally:
++                elapsed_ms = (time.perf_counter() - start_time) * 1000
++                logger.info("Yuanrong store_kvc took %.3f ms, bytes=%d", elapsed_ms, _sum_transfer_bytes(sizes))
+         except Exception as exc:
+             logger.error(
+                 "Failed to put %d keys out of %d. type=%s, error=%s. Check network and yuanrong service.",
+-- 
+2.51.0.windows.1
+
