@@ -3,6 +3,7 @@ import functools
 import json
 import os
 import threading
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -22,6 +23,10 @@ from vllm_ascend.distributed.parallel_state import get_global_rank
 
 DEFAULT_GLOBAL_SEGMENT_SIZE = 1073741824  # 1.0 GiB
 DEFAULT_LOCAL_BUFFER_SIZE = 1073741824  # 1.0 GiB
+
+
+def _sum_transfer_bytes(sizes: list[list[int]]) -> int:
+    return sum(sum(size_group) for size_group in sizes)
 
 
 @functools.lru_cache(maxsize=1)
@@ -191,7 +196,12 @@ class MooncakeBackend(Backend):
             )
             return [0] * len(keys)
         assert self.store is not None
-        return self.store.batch_is_exist(keys)
+        start_time = time.perf_counter()
+        try:
+            return self.store.batch_is_exist(keys)
+        finally:
+            elapsed_ms = (time.perf_counter() - start_time) * 1000
+            logger.info("Mooncake exists took %.3f ms, keys=%d", elapsed_ms, len(keys))
 
     def put(self, keys: list[str], addrs: list[list[int]], sizes: list[list[int]]):
         self.ensure_initialized()
@@ -201,7 +211,13 @@ class MooncakeBackend(Backend):
             if self.config.preferred_segment:
                 config.preferred_segment = self.local_seg
             config.prefer_alloc_in_same_node = self.config.prefer_alloc_in_same_node
-            res = self.store.batch_put_from_multi_buffers(keys, addrs, sizes, config)
+            res = None
+            start_time = time.perf_counter()
+            try:
+                res = self.store.batch_put_from_multi_buffers(keys, addrs, sizes, config)
+            finally:
+                elapsed_ms = (time.perf_counter() - start_time) * 1000
+                logger.info("Mooncake store_kvc took %.3f ms, bytes=%d", elapsed_ms, _sum_transfer_bytes(sizes))
             failed_codes = [int(value) for value in res if value < 0]
             failed_count = len(failed_codes)
             if failed_count:
@@ -244,7 +260,13 @@ class MooncakeBackend(Backend):
             keys[:3],
         )
         try:
-            res = self.store.batch_get_into_multi_buffers(keys, addrs, sizes)
+            res = None
+            start_time = time.perf_counter()
+            try:
+                res = self.store.batch_get_into_multi_buffers(keys, addrs, sizes)
+            finally:
+                elapsed_ms = (time.perf_counter() - start_time) * 1000
+                logger.info("Mooncake load_kvc took %.3f ms, bytes=%d", elapsed_ms, _sum_transfer_bytes(sizes))
             res_list = list(res)
             failed_codes = [int(value) for value in res_list if value < 0]
             failed_count = len(failed_codes)

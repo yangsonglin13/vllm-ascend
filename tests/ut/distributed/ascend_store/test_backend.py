@@ -323,8 +323,18 @@ class TestMooncakeBackendMethods(unittest.TestCase):
     def test_exists(self):
         b = self._make_backend()
         b.store.batch_is_exist.return_value = [1, 0]
-        result = b.exists(["k1", "k2"])
+        with (
+            patch(
+                "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.mooncake_backend.time.perf_counter",
+                side_effect=[10.0, 10.012],
+            ),
+            patch(
+                "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.mooncake_backend.logger"
+            ) as mock_logger,
+        ):
+            result = b.exists(["k1", "k2"])
         self.assertEqual(result, [1, 0])
+        self.assertEqual(_format_log_call(mock_logger.info.call_args), "Mooncake exists took 12.000 ms, keys=2")
 
     def test_put(self):
         b = self._make_backend()
@@ -413,9 +423,19 @@ class TestYuanrongBackendMethods(unittest.TestCase):
     def test_exists(self):
         b = self._make_backend()
         b.store.batch_is_exist.return_value = [1, 0]
-        result = b.exists(["k1", "k2"])
+        with (
+            patch(
+                "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.yuanrong_backend.time.perf_counter",
+                side_effect=[10.0, 10.012],
+            ),
+            patch(
+                "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.yuanrong_backend.logger"
+            ) as mock_logger,
+        ):
+            result = b.exists(["k1", "k2"])
         self.assertEqual(result, [1, 0])
         b.store.batch_is_exist.assert_called_once_with(["k1", "k2"])
+        self.assertEqual(_format_log_call(mock_logger.info.call_args), "Yuanrong exists took 12.000 ms, keys=2")
 
     def test_exists_exception(self):
         b = self._make_backend()
@@ -576,7 +596,17 @@ class TestMemcacheBackendMethods(unittest.TestCase):
     def test_exists(self):
         b = self._make_backend()
         b.store.batch_is_exist.return_value = [1]
-        self.assertEqual(b.exists(["k1"]), [1])
+        with (
+            patch(
+                "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.memcache_backend.time.perf_counter",
+                side_effect=[10.0, 10.012],
+            ),
+            patch(
+                "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.memcache_backend.logger"
+            ) as mock_logger,
+        ):
+            self.assertEqual(b.exists(["k1"]), [1])
+        self.assertEqual(_format_log_call(mock_logger.info.call_args), "Memcache exists took 12.000 ms, keys=1")
 
     def test_register_buffer(self):
         b = self._make_backend()
