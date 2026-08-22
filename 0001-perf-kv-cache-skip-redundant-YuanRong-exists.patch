@@ -1,0 +1,284 @@
+From 01b9af732f98cf09355b7fbcda1dd58373fa2045 Mon Sep 17 00:00:00 2001
+From: yangsonglin13 <yangsonglin566@gmail.com>
+Date: Fri, 21 Aug 2026 17:10:18 +0800
+Subject: [PATCH] perf(kv-cache): skip redundant YuanRong exists
+
+Rely on YuanRong MSetD2H to filter existing keys before device copies and use ExistenceOpt.NX for atomic publish semantics. Keep connector-side filtering when KV events need the exact newly stored key set.
+
+Signed-off-by: yangsonglin13 <yangsonglin566@gmail.com>
+---
+ .../ascend_store/test_kv_transfer.py          | 104 ++++++++++++++++++
+ tests/ut/distributed/test_yuanrong_backend.py |  11 ++
+ .../kv_pool/ascend_store/backend/backend.py   |   2 +
+ .../ascend_store/backend/yuanrong_backend.py  |   7 +-
+ .../kv_pool/ascend_store/kv_transfer.py       |  17 ++-
+ 5 files changed, 136 insertions(+), 5 deletions(-)
+
+diff --git a/tests/ut/distributed/ascend_store/test_kv_transfer.py b/tests/ut/distributed/ascend_store/test_kv_transfer.py
+index 34b432c6a..ae8d4da1c 100644
+--- a/tests/ut/distributed/ascend_store/test_kv_transfer.py
++++ b/tests/ut/distributed/ascend_store/test_kv_transfer.py
+@@ -27,14 +27,17 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store import config_data
+ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import (
+     ChunkedTokenDatabase,
+     KeyMetadata,
++    LayerBlockRange,
+     LayerMultiBlockReqMeta,
+     LayerPoolKey,
++    LayerTransferTask,
+     LoadSpec,
+     ReqMeta,
+ )
+ 
+ # isort: on
+ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import (
++    KVCacheStoreKeyLayerSendingThread,
+     KVCacheStoreLayerRecvingThread,
+     KVCacheStoreLayerSendingThread,
+     KVCacheStoreRecvingThread,
+@@ -45,6 +48,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import
+ 
+ class FakeStore:
+     def __init__(self, exists_result=None):
++        self.requires_exists_before_put = True
+         self.exists_result = exists_result or []
+         self.put_calls = []
+         self.get_calls = []
+@@ -131,6 +135,16 @@ class TestKVTransferThread(unittest.TestCase):
+         result = t.lookup(["k1"])
+         self.assertEqual(result, [False])
+ 
++    def test_get_missing_indices_skips_lookup_when_not_required(self):
++        t, store = self._make_thread([1, 1])
++        store.requires_exists_before_put = False
++        store.exists = MagicMock(side_effect=AssertionError("exists should not be called"))
++
++        result = t._get_missing_indices(["k1", "k2"])
++
++        self.assertEqual(result, [0, 1])
++        store.exists.assert_not_called()
++
+     def test_update_and_get_kv_events(self):
+         t, _ = self._make_thread()
+         event1 = BlockStored(
+@@ -197,6 +211,49 @@ class TestKVCacheStoreSendingThread(unittest.TestCase):
+         keys, _, _ = store.put_calls[0]
+         self.assertEqual(len(keys), 2)
+ 
++    def test_handle_request_puts_all_keys_without_exists_check(self):
++        t, store = self._make_thread([1, 1])
++        store.requires_exists_before_put = False
++        store.exists = MagicMock(side_effect=AssertionError("exists should not be called"))
++        req = ReqMeta(
++            req_id="r1",
++            token_len_chunk=32,
++            block_ids=[0, 1],
++            block_hashes=[b"h0", b"h1"],  # type: ignore[arg-type]
++            current_event=None,
++        )
++        t.add_stored_request("r1")
++        t.request_queue.put(req)
++
++        t._handle_request(req)
++
++        keys, _, _ = store.put_calls[0]
++        self.assertEqual(len(keys), 2)
++        store.exists.assert_not_called()
++
++    def test_handle_request_keeps_exists_check_for_kv_events(self):
++        t, store = self._make_thread([1, 0], enable_kv_event=True)
++        store.requires_exists_before_put = False
++        store.exists = MagicMock(return_value=[1, 0])
++        req = ReqMeta(
++            req_id="r1",
++            token_len_chunk=32,
++            block_ids=[0, 1],
++            block_hashes=[b"h0", b"h1"],  # type: ignore[arg-type]
++            current_event=None,
++            token_ids=list(range(32)),
++            original_block_size=16,
++        )
++        t.add_stored_request("r1")
++        t.request_queue.put(req)
++
++        t._handle_request(req)
++
++        keys, _, _ = store.put_calls[0]
++        self.assertEqual(len(keys), 1)
++        self.assertEqual(len(t.get_kv_events()), 1)
++        store.exists.assert_called_once()
++
+     def test_handle_request_all_exist_no_put(self):
+         t, store = self._make_thread([1, 1])
+         req = ReqMeta(
+@@ -425,6 +482,53 @@ class TestKVCacheStoreSendingThread(unittest.TestCase):
+         self.assertNotIn("r1", t.stored_requests)
+ 
+ 
++class TestKVCacheStoreKeyLayerSendingThread(unittest.TestCase):
++    def test_handle_request_puts_all_keys_without_exists_check(self):
++        store = FakeStore([1, 1])
++        store.requires_exists_before_put = False
++        store.exists = MagicMock(side_effect=AssertionError("exists should not be called"))
++        sync_event = MagicMock()
++        thread = KVCacheStoreKeyLayerSendingThread(
++            m_store=store,
++            token_database=FakeTokenDatabase(),
++            block_size=16,
++            tp_rank=0,
++            tp_size=1,
++            dcp_size=1,
++            put_step=1,
++            ready_event=threading.Event(),
++            num_layers=1,
++            layer_save_finished_events=[threading.Event()],
++            sync_save_events=[sync_event],
++        )
++        request = ReqMeta(
++            req_id="r1",
++            token_len_chunk=32,
++            block_ids=[0, 1],
++            block_hashes=[b"h0", b"h1"],  # type: ignore[arg-type]
++            is_last_chunk=False,
++        )
++        metadata = KeyMetadata("m", 0, 0, 0, 0)
++        task = LayerTransferTask(
++            layer_id=0,
++            block_ranges=[LayerBlockRange(request=request, start_block=0, end_block=2)],
++            cached_process_tokens={
++                0: [
++                    (0, 16, [LayerPoolKey(metadata, "h0", 0)]),
++                    (16, 32, [LayerPoolKey(metadata, "h1", 0)]),
++                ]
++            },
++        )
++        thread.request_queue.put([task])
++
++        thread._handle_request([task])
++
++        keys, _, _ = store.put_calls[0]
++        self.assertEqual(len(keys), 2)
++        store.exists.assert_not_called()
++        sync_event.synchronize.assert_called_once()
++
++
+ class TestKVCacheStoreRecvingThread(unittest.TestCase):
+     def test_handle_request(self):
+         store = FakeStore()
+diff --git a/tests/ut/distributed/test_yuanrong_backend.py b/tests/ut/distributed/test_yuanrong_backend.py
+index 68e601c30..63b45379f 100644
+--- a/tests/ut/distributed/test_yuanrong_backend.py
++++ b/tests/ut/distributed/test_yuanrong_backend.py
+@@ -26,6 +26,10 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.yuanrong_b
+ )
+ 
+ 
++def test_yuanrong_put_does_not_require_exists_check():
++    assert YuanrongBackend.requires_exists_before_put is False
++
++
+ def _make_backend():
+     backend = YuanrongBackend.__new__(YuanrongBackend)
+     backend._ds_set_param = object()
+@@ -229,6 +233,13 @@ def test_backend_accepts_lazy_init_and_initializes_eagerly(tmp_path, monkeypatch
+     assert "does not support lazy initialization; initializing eagerly" in caplog.text
+ 
+ 
++def test_backend_uses_nx_existence_for_put(tmp_path, monkeypatch):
++    backend = _make_full_backend(tmp_path, monkeypatch)
++
++    existence_opt = sys.modules["yr.datasystem.kv_client"].ExistenceOpt
++    assert backend._ds_set_param.existence is existence_opt.NX
++
++
+ def test_dev_mem_pregister_disabled_by_default(tmp_path, monkeypatch):
+     # All HIXL conditions met, but the new toggle defaults to false -> no pre-registration.
+     backend = _make_full_backend(tmp_path, monkeypatch)
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/backend.py b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/backend.py
+index 04068d87f..ec036e757 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/backend.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/backend.py
+@@ -8,6 +8,8 @@ from vllm.config import ParallelConfig
+ 
+ class Backend(ABC):
+     store: Any | None = None
++    # Whether the connector must filter existing keys before calling put().
++    requires_exists_before_put: bool = True
+ 
+     @abstractmethod
+     def __init__(self, parallel_config: ParallelConfig):
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/yuanrong_backend.py b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/yuanrong_backend.py
+index 445b6b5ab..7b040ce95 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/yuanrong_backend.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/yuanrong_backend.py
+@@ -55,12 +55,16 @@ class YuanrongConfig:
+ 
+ 
+ class YuanrongBackend(Backend):
++    # MSetD2H filters existing keys before copying device data and applies NX
++    # again when publishing, so a connector-side existence query is redundant.
++    requires_exists_before_put = False
++
+     def __init__(self, parallel_config: ParallelConfig, lazy_init: bool = False, enable_data_plane: bool = True):
+         if lazy_init:
+             logger.warning("YuanrongBackend does not support lazy initialization; initializing eagerly.")
+         try:
+             from yr.datasystem.hetero_client import HeteroClient  # type: ignore[import-not-found]
+-            from yr.datasystem.kv_client import SetParam  # type: ignore[import-not-found]
++            from yr.datasystem.kv_client import ExistenceOpt, SetParam  # type: ignore[import-not-found]
+             from yr.datasystem.object_client import WriteMode  # type: ignore[import-not-found]
+         except ImportError as exc:
+             raise ImportError(
+@@ -71,6 +75,7 @@ class YuanrongBackend(Backend):
+ 
+         self._ds_set_param = SetParam()
+         self._ds_set_param.write_mode = WriteMode.NONE_L2_CACHE_EVICT
++        self._ds_set_param.existence = ExistenceOpt.NX
+ 
+         self.config = YuanrongConfig.load_from_env()
+         try:
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/kv_transfer.py b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/kv_transfer.py
+index 1659116f8..60c6e36a0 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/kv_transfer.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/kv_transfer.py
+@@ -534,6 +534,17 @@ class KVTransferThread(threading.Thread):
+             )
+             return [False] * len(keys)
+ 
++    def _get_missing_indices(self, keys: list[str], require_exists_check: bool = False) -> list[int]:
++        """Filter existing keys unless the backend can do so during put.
++
++        Callers that need the exact newly stored key set, such as KV event
++        publishers, can force connector-side filtering.
++        """
++        if not require_exists_check and not self.m_store.requires_exists_before_put:
++            return list(range(len(keys)))
++        exists_states = self.lookup(keys)
++        return [index for index, exists in enumerate(exists_states) if not exists]
++
+     def update_kv_event(self, event: list[BlockStored]):
+         with self.kv_event_lock:
+             self.kv_events.extend(event)
+@@ -751,8 +762,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
+ 
+             if not keys:
+                 continue
+-            exists_states = self.lookup(keys)
+-            missing_indices = [index for index, exists in enumerate(exists_states) if not exists]
++            missing_indices = self._get_missing_indices(keys, require_exists_check=self.enable_kv_event)
+             if not missing_indices:
+                 continue
+             starts = [starts[index] for index in missing_indices]
+@@ -1114,8 +1124,7 @@ class KVCacheStoreKeyLayerSendingThread(KVTransferThread):
+             self.dec_stored_request(req_id)
+ 
+         if key_list:
+-            exists_states = self.lookup(key_list)
+-            missing_indices = [index for index, exists in enumerate(exists_states) if not exists]
++            missing_indices = self._get_missing_indices(key_list)
+             keys_to_put = [key_list[index] for index in missing_indices]
+             addrs_to_put = [addr_list[index] for index in missing_indices]
+             sizes_to_put = [size_list[index] for index in missing_indices]
+-- 
+2.51.0.windows.1
+
