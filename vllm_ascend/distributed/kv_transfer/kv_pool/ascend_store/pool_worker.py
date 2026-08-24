@@ -2033,8 +2033,9 @@ class KVPoolWorker:
             )
             if not keys:
                 return
-            exists_states = send_thread.lookup(keys)  # type: ignore[attr-defined]
-            missing_indices = [i for i, exists in enumerate(exists_states) if not exists]
+            missing_indices = send_thread._get_missing_indices(  # type: ignore[attr-defined]
+                keys, require_exists_check=self.enable_kv_events
+            )
             if not missing_indices:
                 return
             keys = [keys[i] for i in missing_indices]
