@@ -14,128 +14,355 @@
 # limitations under the License.
 #
 
+from __future__ import annotations
+
+import math
 import queue
 import socket
 import threading
 import time
+from contextlib import suppress
+from dataclasses import dataclass
 from http import HTTPStatus
+from typing import Any
 
 import requests
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import Response
 from vllm.logger import logger
 
+from vllm_ascend.model_loader.rfork.seed_protocol import (
+    AUTH_TOKEN_HEADER,
+    LEGACY_AUTH_TOKEN_HEADER,
+)
+
+SERVER_STARTUP_QUEUE_TIMEOUT_SEC = 15.0
+SERVER_STOP_TIMEOUT_SEC = 5.0
+HEALTH_POLL_INTERVAL_SEC = 0.01
+
+
+@dataclass
+class _ServerStartup:
+    server: uvicorn.Server
+    sock: socket.socket
+    port: int
+
+
+class RForkSeedServerHandle:
+    """Owner for the HTTP server thread and listening socket.
+
+    ``uvicorn.Server.run`` is synchronous, so the worker must retain this
+    handle to request shutdown and join the thread. Keeping ownership here
+    also makes failed health checks recoverable instead of leaving a zombie
+    server advertising memory that may already have been unregistered.
+    """
+
+    def __init__(
+        self,
+        *,
+        server: uvicorn.Server,
+        sock: socket.socket,
+        thread: threading.Thread,
+        port: int,
+    ) -> None:
+        self.server = server
+        self.sock = sock
+        self.thread = thread
+        self.port = port
+        self._stop_lock = threading.Lock()
+        self._stopped = False
+
+    @property
+    def is_alive(self) -> bool:
+        return self.thread.is_alive()
+
+    def __int__(self) -> int:
+        # Compatibility for integrations that historically treated
+        # start_rfork_server's return value as a port number.
+        return self.port
+
+    def __index__(self) -> int:
+        return self.port
+
+    def __gt__(self, other: object) -> bool:
+        return self.port > int(other)  # type: ignore[arg-type]
+
+    def __ge__(self, other: object) -> bool:
+        return self.port >= int(other)  # type: ignore[arg-type]
+
+    def __lt__(self, other: object) -> bool:
+        return self.port < int(other)  # type: ignore[arg-type]
+
+    def __le__(self, other: object) -> bool:
+        return self.port <= int(other)  # type: ignore[arg-type]
+
+    def stop(self, timeout: float = SERVER_STOP_TIMEOUT_SEC) -> bool:
+        """Request shutdown and join the server thread, idempotently."""
+        with self._stop_lock:
+            if not self._stopped:
+                self.server.should_exit = True
+                # Closing the socket wakes uvicorn promptly on versions whose
+                # server loop waits for socket activity.
+                with suppress(OSError):
+                    self.sock.close()
+                self._stopped = True
+
+        if self.thread is not threading.current_thread():
+            self.thread.join(timeout=max(float(timeout), 0.0))
+        stopped = not self.thread.is_alive()
+        if not stopped:
+            logger.warning("[RFork Seed] server thread did not stop within %.2fs", timeout)
+        return stopped
+
+
+def _create_bound_socket(bind_host: str) -> socket.socket:
+    """Create a listener using the address family's resolver result.
+
+    ``AF_UNSPEC`` is intentional: IPv4 and IPv6 bind hosts must both work,
+    and forcing ``AF_INET`` breaks deployments that advertise IPv6 addresses.
+    """
+    host = bind_host or "0.0.0.0"
+    infos = socket.getaddrinfo(host, 0, socket.AF_UNSPEC, socket.SOCK_STREAM, 0, socket.AI_PASSIVE)
+    last_error: OSError | None = None
+    for family, socktype, protocol, _, sockaddr in infos:
+        sock: socket.socket | None = None
+        try:
+            sock = socket.socket(family, socktype, protocol)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(sockaddr)
+            sock.listen(socket.SOMAXCONN)
+            return sock
+        except OSError as exc:
+            last_error = exc
+            if sock is not None:
+                sock.close()
+    if last_error is None:
+        raise OSError(f"unable to resolve RFork seed bind host {host!r}")
+    raise OSError(f"unable to bind RFork seed host {host!r}: {last_error}") from last_error
+
+
+def _health_url(bind_host: str, sock: socket.socket, port: int) -> str:
+    if sock.family == socket.AF_INET6:
+        # Use the resolved bound address instead of a possibly non-literal
+        # hostname such as ``localhost``; bracket syntax is valid only for an
+        # IPv6 literal.
+        host = str(sock.getsockname()[0]) or "::1"
+        if host == "::" or host == "0:0:0:0:0:0:0:0":
+            host = "::1"
+        return f"http://[{host}]:{port}/health_check_with_key"
+    host = str(sock.getsockname()[0]) or bind_host or "127.0.0.1"
+    if host == "0.0.0.0":
+        host = "127.0.0.1"
+    return f"http://{host}:{port}/health_check_with_key"
+
+
+def _authorized(request: Request, auth_token: str | None) -> bool:
+    if not auth_token:
+        return True
+    return auth_token in {
+        request.headers.get(AUTH_TOKEN_HEADER),
+        request.headers.get(LEGACY_AUTH_TOKEN_HEADER),
+    }
+
 
 def start_fastapi_server(
-    port_queue: queue.Queue[int],
+    port_queue: queue.Queue[Any],
     local_seed_key,
     info,
+    *,
+    bind_host: str = "0.0.0.0",
+    auth_token: str | None = None,
+    stop_event: threading.Event | None = None,
 ):
-    logger.debug("[RFork Seed] Preparing socket with dynamic port...")
+    logger.debug("[RFork Seed] Preparing socket with dynamic port on %s...", bind_host)
 
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.bind(("0.0.0.0", 0))
-    _, port = sock.getsockname()
-    logger.debug("[RFork Seed] Assigned dynamic port: %s", port)
-
-    app = FastAPI()
-    rfork_transfer_engine_info = info
-    rfork_transfer_engine_shape_info = None
-    if isinstance(info, (list, tuple)) and len(info) == 3:
-        rfork_transfer_engine_info = (info[0], info[1])
-        rfork_transfer_engine_shape_info = info[2]
-
-    @app.get("/get_rfork_transfer_engine_info")
-    def get_rfork_transfer_engine_info(seed_key: str):
-        if seed_key == local_seed_key:
-            return {"rfork_transfer_engine_info": rfork_transfer_engine_info}
-        return {"rfork_transfer_engine_info": None}
-
-    @app.get("/get_rfork_transfer_engine_shape_info")
-    def get_rfork_transfer_engine_shape_info(seed_key: str):
-        if seed_key == local_seed_key:
-            return {"rfork_transfer_engine_shape_info": rfork_transfer_engine_shape_info}
-        return {"rfork_transfer_engine_shape_info": None}
-
-    @app.get("/rfork_fetch_seed")
-    def rfork_fetch_seed():
-        return {"status": "ok"}
-
-    @app.get("/health_check_with_key")
-    def health_check_with_key(seed_key: str):
-        if seed_key == local_seed_key:
-            return Response(status_code=HTTPStatus.OK)
-        return Response(status_code=HTTPStatus.BAD_REQUEST)
-
-    config = uvicorn.Config(app, host=None, port=None, log_level="warning")
-    server = uvicorn.Server(config)
-
+    sock: socket.socket | None = None
     try:
-        port_queue.put(port)
-    except Exception as e:
-        logger.error("[RFork Seed] Failed to send port via queue: %s", e)
-        sock.close()
-        return
+        sock = _create_bound_socket(bind_host)
+        _, port = sock.getsockname()[:2]
+        logger.debug("[RFork Seed] Assigned dynamic port: %s", port)
 
-    logger.debug("[RFork Seed] FastAPI server starting on port %s...", port)
-    server.run(sockets=[sock])
-    sock.close()
+        app = FastAPI()
+        rfork_transfer_engine_info = info
+        rfork_transfer_engine_shape_info = None
+        if isinstance(info, (list, tuple)) and len(info) == 3:
+            rfork_transfer_engine_info = (info[0], info[1])
+            rfork_transfer_engine_shape_info = info[2]
+
+        def is_authorized(request: Request) -> bool:
+            return _authorized(request, auth_token)
+
+        @app.get("/get_rfork_transfer_engine_info")
+        def get_rfork_transfer_engine_info(request: Request, seed_key: str):
+            if not is_authorized(request):
+                return Response(status_code=HTTPStatus.UNAUTHORIZED)
+            if seed_key == local_seed_key:
+                return {"rfork_transfer_engine_info": rfork_transfer_engine_info}
+            return {"rfork_transfer_engine_info": None}
+
+        @app.get("/get_rfork_transfer_engine_shape_info")
+        def get_rfork_transfer_engine_shape_info(request: Request, seed_key: str):
+            if not is_authorized(request):
+                return Response(status_code=HTTPStatus.UNAUTHORIZED)
+            if seed_key == local_seed_key:
+                return {"rfork_transfer_engine_shape_info": rfork_transfer_engine_shape_info}
+            return {"rfork_transfer_engine_shape_info": None}
+
+        @app.get("/rfork_fetch_seed")
+        def rfork_fetch_seed(request: Request):
+            if not is_authorized(request):
+                return Response(status_code=HTTPStatus.UNAUTHORIZED)
+            return {"status": "ok"}
+
+        @app.get("/health_check_with_key")
+        def health_check_with_key(request: Request, seed_key: str):
+            if not is_authorized(request):
+                return Response(status_code=HTTPStatus.UNAUTHORIZED)
+            if seed_key == local_seed_key:
+                return Response(status_code=HTTPStatus.OK)
+            return Response(status_code=HTTPStatus.BAD_REQUEST)
+
+        config = uvicorn.Config(app, host=None, port=None, log_level="warning")
+        server = uvicorn.Server(config)
+        startup = _ServerStartup(server=server, sock=sock, port=port)
+        try:
+            port_queue.put(startup)
+        except Exception as exc:
+            logger.error("[RFork Seed] Failed to send server handle via queue: %s", exc)
+            server.should_exit = True
+            sock.close()
+            return
+
+        if stop_event is not None and stop_event.is_set():
+            server.should_exit = True
+            sock.close()
+            return
+
+        logger.debug("[RFork Seed] FastAPI server starting on port %s...", port)
+        server.run(sockets=[sock])
+    except Exception as exc:
+        logger.error("[RFork Seed] server thread failed: %s", exc)
+        with suppress(Exception):
+            port_queue.put(exc)
+    finally:
+        if sock is not None:
+            with suppress(OSError):
+                sock.close()
 
 
-def start_rfork_server(local_seed_key, rfork_transfer_engine_info, health_timeout_sec: float = 30.0) -> int:
-    port_queue: queue.Queue[int] = queue.Queue()
-    process = threading.Thread(
-        target=start_fastapi_server,
-        args=(port_queue, local_seed_key, rfork_transfer_engine_info),
-        daemon=True,
-    )
-    process.start()
+def _stop_startup_thread(
+    thread: threading.Thread,
+    startup_state: dict[str, _ServerStartup],
+    stop_event: threading.Event,
+    timeout: float = SERVER_STOP_TIMEOUT_SEC,
+) -> bool:
+    stop_event.set()
+    startup = startup_state.get("startup")
+    if startup is not None:
+        startup.server.should_exit = True
+        with suppress(OSError):
+            startup.sock.close()
+    thread.join(timeout=max(float(timeout), 0.0))
+    if thread.is_alive():
+        logger.warning("[RFork Seed] failed to join startup thread within %.2fs", timeout)
+        return False
+    return True
 
-    try:
-        port = port_queue.get(timeout=15)
-        if port == -1:
-            raise RuntimeError("Child process failed to start server")
-    except Exception as e:
-        logger.error(
-            "[RFork Seed] start server error for seed_key=%s: %s",
+
+def start_rfork_server(
+    local_seed_key,
+    rfork_transfer_engine_info,
+    health_timeout_sec: float = 30.0,
+    *,
+    bind_host: str = "0.0.0.0",
+    auth_token: str | None = None,
+) -> RForkSeedServerHandle | int:
+    if isinstance(health_timeout_sec, bool) or not isinstance(health_timeout_sec, (int, float)):
+        raise ValueError("health_timeout_sec must be a finite positive number")
+    if not math.isfinite(float(health_timeout_sec)) or float(health_timeout_sec) <= 0:
+        raise ValueError("health_timeout_sec must be a finite positive number")
+
+    port_queue: queue.Queue[Any] = queue.Queue(maxsize=1)
+    startup_stop_event = threading.Event()
+    startup_state: dict[str, _ServerStartup] = {}
+
+    def run_server() -> None:
+        start_fastapi_server(
+            port_queue,
             local_seed_key,
-            e,
+            rfork_transfer_engine_info,
+            bind_host=bind_host,
+            auth_token=auth_token,
+            stop_event=startup_stop_event,
         )
+
+    thread = threading.Thread(target=run_server, daemon=True, name="RForkSeedServer")
+    thread.start()
+    deadline = time.monotonic() + float(health_timeout_sec)
+
+    try:
+        remaining = deadline - time.monotonic()
+        startup = port_queue.get(timeout=min(SERVER_STARTUP_QUEUE_TIMEOUT_SEC, max(remaining, 0.0)))
+        if isinstance(startup, BaseException):
+            raise RuntimeError("Child thread failed to start server") from startup
+        if not isinstance(startup, _ServerStartup):
+            raise RuntimeError(f"Child thread returned invalid server startup state: {startup!r}")
+        startup_state["startup"] = startup
+    except Exception as exc:
+        logger.error("[RFork Seed] start server error for seed_key=%s: %s", local_seed_key, exc)
+        _stop_startup_thread(thread, startup_state, startup_stop_event)
         return -1
 
-    deadline = time.time() + health_timeout_sec
+    handle = RForkSeedServerHandle(
+        server=startup.server,
+        sock=startup.sock,
+        thread=thread,
+        port=startup.port,
+    )
+    url = _health_url(bind_host, startup.sock, startup.port)
     healthy = False
     retry_count = 0
-    last_error = None
-    while time.time() < deadline:
-        time.sleep(0.01)
-        url = f"http://127.0.0.1:{port}/health_check_with_key"
+    last_error: object | None = None
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
         try:
-            response = requests.get(
-                url,
-                params={"seed_key": local_seed_key},
-                timeout=10,
-            )
-            if response.status_code == 200:
+            health_request = {
+                "params": {"seed_key": local_seed_key},
+                "timeout": min(10.0, remaining),
+            }
+            if auth_token:
+                health_request["headers"] = {AUTH_TOKEN_HEADER: auth_token}
+            response = requests.get(url, **health_request)
+            if response.status_code == HTTPStatus.OK:
                 healthy = True
                 break
             last_error = f"unexpected status code {response.status_code} from health check"
-        except Exception as e:
-            last_error = str(e)
+        except Exception as exc:
+            last_error = str(exc)
         retry_count += 1
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(min(HEALTH_POLL_INTERVAL_SEC, remaining))
+
     if healthy:
         if retry_count > 1:
             logger.info(
                 "[RFork Seed] health check passed after %d retries for port %s",
                 retry_count - 1,
-                port,
+                startup.port,
             )
-        return port
+        return handle
+
     logger.error(
         "[RFork Seed] health check timed out after %.1fs for port %s, last error: %s",
         health_timeout_sec,
-        port,
+        startup.port,
         last_error,
     )
+    # The timeout is a total budget for health, but cleanup gets its own small
+    # bounded budget so the caller never inherits a live server thread.
+    handle.stop()
     return -1

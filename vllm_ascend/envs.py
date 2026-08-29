@@ -27,6 +27,26 @@ from typing import Any
 
 # begin-env-vars-definition
 
+
+def _get_env_with_legacy_fallback(
+    canonical_name: str,
+    legacy_name: str | None = None,
+    default: str | None = None,
+) -> str | None:
+    """Read a canonical variable and, for compatibility, its legacy alias.
+
+    RFork is intentionally the only caller of the legacy aliases.  Keeping
+    the lookup here prevents old deployment manifests from leaking raw
+    ``os.environ`` access into the loader, while giving the canonical names
+    well-defined precedence.
+    """
+
+    value = os.getenv(canonical_name)
+    if value is None and legacy_name is not None:
+        value = os.getenv(legacy_name)
+    return default if value is None else value
+
+
 env_variables: dict[str, Callable[[], Any]] = {
     # max compile thread number for package building. Usually, it is set to
     # the number of CPU cores. If not set, the default value is None, which
@@ -71,6 +91,55 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # RFork logical model identity. The default is None (unset). The legacy
+    # MODEL_URL variable is accepted only as a compatibility fallback.
+    "VLLM_ASCEND_RFORK_MODEL_URL": lambda: _get_env_with_legacy_fallback(
+        "VLLM_ASCEND_RFORK_MODEL_URL", "MODEL_URL", None
+    ),
+    # RFork deployment strategy identity. The default is None (unset). The
+    # legacy MODEL_DEPLOY_STRATEGY_NAME variable remains a fallback.
+    "VLLM_ASCEND_RFORK_DEPLOY_STRATEGY_NAME": lambda: _get_env_with_legacy_fallback(
+        "VLLM_ASCEND_RFORK_DEPLOY_STRATEGY_NAME", "MODEL_DEPLOY_STRATEGY_NAME", None
+    ),
+    # RFork planner URL. The default is None (unset). RFORK_SCHEDULER_URL is
+    # retained as a legacy fallback.
+    "VLLM_ASCEND_RFORK_SCHEDULER_URL": lambda: _get_env_with_legacy_fallback(
+        "VLLM_ASCEND_RFORK_SCHEDULER_URL", "RFORK_SCHEDULER_URL", None
+    ),
+    # RFork seed HTTP health timeout in seconds. Default: 5.0; valid range is
+    # finite values greater than zero. RFORK_SEED_TIMEOUT_SEC is a fallback.
+    "VLLM_ASCEND_RFORK_SEED_TIMEOUT_SEC": lambda: _get_env_with_legacy_fallback(
+        "VLLM_ASCEND_RFORK_SEED_TIMEOUT_SEC", "RFORK_SEED_TIMEOUT_SEC", "5.0"
+    ),
+    # RFork planner/seed HTTP request timeout in seconds. Default: 10.0; valid
+    # range is finite values greater than zero. RFORK_REQUEST_TIMEOUT_SEC is a
+    # fallback.
+    "VLLM_ASCEND_RFORK_REQUEST_TIMEOUT_SEC": lambda: _get_env_with_legacy_fallback(
+        "VLLM_ASCEND_RFORK_REQUEST_TIMEOUT_SEC", "RFORK_REQUEST_TIMEOUT_SEC", "10.0"
+    ),
+    # RFork seed-key separator. Default: "$"; any non-empty string is valid.
+    # RFORK_SEED_KEY_SEPARATOR is a fallback.
+    "VLLM_ASCEND_RFORK_SEED_KEY_SEPARATOR": lambda: _get_env_with_legacy_fallback(
+        "VLLM_ASCEND_RFORK_SEED_KEY_SEPARATOR", "RFORK_SEED_KEY_SEPARATOR", "$"
+    ),
+    # Optional shared RFork authentication token. Default: None (disabled).
+    # This value is sensitive and must never be logged. RFORK_AUTH_TOKEN is a
+    # fallback for existing deployments.
+    "VLLM_ASCEND_RFORK_AUTH_TOKEN": lambda: _get_env_with_legacy_fallback(
+        "VLLM_ASCEND_RFORK_AUTH_TOKEN", "RFORK_AUTH_TOKEN", None
+    ),
+    # Local host/interface for the RFork seed HTTP server. Default:
+    # 0.0.0.0; any valid bind address is accepted. RFORK_SEED_BIND_HOST is a
+    # fallback.
+    "VLLM_ASCEND_RFORK_SEED_BIND_HOST": lambda: _get_env_with_legacy_fallback(
+        "VLLM_ASCEND_RFORK_SEED_BIND_HOST", "RFORK_SEED_BIND_HOST", "0.0.0.0"
+    ),
+    # Advertised host/interface for planner seed records. Default: None,
+    # meaning derive the local address. RFORK_SEED_ADVERTISE_HOST is a
+    # fallback.
+    "VLLM_ASCEND_RFORK_SEED_ADVERTISE_HOST": lambda: _get_env_with_legacy_fallback(
+        "VLLM_ASCEND_RFORK_SEED_ADVERTISE_HOST", "RFORK_SEED_ADVERTISE_HOST", None
+    ),
 }
 
 # end-env-vars-definition

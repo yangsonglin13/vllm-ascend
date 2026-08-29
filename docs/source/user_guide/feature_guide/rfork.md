@@ -14,8 +14,8 @@ The RFork loading flow in the current implementation is:
 2. RFork builds a **seed key** from the model identity and deployment topology.
 3. RFork asks the planner for an available seed matching that key.
 4. If a seed is returned, the new instance initializes the model structure on its local NPU, registers local weight memory, fetches the remote transfer-engine metadata from the seed, and performs batch weight transfer into local parameter buffers.
-5. If no seed is available, or any step fails, RFork cleans up and falls back to the default loader.
-6. After the instance finishes loading, it starts a local seed service and periodically reports heartbeat to the planner, so later instances can reuse it.
+5. If no seed is available, or any transfer step fails, RFork cleans up and falls back to the default loader.
+6. RFork completes post-load processing and switches the model to evaluation mode before it starts a local seed service and advertises it to the planner. A seed-service startup failure does not reload the valid model; RFork only cleans up its registered memory.
 
 ## Flowchart
 
@@ -46,7 +46,30 @@ To enable RFork, pass `--load-format rfork` and provide RFork settings through `
 | **model_deploy_strategy_name** | String | Deployment strategy identifier used together with `model_url` to build the seed key. | Required for RFork transfer. Instances that should share seeds must use the same value. |
 | **rfork_scheduler_url** | String | Base URL of the planner service used for seed allocation, release, and heartbeat. | Required for planner-based matching. Example: `http://127.0.0.1:1223`. |
 | **rfork_seed_timeout_sec** | Number | Timeout for waiting until the local seed HTTP service becomes healthy after startup. | Optional. Default: `5.0`. Must be greater than `0`. Invalid values fall back to the default. |
+| **rfork_request_timeout_sec** | Number | Timeout for every planner and seed HTTP request. | Optional. Default: `10.0`. Must be finite and greater than `0`; invalid values fall back to the default. |
 | **rfork_seed_key_separator** | String | Separator used when building the RFork seed key string. | Optional. Default: `$`. Keep the same value across compatible instances. |
+| **rfork_auth_token** | String | Optional shared token sent with planner and seed requests. | Optional. Default: disabled. Treat as a secret and do not include it in logs. |
+| **rfork_seed_bind_host** | String | Local address/interface for the seed HTTP server. | Optional. Default: `0.0.0.0`. |
+| **rfork_seed_advertise_host** | String | Address reported to the planner for later receivers. | Optional. Default: auto-detect the local address. |
+
+The environment fallback names are centralized under the `VLLM_ASCEND_RFORK_*`
+namespace:
+
+| Environment variable | Default | Notes |
+|----------------------|---------|-------|
+| `VLLM_ASCEND_RFORK_MODEL_URL` | unset | Legacy `MODEL_URL` is accepted as a fallback. |
+| `VLLM_ASCEND_RFORK_DEPLOY_STRATEGY_NAME` | unset | Legacy `MODEL_DEPLOY_STRATEGY_NAME` is accepted as a fallback. |
+| `VLLM_ASCEND_RFORK_SCHEDULER_URL` | unset | Legacy `RFORK_SCHEDULER_URL` is accepted as a fallback. |
+| `VLLM_ASCEND_RFORK_SEED_TIMEOUT_SEC` | `5.0` | Legacy `RFORK_SEED_TIMEOUT_SEC` is accepted as a fallback; finite and positive only. |
+| `VLLM_ASCEND_RFORK_REQUEST_TIMEOUT_SEC` | `10.0` | Legacy `RFORK_REQUEST_TIMEOUT_SEC` is accepted as a fallback; finite and positive only. |
+| `VLLM_ASCEND_RFORK_SEED_KEY_SEPARATOR` | `$` | Legacy `RFORK_SEED_KEY_SEPARATOR` is accepted as a fallback. |
+| `VLLM_ASCEND_RFORK_AUTH_TOKEN` | unset | Sensitive; legacy `RFORK_AUTH_TOKEN` is accepted as a fallback. |
+| `VLLM_ASCEND_RFORK_SEED_BIND_HOST` | `0.0.0.0` | Legacy `RFORK_SEED_BIND_HOST` is accepted as a fallback. |
+| `VLLM_ASCEND_RFORK_SEED_ADVERTISE_HOST` | auto-detect | Legacy `RFORK_SEED_ADVERTISE_HOST` is accepted as a fallback. |
+
+`model_loader_extra_config` takes precedence over environment values. Numeric
+values reject booleans, NaN, infinity, and non-positive values. The
+authentication token is never written to RFork configuration logs.
 
 ### How RFork Matches Seeds
 
@@ -61,8 +84,14 @@ RFork does not match instances by `model_url` alone. The local seed key is compo
 - `ep_rank` when expert parallelism is enabled for an MoE model
 - optional `draft` suffix when the worker runs as a draft model
 
-This means two instances must agree on both model identity and deployment topology before the planner will treat them as interchangeable seeds.
-For deployments without pipeline or expert parallelism, the existing seed-key format is unchanged.
+In RFork protocol v2, these fields are normalized into a canonical JSON
+compatibility descriptor and represented by a SHA256 fingerprint. The
+descriptor also includes model revision, dtype, quantization, architecture,
+tensor/pipeline/expert parallel world sizes, Ascend NZ layout mode, hardware
+layout policy, and draft role. This prevents an old or differently configured
+seed from being selected merely because its textual key happens to match.
+
+This means two instances must agree on both model identity and deployment topology before the planner will treat them as interchangeable seeds. Legacy callers that do not provide a fingerprint retain the pre-v2 seed-key format during a rolling upgrade, while the RFork loader always uses the opaque v2 key.
 
 ### Quantized Models
 
@@ -74,7 +103,7 @@ When validating RFork for a quantized model:
 
 - Apply the same vLLM Ascend code to both the seed instance and the receiver instance.
 - Restart the planner and all vLLM instances after changing RFork code, because existing seeds keep their old transfer metadata.
-- Use a new `model_deploy_strategy_name` after changing model arguments or RFork code, so the planner does not match a receiver with an incompatible old seed.
+- Use a new `model_deploy_strategy_name` after changing model arguments or RFork code when operating with an older planner; protocol v2 fingerprints also reject incompatible old seeds before native transfer.
 - A successful RFork transfer logs `transfer weights starts` and `transfer weights time`. The fallback path logs `RFork transfer failed`.
 
 ## Tested Models
@@ -124,7 +153,10 @@ For later instances, if the planner can allocate a compatible seed, RFork will t
 export RFORK_CONFIG='{
   "model_url": "<model_url>",
   "model_deploy_strategy_name": "<deploy_strategy>",
-  "rfork_scheduler_url": "http://<planner_ip>:<planner_port>"
+  "rfork_scheduler_url": "http://<planner_ip>:<planner_port>",
+  "rfork_request_timeout_sec": 10.0,
+  "rfork_seed_bind_host": "0.0.0.0",
+  "rfork_seed_advertise_host": "<seed_ip>"
 }'
 
 vllm serve <model_path> \
@@ -149,7 +181,9 @@ vllm serve <model_path> \
 
 ## Note & Caveats
 
-- RFork requires `YuanRong TransferEngine` at runtime. If the package is missing, RFork cannot initialize the transfer backend.
-- If RFORK is used, **each worker process** must bind a listening port. That port is assigned randomly.
+- RFork requires `YuanRong TransferEngine` at runtime. If the package is missing or cannot be initialized, the default loader is used and no seed service is started by that RFork worker.
+- If RFork is used, **each worker process** must bind a listening port. The seed bind host is configurable and the port is assigned randomly.
+- RFork currently requires all materialized model parameters and registered buffers to reside on NPU. Mixed CPU/NPU or CPU-offloaded model state is rejected and falls back to the default loader rather than performing a partial transfer.
+- Keep the seed bind/advertise addresses reachable from the receiver workers. The optional shared token provides request authentication; transport encryption remains the deployment's responsibility, so use HTTPS and network isolation for untrusted networks.
 - RFork weight transfer does not support dynamic EPLB because expert weights and placement can change after the seed service starts. If `eplb_config.dynamic_eplb` or `eplb_config.expert_map_record_path` enables dynamic EPLB, RFork transfer is bypassed and the model is loaded through the default model loader.
 - The example [`rfork_planner.py`](https://github.com/vllm-project/vllm-ascend/blob/main/examples/rfork/rfork_planner.py) is only a simple mock implementation. If you need stronger scheduling, capacity management, or production-grade availability behavior, implement your own planner based on the RFork seed protocol.
