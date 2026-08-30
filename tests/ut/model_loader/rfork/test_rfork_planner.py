@@ -90,4 +90,5 @@ def test_planner_auth_rejects_missing_token_and_accepts_shared_token():
         "SEED_REFCNT": "0",
     }
     assert client.post("/add_seed", headers=headers).status_code == 401
+    assert client.post("/add_seed", headers={**headers, "X-RFork-Auth-Token": "secret"}).status_code == 401
     assert client.post("/add_seed", headers={**headers, "X-RFORK-TOKEN": "secret"}).status_code == 200

@@ -23,20 +23,25 @@ from types import ModuleType, SimpleNamespace
 import pytest
 import torch
 
+import vllm_ascend.model_loader.rfork.manifest as manifest_module
+import vllm_ascend.model_loader.rfork.seed_client as seed_client_module
 import vllm_ascend.model_loader.rfork.transfer_backend as transfer_backend
+from vllm_ascend.model_loader.rfork.manifest import (
+    collect_checkpoint_layout_tensors,
+    collect_processed_layout_tensors,
+    iter_transfer_chunks,
+    parse_weight_info,
+    reshape_tensor_to_seed_shape,
+)
+from vllm_ascend.model_loader.rfork.seed_client import fetch_seed_transfer_info
 from vllm_ascend.model_loader.rfork.transfer_backend import (
     RForkTransferBackend,
-    _collect_checkpoint_layout_tensors,
-    _collect_processed_layout_tensors,
-    _iter_transfer_chunks,
-    _parse_weight_info,
-    _reshape_tensor_to_seed_shape,
-    get_remote_instance_transfer_engine_info,
 )
+from vllm_ascend.model_loader.rfork.types import SeedTransferInfo
 
 
 def test_parse_weight_info_keeps_backward_compatibility():
-    assert _parse_weight_info([1, 2, 4]) == (1, 2, 4, None)
+    assert parse_weight_info([1, 2, 4]) == (1, 2, 4, None)
 
 
 def test_backend_initialization_rejects_transfer_engine_without_memory_registration(monkeypatch):
@@ -53,12 +58,12 @@ def test_backend_initialization_rejects_transfer_engine_without_memory_registrat
 
 
 def test_parse_weight_info_accepts_shape_metadata_from_json():
-    assert _parse_weight_info([1, 6, 2, [2, 3]]) == (1, 6, 2, (2, 3))
+    assert parse_weight_info([1, 6, 2, [2, 3]]) == (1, 6, 2, (2, 3))
 
 
 def test_parse_weight_info_rejects_invalid_shape_metadata():
-    assert _parse_weight_info([1, 6, 2, ["2", 3]]) is None
-    assert _parse_weight_info([1, 6, 2, -1]) is None
+    assert parse_weight_info([1, 6, 2, ["2", 3]]) is None
+    assert parse_weight_info([1, 6, 2, -1]) is None
 
 
 @pytest.mark.parametrize(
@@ -73,11 +78,11 @@ def test_parse_weight_info_rejects_invalid_shape_metadata():
     ],
 )
 def test_parse_weight_info_rejects_bool_and_non_positive_values(weight_info):
-    assert _parse_weight_info(weight_info) is None
+    assert parse_weight_info(weight_info) is None
 
 
 def test_parse_weight_info_accepts_v2_named_shape_and_dtype():
-    parsed = _parse_weight_info(
+    parsed = parse_weight_info(
         {
             "ptr": 1,
             "numel": 6,
@@ -87,14 +92,14 @@ def test_parse_weight_info_accepts_v2_named_shape_and_dtype():
         }
     )
     assert parsed == (1, 6, 2, (2, 3), "float16")
-    assert _parse_weight_info([1, 6, 2, [2, 3], "bfloat16"]) == (1, 6, 2, (2, 3), "bfloat16")
+    assert parse_weight_info([1, 6, 2, [2, 3], "bfloat16"]) == (1, 6, 2, (2, 3), "bfloat16")
 
 
 def test_reshape_tensor_to_seed_shape_updates_tensor_metadata_only():
     tensor = torch.arange(6).reshape(2, 3)
     original_ptr = tensor.data_ptr()
 
-    assert _reshape_tensor_to_seed_shape("weight", tensor, (1, 2, 3))
+    assert reshape_tensor_to_seed_shape("weight", tensor, (1, 2, 3))
 
     assert tuple(tensor.shape) == (1, 2, 3)
     assert tensor.data_ptr() == original_ptr
@@ -103,14 +108,14 @@ def test_reshape_tensor_to_seed_shape_updates_tensor_metadata_only():
 def test_reshape_tensor_to_seed_shape_rejects_numel_mismatch():
     tensor = torch.arange(6).reshape(2, 3)
 
-    assert not _reshape_tensor_to_seed_shape("weight", tensor, (2, 2))
+    assert not reshape_tensor_to_seed_shape("weight", tensor, (2, 2))
     assert tuple(tensor.shape) == (2, 3)
 
 
 def test_iter_transfer_chunks_splits_single_large_tensor():
     chunk_limit = transfer_backend.MAX_TRANSFER_CHUNK_BYTES
     chunks = list(
-        _iter_transfer_chunks(
+        iter_transfer_chunks(
             ["large"],
             [10_000],
             [20_000],
@@ -139,13 +144,13 @@ def test_recv_from_source_refreshes_registered_shape_after_reshape(monkeypatch):
 
     monkeypatch.setattr(
         transfer_backend,
-        "_iter_transferable_tensors",
-        lambda model, processed_layout: iter([("weight", tensor)]),
+        "collect_transferable_tensors",
+        lambda model, processed_layout: [("weight", tensor)],
     )
     monkeypatch.setattr(
         transfer_backend,
-        "get_remote_instance_transfer_engine_info",
-        lambda *args: (
+        "fetch_seed_transfer_info",
+        lambda *args: SeedTransferInfo(
             "seed-session",
             {"weight": [1, tensor.numel(), tensor.element_size()]},
             {"weight": [1, 2, 3]},
@@ -175,11 +180,11 @@ def test_recv_from_source_retains_registered_transferable_tensor_owners(monkeypa
     def fail_if_rescanned(model, processed_layout):
         raise AssertionError("recv_from_source should reuse the registered tensor cache")
 
-    monkeypatch.setattr(transfer_backend, "_iter_transferable_tensors", fail_if_rescanned)
+    monkeypatch.setattr(transfer_backend, "collect_transferable_tensors", fail_if_rescanned)
     monkeypatch.setattr(
         transfer_backend,
-        "get_remote_instance_transfer_engine_info",
-        lambda *args: (
+        "fetch_seed_transfer_info",
+        lambda *args: SeedTransferInfo(
             "seed-session",
             {"weight": [1, tensor_numel, tensor_element_size, [2, 3]]},
             None,
@@ -203,8 +208,8 @@ def test_recv_from_source_keeps_registered_tensors_when_seed_metadata_is_unavail
 
     monkeypatch.setattr(
         transfer_backend,
-        "get_remote_instance_transfer_engine_info",
-        lambda *args: (None, None, None),
+        "fetch_seed_transfer_info",
+        lambda *args: None,
     )
 
     assert not backend.recv_from_source(object(), "127.0.0.1", 8000, "seed-key", True)
@@ -230,8 +235,8 @@ def test_recv_from_source_rejects_manifest_mismatch_before_native_transfer(monke
     backend.rfork_transfer_engine_weights_shape_dict = {"weight": (2, 3)}
     monkeypatch.setattr(
         transfer_backend,
-        "get_remote_instance_transfer_engine_info",
-        lambda *args: ("seed-session", remote_info, None),
+        "fetch_seed_transfer_info",
+        lambda *args: SeedTransferInfo("seed-session", remote_info, None),
     )
 
     assert not backend.recv_from_source(object(), "127.0.0.1", 8000, "seed-key", True)
@@ -247,8 +252,8 @@ def test_recv_from_source_requires_shape_and_dtype_for_v2_key(monkeypatch):
 
     monkeypatch.setattr(
         transfer_backend,
-        "get_remote_instance_transfer_engine_info",
-        lambda *args: (
+        "fetch_seed_transfer_info",
+        lambda *args: SeedTransferInfo(
             "seed-session",
             {"weight": [1, tensor.numel(), tensor.element_size()]},
             None,
@@ -256,37 +261,6 @@ def test_recv_from_source_requires_shape_and_dtype_for_v2_key(monkeypatch):
     )
 
     assert not backend.recv_from_source(object(), "127.0.0.1", 8000, "rfork-v2:digest", True)
-
-
-def test_recv_from_source_validates_optional_manifest_metadata(monkeypatch):
-    tensor = torch.arange(6, dtype=torch.float16).reshape(2, 3)
-    native_calls = []
-    backend = RForkTransferBackend.__new__(RForkTransferBackend)
-    backend.rfork_transfer_engine = SimpleNamespace(
-        batch_transfer_sync_read=lambda *args: native_calls.append(args) or SimpleNamespace(is_error=lambda: False)
-    )
-    backend._registered_transferable_tensors = [("weight", tensor)]
-    backend.rfork_transfer_engine_weights_shape_dict = {"weight": (2, 3)}
-    monkeypatch.setattr(
-        transfer_backend,
-        "get_remote_instance_transfer_engine_info",
-        lambda *args: ("seed-session", {"weight": [1, 6, 2, [2, 3], "float16"]}, None),
-    )
-
-    metadata = {
-        "tensor_count": 1,
-        "total_bytes": tensor.numel() * tensor.element_size(),
-        "weights": {
-            "weight": {
-                "numel": 6,
-                "element_size": 2,
-                "shape": [2, 3],
-                "dtype": "float16",
-            }
-        },
-    }
-    assert backend.recv_from_source(object(), "127.0.0.1", 8000, "seed-key", True, metadata)
-    assert len(native_calls) == 1
 
 
 def test_unregister_memory_region_releases_registered_tensor_owners():
@@ -298,6 +272,7 @@ def test_unregister_memory_region_releases_registered_tensor_owners():
     backend.rfork_transfer_engine_weights_info_dict = {"weight": (tensor.data_ptr(), tensor.numel(), 1)}
     backend.rfork_transfer_engine_weights_shape_dict = {"weight": tuple(tensor.shape)}
     backend.registered_weight_blocks = [(tensor.data_ptr(), tensor.numel() * tensor.element_size())]
+    backend.registered_memory_addresses = [tensor.data_ptr()]
     backend._registered_transferable_tensors = [("weight", tensor)]
 
     assert backend.unregister_memory_region()
@@ -332,6 +307,7 @@ def test_unregister_memory_region_failure_preserves_state_for_retry():
     backend.rfork_transfer_engine_weights_info_dict = {"weight": (tensor.data_ptr(), 6, 1)}
     backend.rfork_transfer_engine_weights_shape_dict = {"weight": (2, 3)}
     backend.registered_weight_blocks = blocks
+    backend.registered_memory_addresses = [blocks[0][0]]
     backend._registered_transferable_tensors = owners
 
     assert not backend.unregister_memory_region()
@@ -372,9 +348,9 @@ def test_register_memory_region_uses_logical_ranges_with_allocator_backing(monke
     backend.rfork_transfer_engine_weights_shape_dict = None
     backend._registered_transferable_tensors = None
 
-    monkeypatch.setattr(transfer_backend, "_find_non_npu_state_tensors", lambda _model: [])
-    monkeypatch.setattr(transfer_backend, "_is_transferable_tensor", lambda _tensor: True)
-    monkeypatch.setattr(transfer_backend, "_iter_transferable_tensors", lambda *args: [("weight", logical)])
+    monkeypatch.setattr(transfer_backend, "find_non_npu_state_tensors", lambda _model: [])
+    monkeypatch.setattr(transfer_backend, "is_transferable_tensor", lambda _tensor: True)
+    monkeypatch.setattr(transfer_backend, "collect_transferable_tensors", lambda *args: [("weight", logical)])
     monkeypatch.setattr(
         transfer_backend.torch,
         "npu",
@@ -424,11 +400,11 @@ def test_extended_registration_merges_overlapping_logical_ranges(monkeypatch):
     backend.registered_weight_blocks = []
     backend.registered_memory_addresses = []
     backend._registered_transferable_tensors = None
-    monkeypatch.setattr(transfer_backend, "_find_non_npu_state_tensors", lambda _model: [])
-    monkeypatch.setattr(transfer_backend, "_is_transferable_tensor", lambda _tensor: True)
+    monkeypatch.setattr(transfer_backend, "find_non_npu_state_tensors", lambda _model: [])
+    monkeypatch.setattr(transfer_backend, "is_transferable_tensor", lambda _tensor: True)
     monkeypatch.setattr(
         transfer_backend,
-        "_iter_transferable_tensors",
+        "collect_transferable_tensors",
         lambda *args: [("first", first), ("second", second)],
     )
     monkeypatch.setattr(
@@ -472,9 +448,9 @@ def test_register_memory_region_rejects_transfer_engine_without_extended_registr
     backend.registered_weight_blocks = []
     backend.registered_memory_addresses = []
     backend._registered_transferable_tensors = None
-    monkeypatch.setattr(transfer_backend, "_find_non_npu_state_tensors", lambda _model: [])
-    monkeypatch.setattr(transfer_backend, "_is_transferable_tensor", lambda _tensor: True)
-    monkeypatch.setattr(transfer_backend, "_iter_transferable_tensors", lambda *args: [("weight", tensor)])
+    monkeypatch.setattr(transfer_backend, "find_non_npu_state_tensors", lambda _model: [])
+    monkeypatch.setattr(transfer_backend, "is_transferable_tensor", lambda _tensor: True)
+    monkeypatch.setattr(transfer_backend, "collect_transferable_tensors", lambda *args: [("weight", tensor)])
     monkeypatch.setattr(
         transfer_backend.torch,
         "npu",
@@ -637,7 +613,7 @@ def test_register_memory_region_rejects_second_registration_without_overwriting(
     backend.rfork_transfer_engine_weights_shape_dict = {"old": (4,)}
     backend._registered_transferable_tensors = old_owners
 
-    monkeypatch.setattr(transfer_backend, "_iter_transferable_tensors", lambda *args: [("new", tensor)])
+    monkeypatch.setattr(transfer_backend, "collect_transferable_tensors", lambda *args: [("new", tensor)])
     assert not backend.register_memory_region(object(), False)
     assert backend.registered_weight_blocks == old_blocks
     assert backend.rfork_transfer_engine_weights_info_dict is old_info
@@ -672,8 +648,8 @@ def test_register_memory_region_rejects_uncovered_tensor_without_state_change(mo
     backend.rfork_transfer_engine_weights_shape_dict = None
     backend._registered_transferable_tensors = None
 
-    monkeypatch.setattr(transfer_backend, "_is_transferable_tensor", lambda _tensor: True)
-    monkeypatch.setattr(transfer_backend, "_iter_transferable_tensors", lambda *args: [("weight", tensor)])
+    monkeypatch.setattr(transfer_backend, "is_transferable_tensor", lambda _tensor: True)
+    monkeypatch.setattr(transfer_backend, "collect_transferable_tensors", lambda *args: [("weight", tensor)])
     monkeypatch.setattr(
         transfer_backend.torch,
         "npu",
@@ -700,24 +676,24 @@ def test_transferable_tensor_scan_depends_on_runtime_layout(monkeypatch):
             self.runtime_constant = torch.ones(2)
             self.impl = _RuntimeImpl()
 
-    monkeypatch.setattr(transfer_backend, "_is_transferable_tensor", lambda tensor: True)
+    monkeypatch.setattr(manifest_module, "is_transferable_tensor", lambda tensor: True)
     model = _Model()
 
-    processed_names = {name for name, _ in _collect_processed_layout_tensors(model)}
-    checkpoint_names = {name for name, _ in _collect_checkpoint_layout_tensors(model)}
+    processed_names = {name for name, _ in collect_processed_layout_tensors(model)}
+    checkpoint_names = {name for name, _ in collect_checkpoint_layout_tensors(model)}
 
     assert processed_names == {"weight", "buffer", "runtime_constant", "impl.runtime_weight"}
     assert checkpoint_names == {"weight", "buffer", "impl.runtime_weight"}
 
 
-def test_get_remote_instance_transfer_engine_info_non_200_returns_three_values(monkeypatch):
+def test_fetch_seed_transfer_info_returns_none_for_non_200(monkeypatch):
     monkeypatch.setattr(
-        transfer_backend.requests,
+        seed_client_module.requests,
         "get",
         lambda *args, **kwargs: SimpleNamespace(status_code=503),
     )
 
-    assert get_remote_instance_transfer_engine_info("http://seed", "seed-key") == (None, None, None)
+    assert fetch_seed_transfer_info("http://seed", "seed-key", 10.0) is None
 
 
 def test_remote_manifest_requests_use_timeout_and_auth_token(monkeypatch):
@@ -743,20 +719,17 @@ def test_remote_manifest_requests_use_timeout_and_auth_token(monkeypatch):
         calls.append((args, kwargs))
         return next(responses)
 
-    monkeypatch.setattr(transfer_backend.requests, "get", fake_get)
-    assert get_remote_instance_transfer_engine_info("http://[::1]:8000", "seed-key", 2.5, "secret") == (
-        "session",
-        {"w": [1, 1, 2]},
-        {"w": [1]},
+    monkeypatch.setattr(seed_client_module.requests, "get", fake_get)
+    assert fetch_seed_transfer_info("http://[::1]:8000", "seed-key", 2.5, "secret") == SeedTransferInfo(
+        "session", {"w": [1, 1, 2]}, {"w": [1]}
     )
     assert len(calls) == 2
     assert all(call[1]["timeout"] == 2.5 for call in calls)
     assert all(call[1]["headers"] == {"X-RFORK-TOKEN": "secret"} for call in calls)
 
 
-def test_remote_manifest_timeout_must_be_finite_and_positive(monkeypatch):
-    monkeypatch.setattr(transfer_backend.requests, "get", lambda *args, **kwargs: None)
+def test_backend_request_timeout_must_be_finite_and_positive():
     with pytest.raises(ValueError):
-        get_remote_instance_transfer_engine_info("http://seed", "key", 0)
+        transfer_backend._validate_request_timeout(0)
     with pytest.raises(ValueError):
-        get_remote_instance_transfer_engine_info("http://seed", "key", float("inf"))
+        transfer_backend._validate_request_timeout(float("inf"))

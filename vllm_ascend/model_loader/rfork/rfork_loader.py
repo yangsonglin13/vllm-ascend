@@ -41,14 +41,12 @@ from vllm.model_executor.model_loader.utils import (
 )
 from vllm.utils.torch_utils import set_default_torch_dtype
 
-from vllm_ascend import envs
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.device.hardware_profile import get_current_hardware_profile
-from vllm_ascend.model_loader.rfork.rfork_worker import RForkWorker
-from vllm_ascend.model_loader.rfork.seed_protocol import RFORK_PROTOCOL_VERSION
-
-DEFAULT_RFORK_SEED_TIMEOUT_SEC = 5.0
-DEFAULT_RFORK_REQUEST_TIMEOUT_SEC = 10.0
+from vllm_ascend.model_loader.rfork.config import RForkConfig
+from vllm_ascend.model_loader.rfork.planner_client import RFORK_PROTOCOL_VERSION
+from vllm_ascend.model_loader.rfork.session import RForkSession
+from vllm_ascend.model_loader.rfork.types import RForkIdentity
 
 
 def _canonicalize_fingerprint_value(value: Any) -> Any:
@@ -282,8 +280,8 @@ def _is_draft_model(vllm_config: VllmConfig, model_config: ModelConfig | None = 
     )
 
 
-def _get_rfork_worker_attr(vllm_config: VllmConfig, model_config: ModelConfig) -> str:
-    return "rfork_draft_worker" if _is_draft_model(vllm_config, model_config) else "rfork_worker"
+def _get_rfork_session_attr(vllm_config: VllmConfig, model_config: ModelConfig) -> str:
+    return "rfork_draft_session" if _is_draft_model(vllm_config, model_config) else "rfork_session"
 
 
 def _get_ep_rank(vllm_config: VllmConfig) -> int | None:
@@ -431,126 +429,22 @@ def _noop_process_weights_after_loading(*args: Any, **kwargs: Any) -> None:
 class RForkModelLoader(BaseModelLoader):
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
-        config = load_config.model_loader_extra_config
-        if config is None:
-            config = {}
-        elif not isinstance(config, dict):
-            err_msg = "RFork requires --model-loader-extra-config to be a JSON object."
-            logger.error(err_msg)
-            raise RuntimeError(err_msg)
-
-        def _get_env_value(env_name: str) -> Any:
-            # Legacy aliases are resolved exclusively in vllm_ascend.envs.
-            return getattr(envs, env_name)
-
-        def _get_extra_config_string(
-            keys: tuple[str, ...],
-            env_name: str,
-            default: str | None = "",
-        ) -> str | None:
-            value: Any = None
-            for key in keys:
-                if key in config:
-                    value = config[key]
-                    break
-            if not isinstance(value, str) or not value:
-                value = _get_env_value(env_name)
-            return value if isinstance(value, str) and value else default
-
-        def _parse_positive_float(value: Any) -> float | None:
-            if isinstance(value, bool) or not isinstance(value, (int, float, str)):
-                return None
-            try:
-                parsed_value = float(value)
-            except (TypeError, ValueError):
-                return None
-            if not math.isfinite(parsed_value) or parsed_value <= 0:
-                return None
-            return parsed_value
-
-        def _get_extra_config_float(
-            keys: tuple[str, ...],
-            env_name: str,
-            default: float,
-        ) -> float:
-            config_value: Any = None
-            has_config_value = False
-            for key in keys:
-                if key in config:
-                    config_value = config[key]
-                    has_config_value = True
-                    break
-            if has_config_value:
-                parsed_value = _parse_positive_float(config_value)
-                if parsed_value is not None:
-                    return parsed_value
-
-            env_value = _get_env_value(env_name)
-            parsed_value = _parse_positive_float(env_value)
-            return default if parsed_value is None else parsed_value
-
-        self.model_url = _get_extra_config_string(("model_url",), "VLLM_ASCEND_RFORK_MODEL_URL", "") or ""
-        self.model_deploy_strategy_name = (
-            _get_extra_config_string(
-                ("model_deploy_strategy_name",),
-                "VLLM_ASCEND_RFORK_DEPLOY_STRATEGY_NAME",
-                "",
-            )
-            or ""
-        )
-        self.scheduler_url = (
-            _get_extra_config_string(("rfork_scheduler_url",), "VLLM_ASCEND_RFORK_SCHEDULER_URL", "") or ""
-        )
-        self.seed_timeout_sec = _get_extra_config_float(
-            ("rfork_seed_timeout_sec",),
-            "VLLM_ASCEND_RFORK_SEED_TIMEOUT_SEC",
-            DEFAULT_RFORK_SEED_TIMEOUT_SEC,
-        )
-        self.request_timeout_sec = _get_extra_config_float(
-            ("rfork_request_timeout_sec", "request_timeout_sec"),
-            "VLLM_ASCEND_RFORK_REQUEST_TIMEOUT_SEC",
-            DEFAULT_RFORK_REQUEST_TIMEOUT_SEC,
-        )
-        self.seed_key_separator = (
-            _get_extra_config_string(
-                ("rfork_seed_key_separator",),
-                "VLLM_ASCEND_RFORK_SEED_KEY_SEPARATOR",
-                "$",
-            )
-            or "$"
-        )
-        self.auth_token = _get_extra_config_string(
-            ("rfork_auth_token", "auth_token"),
-            "VLLM_ASCEND_RFORK_AUTH_TOKEN",
-            None,
-        )
-        self.seed_bind_host = (
-            _get_extra_config_string(
-                ("rfork_seed_bind_host", "seed_bind_host", "bind_host"),
-                "VLLM_ASCEND_RFORK_SEED_BIND_HOST",
-                "0.0.0.0",
-            )
-            or "0.0.0.0"
-        )
-        self.seed_advertise_host = _get_extra_config_string(
-            ("rfork_seed_advertise_host", "seed_advertise_host", "advertise_host"),
-            "VLLM_ASCEND_RFORK_SEED_ADVERTISE_HOST",
-            None,
-        )
+        self.rfork_config = RForkConfig.from_extra_config(load_config.model_loader_extra_config)
+        config = self.rfork_config
 
         logger.info(
             "Initializing rfork with config: "
             "MODEL_URL=%s, MODEL_DEPLOY_STRATEGY_NAME=%s, "
             "SCHEDULER_URL=%s, SEED_TIMEOUT_SEC=%s, REQUEST_TIMEOUT_SEC=%s, "
             "SEED_KEY_SEPARATOR=%s, SEED_BIND_HOST=%s, SEED_ADVERTISE_HOST=%s",
-            self.model_url,
-            self.model_deploy_strategy_name,
-            self.scheduler_url,
-            self.seed_timeout_sec,
-            self.request_timeout_sec,
-            self.seed_key_separator,
-            self.seed_bind_host,
-            self.seed_advertise_host,
+            config.model_url,
+            config.model_deploy_strategy_name,
+            config.scheduler_url,
+            config.seed_timeout_sec,
+            config.request_timeout_sec,
+            config.seed_key_separator,
+            config.seed_bind_host,
+            config.seed_advertise_host,
         )
 
     def download_model(self, model_config: ModelConfig) -> None:
@@ -559,10 +453,10 @@ class RForkModelLoader(BaseModelLoader):
     def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
         raise NotImplementedError
 
-    def _ensure_rfork_worker(self, vllm_config: VllmConfig, model_config: ModelConfig) -> RForkWorker:
-        worker_attr = _get_rfork_worker_attr(vllm_config, model_config)
-        rfork_worker = getattr(self.load_config, worker_attr, None)
-        if rfork_worker is None:
+    def _ensure_rfork_session(self, vllm_config: VllmConfig, model_config: ModelConfig) -> RForkSession:
+        session_attr = _get_rfork_session_attr(vllm_config, model_config)
+        session = getattr(self.load_config, session_attr, None)
+        if session is None:
             kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
             disaggregation_mode = "kv_both" if kv_transfer_config is None else str(kv_transfer_config.kv_role)
             is_draft_model = _is_draft_model(vllm_config, model_config)
@@ -574,8 +468,8 @@ class RForkModelLoader(BaseModelLoader):
             compatibility_fingerprint = _build_rfork_compatibility_fingerprint(
                 vllm_config,
                 model_config,
-                model_url=self.model_url,
-                model_deploy_strategy_name=self.model_deploy_strategy_name,
+                model_url=self.rfork_config.model_url,
+                model_deploy_strategy_name=self.rfork_config.model_deploy_strategy_name,
                 disaggregation_mode=disaggregation_mode,
                 node_rank=node_rank,
                 tp_rank=tp_rank,
@@ -583,33 +477,25 @@ class RForkModelLoader(BaseModelLoader):
                 ep_rank=ep_rank,
                 is_draft_model=is_draft_model,
             )
-            rfork_worker = RForkWorker(
+            identity = RForkIdentity(
                 disaggregation_mode=disaggregation_mode,
                 node_rank=node_rank,
                 tp_rank=tp_rank,
                 device_id=device_id,
-                scheduler_url=self.scheduler_url,
-                model_url=self.model_url,
-                model_deploy_strategy_name=self.model_deploy_strategy_name,
-                seed_timeout_sec=self.seed_timeout_sec,
-                request_timeout_sec=self.request_timeout_sec,
-                auth_token=self.auth_token,
-                seed_bind_host=self.seed_bind_host,
-                seed_advertise_host=self.seed_advertise_host,
-                seed_key_separator=self.seed_key_separator,
                 is_draft_model=is_draft_model,
                 pp_rank=pp_rank,
                 ep_rank=ep_rank,
                 compatibility_fingerprint=compatibility_fingerprint,
             )
-            setattr(self.load_config, worker_attr, rfork_worker)
+            session = RForkSession(self.rfork_config, identity)
+            setattr(self.load_config, session_attr, session)
             logger.info(
-                "RFork worker initialized, load_format=rfork, is_draft_model=%s, worker_attr=%s, fingerprint=%s",
+                "RFork session initialized, load_format=rfork, is_draft_model=%s, session_attr=%s, fingerprint=%s",
                 is_draft_model,
-                worker_attr,
+                session_attr,
                 compatibility_fingerprint,
             )
-        return rfork_worker
+        return session
 
     def _requires_processed_layout_transfer(self, model_config: ModelConfig) -> bool:
         if getattr(model_config, "quantization", None) is not None:
@@ -630,63 +516,6 @@ class RForkModelLoader(BaseModelLoader):
         except (AttributeError, RuntimeError):
             return False
 
-    @staticmethod
-    def _stop_rfork_seed_service(rfork_worker: RForkWorker) -> bool:
-        """Stop any service owned by a worker before fallback/reinitialization."""
-
-        for method_name in ("stop_seed_service", "shutdown"):
-            stop_method = getattr(rfork_worker, method_name, None)
-            if not callable(stop_method):
-                continue
-            try:
-                result = stop_method()
-                return result is not False
-            except Exception as exc:  # pragma: no cover - best-effort cleanup
-                logger.warning("Failed to stop RFork seed service during cleanup: %s", exc)
-                return False
-        return True
-
-    @classmethod
-    def _cleanup_rfork_worker(cls, rfork_worker: RForkWorker) -> bool:
-        """Best-effort cleanup preserving worker-owned unregister retry state."""
-
-        service_stopped = cls._stop_rfork_seed_service(rfork_worker)
-        cleanup_ok = service_stopped
-        try:
-            released = rfork_worker.post_transfer()
-            if released is False:
-                logger.warning("RFork seed lease release failed during cleanup.")
-                cleanup_ok = False
-        except Exception as exc:  # pragma: no cover - best-effort cleanup
-            logger.warning("Failed to release RFork seed lease during cleanup: %s", exc)
-            cleanup_ok = False
-        if service_stopped:
-            try:
-                reset = rfork_worker.reset_transfer_state()
-                if reset is False:
-                    logger.warning("RFork transfer state reset failed during cleanup; retaining retry state.")
-                    cleanup_ok = False
-            except Exception as exc:  # pragma: no cover - best-effort cleanup
-                logger.warning("Failed to reset RFork transfer state during cleanup: %s", exc)
-                cleanup_ok = False
-        else:
-            logger.warning("RFork seed service is still alive; retaining its registered memory for safety.")
-        return cleanup_ok
-
-    @staticmethod
-    def _start_rfork_seed_service(rfork_worker: RForkWorker, model: Module, processed_layout: bool) -> bool:
-        """Start seed advertising and normalize old workers' implicit success."""
-
-        try:
-            result = rfork_worker.start_seed_service(model, processed_layout)
-        except Exception as exc:
-            logger.warning("RFork seed service startup failed: %s", exc)
-            return False
-        # Before the v2 worker contract, a successful start returned None.
-        # Treat only an explicit False as failure for compatibility with an
-        # already-created worker from an older embedding process.
-        return result is not False
-
     def load_model(
         self,
         vllm_config: VllmConfig,
@@ -701,7 +530,7 @@ class RForkModelLoader(BaseModelLoader):
         with set_default_torch_dtype(model_config.dtype):
             need_del = False
             model: Module | None = None
-            rfork_worker: RForkWorker | None = None
+            session: RForkSession | None = None
             processed_layout_transfer = self._requires_processed_layout_transfer(model_config)
             bypass_reason = None
             if _is_dynamic_eplb_enabled(vllm_config):
@@ -728,11 +557,11 @@ class RForkModelLoader(BaseModelLoader):
                     raise
 
             try:
-                # Worker construction and TransferEngine initialization belong
+                # Session construction and TransferEngine initialization belong
                 # to the guarded RFork path. Missing optional dependencies or
                 # an uninitialized parallel group must still reach fallback.
-                rfork_worker = self._ensure_rfork_worker(vllm_config, model_config)
-                if not rfork_worker.is_seed_available():
+                session = self._ensure_rfork_session(vllm_config, model_config)
+                if not session.acquire_seed():
                     raise RuntimeError("seed is not available.")
 
                 with target_device:
@@ -751,12 +580,8 @@ class RForkModelLoader(BaseModelLoader):
                     torch.npu.synchronize()
 
                 weight_load_start_time = time.perf_counter()
-                if not rfork_worker.pre_transfer(model, processed_layout_transfer):
-                    raise RuntimeError("pre_transfer failed.")
-                if not rfork_worker.transfer(model, processed_layout_transfer):
+                if not session.transfer_from_seed(model, processed_layout_transfer):
                     raise RuntimeError("transfer failed.")
-                if not rfork_worker.post_transfer():
-                    raise RuntimeError("post_transfer failed.")
                 logger.info(
                     "Loading model weights took %.2f seconds",
                     time.perf_counter() - weight_load_start_time,
@@ -766,27 +591,17 @@ class RForkModelLoader(BaseModelLoader):
                     with _rfork_skip_unquantized_moe_post_load_processing(model):
                         process_weights_after_loading(model, model_config, target_device)
 
-                # A seed must only become visible after all post-load work and
-                # eval mode are complete. If service startup fails, the model
-                # is already valid: unregister its MR and return it directly.
+                # A seed becomes visible only after post-load work and eval mode.
+                # The session owns every cleanup action if startup fails.
                 model = model.eval()
-                if not self._start_rfork_seed_service(rfork_worker, model, processed_layout_transfer):
-                    if self._stop_rfork_seed_service(rfork_worker):
-                        try:
-                            reset = rfork_worker.reset_transfer_state()
-                            if reset is False:
-                                logger.warning("RFork seed startup cleanup could not unregister memory.")
-                        except Exception as exc:  # pragma: no cover - best-effort cleanup
-                            logger.warning("RFork seed startup cleanup failed: %s", exc)
-                    else:
-                        logger.warning("RFork seed server is still alive; retaining registered memory for safety.")
+                session.start_seed_service(model, processed_layout_transfer)
                 return model
             except Exception as e:
                 logger.warning("RFork transfer failed: %s, clean up and fall back to default loader", e)
 
                 cleanup_ok = False
-                if rfork_worker is not None:
-                    cleanup_ok = self._cleanup_rfork_worker(rfork_worker)
+                if session is not None:
+                    cleanup_ok = session.prepare_for_fallback()
 
                 if need_del and model is not None:
                     _reset_process_global_model_state(vllm_config, model)
@@ -813,22 +628,10 @@ class RForkModelLoader(BaseModelLoader):
                     logger.exception("RFork fallback default loader failed.")
                     raise
 
-                # A failed RFork transfer may still leave a worker available to
+                # A failed RFork transfer may still leave a session available to
                 # seed later instances. Never advertise if construction failed;
                 # a seed-start failure only cleans the MR and keeps this valid
                 # fallback model.
-                if (
-                    rfork_worker is not None
-                    and cleanup_ok
-                    and not self._start_rfork_seed_service(rfork_worker, model, processed_layout_transfer)
-                ):
-                    if self._stop_rfork_seed_service(rfork_worker):
-                        try:
-                            reset = rfork_worker.reset_transfer_state()
-                            if reset is False:
-                                logger.warning("Fallback seed startup cleanup could not unregister memory.")
-                        except Exception as exc:  # pragma: no cover - best-effort cleanup
-                            logger.warning("Fallback seed startup cleanup failed: %s", exc)
-                    else:
-                        logger.warning("Fallback seed server is still alive; retaining registered memory for safety.")
+                if session is not None and cleanup_ok:
+                    session.start_seed_service(model, processed_layout_transfer)
                 return model

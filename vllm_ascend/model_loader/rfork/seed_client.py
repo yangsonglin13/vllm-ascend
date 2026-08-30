@@ -1,0 +1,62 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+
+from collections.abc import Mapping
+from http import HTTPStatus
+from typing import Any
+
+import requests
+from vllm.logger import logger
+
+from vllm_ascend.model_loader.rfork.planner_client import AUTH_TOKEN_HEADER
+from vllm_ascend.model_loader.rfork.types import SeedTransferInfo
+
+
+def _headers(auth_token: str) -> dict[str, str]:
+    return {AUTH_TOKEN_HEADER: auth_token} if auth_token else {}
+
+
+def fetch_seed_transfer_info(
+    seed_url: str,
+    seed_key: str,
+    request_timeout_sec: float,
+    auth_token: str = "",
+) -> SeedTransferInfo | None:
+    try:
+        response = requests.get(
+            f"{seed_url}/get_rfork_transfer_engine_info",
+            params={"seed_key": seed_key},
+            headers=_headers(auth_token),
+            timeout=request_timeout_sec,
+        )
+        if response.status_code != HTTPStatus.OK:
+            logger.error("RFork seed metadata request returned status=%s", response.status_code)
+            return None
+        info = response.json().get("rfork_transfer_engine_info")
+        if not isinstance(info, (list, tuple)) or len(info) != 2:
+            logger.error("RFork seed returned malformed transfer metadata.")
+            return None
+        session_id, weights = info
+        if not isinstance(session_id, str) or not session_id or not isinstance(weights, Mapping):
+            logger.error("RFork seed returned an invalid session or weight manifest.")
+            return None
+
+        shape_response = requests.get(
+            f"{seed_url}/get_rfork_transfer_engine_shape_info",
+            params={"seed_key": seed_key},
+            headers=_headers(auth_token),
+            timeout=request_timeout_sec,
+        )
+        shapes: Mapping[str, Any] | None = None
+        if shape_response.status_code == HTTPStatus.OK:
+            candidate = shape_response.json().get("rfork_transfer_engine_shape_info")
+            if candidate is not None and not isinstance(candidate, Mapping):
+                logger.error("RFork seed returned a malformed shape manifest.")
+                return None
+            shapes = candidate
+        return SeedTransferInfo(session_id=session_id, weights=weights, shapes=shapes)
+    except Exception as exc:
+        logger.error("RFork seed metadata request failed for %s: %s", seed_url, exc)
+        return None

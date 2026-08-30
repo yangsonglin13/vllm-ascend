@@ -4,24 +4,25 @@ import threading
 
 import pytest
 
-from vllm_ascend.model_loader.rfork.seed_protocol import (
+from vllm_ascend.model_loader.rfork.config import RForkConfig
+from vllm_ascend.model_loader.rfork.planner_client import (
     AUTH_TOKEN_HEADER,
-    RForkSeedProtocol,
+    RForkPlannerClient,
     get_local_seed_key,
 )
+from vllm_ascend.model_loader.rfork.types import RForkIdentity, SeedAdvertisement, SeedLease
 
 
-def _protocol(**kwargs):
-    options = {
-        "disaggregation_mode": "kv_consumer",
-        "node_rank": 0,
-        "tp_rank": 1,
+def _planner(**kwargs):
+    config_options = {
         "scheduler_url": "http://planner",
         "model_url": "/models/model",
         "model_deploy_strategy_name": "decode",
+        "request_timeout_sec": kwargs.pop("request_timeout_sec", 10.0),
+        "auth_token": kwargs.pop("auth_token", None),
     }
-    options.update(kwargs)
-    return RForkSeedProtocol(**options)
+    identity = RForkIdentity("kv_consumer", 0, 1, 0)
+    return RForkPlannerClient(RForkConfig(**config_options), identity, **kwargs)
 
 
 def test_v2_seed_key_is_opaque_and_collision_free():
@@ -62,7 +63,7 @@ def test_v2_seed_key_changes_with_fingerprint_and_legacy_key_is_preserved():
 
 
 def test_request_timeout_and_auth_are_applied(monkeypatch):
-    protocol = _protocol(request_timeout_sec=1.25, auth_token="secret")
+    protocol = _planner(request_timeout_sec=1.25, auth_token="secret")
     calls = []
 
     class Response:
@@ -74,16 +75,16 @@ def test_request_timeout_and_auth_are_applied(monkeypatch):
         return Response()
 
     monkeypatch.setattr(
-        "vllm_ascend.model_loader.rfork.seed_protocol.requests.get",
+        "vllm_ascend.model_loader.rfork.planner_client.requests.get",
         fake_get,
     )
-    assert protocol.get_seed() is None
+    assert protocol.acquire_seed() is None
     assert calls[0][1]["timeout"] == pytest.approx(1.25)
     assert calls[0][1]["headers"][AUTH_TOKEN_HEADER] == "secret"
 
 
 def test_release_retries_with_a_bounded_count(monkeypatch):
-    protocol = _protocol(request_timeout_sec=0.5, release_max_retries=3, release_retry_backoff_sec=0)
+    protocol = _planner(request_timeout_sec=0.5, release_max_retries=3, release_retry_backoff_sec=0)
     calls = []
 
     class Response:
@@ -97,17 +98,17 @@ def test_release_retries_with_a_bounded_count(monkeypatch):
         return next(responses)
 
     monkeypatch.setattr(
-        "vllm_ascend.model_loader.rfork.seed_protocol.requests.post",
+        "vllm_ascend.model_loader.rfork.planner_client.requests.post",
         fake_post,
     )
-    seed = {"seed_ip": "127.0.0.1", "seed_port": 1234, "seed_rank": 0, "user_id": "lease"}
+    seed = SeedLease("127.0.0.1", 1234, "lease", 0, protocol.local_seed_key)
     assert protocol.release_seed(seed) is True
     assert len(calls) == 3
     assert all(call["timeout"] == pytest.approx(0.5) for call in calls)
 
 
 def test_release_treats_already_expired_lease_as_success(monkeypatch):
-    protocol = _protocol(release_max_retries=3, release_retry_backoff_sec=0)
+    protocol = _planner(release_max_retries=3, release_retry_backoff_sec=0)
 
     class Response:
         status_code = 404
@@ -119,16 +120,16 @@ def test_release_treats_already_expired_lease_as_success(monkeypatch):
         return Response()
 
     monkeypatch.setattr(
-        "vllm_ascend.model_loader.rfork.seed_protocol.requests.post",
+        "vllm_ascend.model_loader.rfork.planner_client.requests.post",
         fake_post,
     )
-    seed = {"seed_ip": "127.0.0.1", "seed_port": 1234, "seed_rank": 0, "user_id": "expired"}
+    seed = SeedLease("127.0.0.1", 1234, "expired", 0, protocol.local_seed_key)
     assert protocol.release_seed(seed) is True
     assert len(calls) == 1
 
 
 def test_report_seed_stops_without_an_extra_heartbeat(monkeypatch):
-    protocol = _protocol(auth_token="secret")
+    protocol = _planner(auth_token="secret")
     stop_event = threading.Event()
     calls = []
 
@@ -141,31 +142,31 @@ def test_report_seed_stops_without_an_extra_heartbeat(monkeypatch):
         return Response()
 
     monkeypatch.setattr(
-        "vllm_ascend.model_loader.rfork.seed_protocol.requests.post",
+        "vllm_ascend.model_loader.rfork.planner_client.requests.post",
         fake_post,
     )
-    monkeypatch.setattr("vllm_ascend.model_loader.rfork.seed_protocol.get_ip", lambda: "127.0.0.1")
+    monkeypatch.setattr("vllm_ascend.model_loader.rfork.planner_client.get_ip", lambda: "127.0.0.1")
     protocol.report_seed(2345, sleep_interval=60, stop_event=stop_event)
     assert len(calls) == 1
     assert calls[0]["headers"][AUTH_TOKEN_HEADER] == "secret"
 
 
 def test_report_seed_once_propagates_planner_rejection(monkeypatch):
-    protocol = _protocol()
+    protocol = _planner()
 
     class Response:
         status_code = 401
 
     monkeypatch.setattr(
-        "vllm_ascend.model_loader.rfork.seed_protocol.requests.post",
+        "vllm_ascend.model_loader.rfork.planner_client.requests.post",
         lambda *args, **kwargs: Response(),
     )
     assert protocol.report_seed_once(2345, seed_ip="127.0.0.1") is False
-    assert protocol._last_report is None
+    assert protocol.last_advertisement is None
 
 
 def test_remove_seed_is_idempotent_and_bounded(monkeypatch):
-    protocol = _protocol(request_timeout_sec=0.75)
+    protocol = _planner(request_timeout_sec=0.75)
     calls = []
 
     class Response:
@@ -176,8 +177,8 @@ def test_remove_seed_is_idempotent_and_bounded(monkeypatch):
         return Response()
 
     monkeypatch.setattr(
-        "vllm_ascend.model_loader.rfork.seed_protocol.requests.post",
+        "vllm_ascend.model_loader.rfork.planner_client.requests.post",
         fake_post,
     )
-    assert protocol.remove_seed(port=2345, seed_ip="127.0.0.1") is True
+    assert protocol.remove_seed(SeedAdvertisement("127.0.0.1", 2345, 1)) is True
     assert calls[0][1]["timeout"] == pytest.approx(0.75)

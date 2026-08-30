@@ -37,7 +37,6 @@ from dataclasses import dataclass
 from fastapi import APIRouter, FastAPI, Request, Response, status
 
 AUTH_TOKEN_HEADER = "X-RFORK-TOKEN"
-LEGACY_AUTH_TOKEN_HEADER = "X-RFork-Auth-Token"
 
 
 @dataclass(frozen=True)
@@ -437,10 +436,7 @@ def build_router(store: Store, auth_token: str | None = None):
     def authorized(request: Request) -> bool:
         if not auth_token:
             return True
-        return auth_token in {
-            request.headers.get(AUTH_TOKEN_HEADER),
-            request.headers.get(LEGACY_AUTH_TOKEN_HEADER),
-        }
+        return request.headers.get(AUTH_TOKEN_HEADER) == auth_token
 
     @router.post("/add_seed")
     def add_seed(request: Request) -> Response:

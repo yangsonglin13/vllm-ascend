@@ -6,13 +6,14 @@ from types import SimpleNamespace
 
 import pytest
 
-from vllm_ascend.model_loader.rfork.seed_protocol import AUTH_TOKEN_HEADER
+from vllm_ascend.model_loader.rfork.planner_client import AUTH_TOKEN_HEADER
 from vllm_ascend.model_loader.rfork.seed_server import (
     RForkSeedServerHandle,
     _authorized,
     _create_bound_socket,
     start_rfork_server,
 )
+from vllm_ascend.model_loader.rfork.types import SeedTransferInfo
 
 
 def test_authorization_accepts_only_the_configured_token():
@@ -70,8 +71,13 @@ def test_health_timeout_stops_and_joins_server(monkeypatch):
         "vllm_ascend.model_loader.rfork.seed_server.requests.get",
         lambda *args, **kwargs: Response(),
     )
-    result = start_rfork_server("key", ("session", {}, {}), health_timeout_sec=0.03, bind_host="127.0.0.1")
-    assert result == -1
+    with pytest.raises(RuntimeError, match="health check"):
+        start_rfork_server(
+            "key",
+            SeedTransferInfo("session", {}, {}),
+            health_timeout_sec=0.03,
+            bind_host="127.0.0.1",
+        )
     assert not any(thread.name == "RForkSeedServer" and thread.is_alive() for thread in threading.enumerate())
 
 
@@ -92,16 +98,14 @@ def test_seed_server_auth_header_is_required(monkeypatch):
         "vllm_ascend.model_loader.rfork.seed_server.requests.get",
         fake_get,
     )
-    assert (
+    with pytest.raises(RuntimeError, match="health check"):
         start_rfork_server(
             "key",
-            ("session", {}, {}),
+            SeedTransferInfo("session", {}, {}),
             health_timeout_sec=0.03,
             bind_host="127.0.0.1",
             auth_token="secret",
         )
-        == -1
-    )
     assert calls
     assert calls[0]["headers"][AUTH_TOKEN_HEADER] == "secret"
 
@@ -110,12 +114,10 @@ def test_seed_server_auth_header_is_required(monkeypatch):
 def test_ipv6_bind_can_start_and_stop():
     handle = start_rfork_server(
         "key-ipv6",
-        ("session", {}, {}),
+        SeedTransferInfo("session", {}, {}),
         health_timeout_sec=2,
         bind_host="::1",
     )
-    if handle == -1:
-        pytest.skip("IPv6 loopback is not available on this host")
     assert isinstance(handle, RForkSeedServerHandle)
     assert handle.port > 0
     assert handle.stop() is True

@@ -21,12 +21,13 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm_ascend.model_loader.rfork.planner_client import get_local_seed_key
 from vllm_ascend.model_loader.rfork.rfork_loader import (
     RForkModelLoader,
     _build_rfork_compatibility_fingerprint,
     _get_ep_rank,
     _get_pp_rank,
-    _get_rfork_worker_attr,
+    _get_rfork_session_attr,
     _is_draft_model,
     _is_dynamic_eplb_enabled,
     _make_fallback_load_config,
@@ -34,7 +35,6 @@ from vllm_ascend.model_loader.rfork.rfork_loader import (
     _rfork_pre_transfer_weight_processing,
     _rfork_skip_unquantized_moe_post_load_processing,
 )
-from vllm_ascend.model_loader.rfork.seed_protocol import get_local_seed_key
 
 
 class DummyLoadConfig:
@@ -57,7 +57,7 @@ def test_rfork_seed_timeout_bool_falls_back_to_env(monkeypatch, config_value):
         )
     )
 
-    assert loader.seed_timeout_sec == 7.5
+    assert loader.rfork_config.seed_timeout_sec == 7.5
 
 
 @pytest.mark.parametrize("config_value", [True, False])
@@ -72,7 +72,7 @@ def test_rfork_seed_timeout_bool_falls_back_to_default(monkeypatch, config_value
         )
     )
 
-    assert loader.seed_timeout_sec == 5.0
+    assert loader.rfork_config.seed_timeout_sec == 5.0
 
 
 def test_rfork_canonical_environment_values_override_legacy_aliases(monkeypatch):
@@ -84,9 +84,9 @@ def test_rfork_canonical_environment_values_override_legacy_aliases(monkeypatch)
 
     loader = RForkModelLoader(DummyLoadConfig({}))
 
-    assert loader.model_url == "canonical-model"
-    assert loader.request_timeout_sec == 4.0
-    assert loader.auth_token == "secret-token"
+    assert loader.rfork_config.model_url == "canonical-model"
+    assert loader.rfork_config.request_timeout_sec == 4.0
+    assert loader.rfork_config.auth_token == "secret-token"
 
 
 @pytest.mark.parametrize("invalid_value", [True, False, 0, -1, float("nan"), float("inf"), "nan", "inf"])
@@ -105,8 +105,8 @@ def test_rfork_numeric_config_rejects_invalid_values(monkeypatch, invalid_value)
         )
     )
 
-    assert loader.seed_timeout_sec == 5.0
-    assert loader.request_timeout_sec == 10.0
+    assert loader.rfork_config.seed_timeout_sec == 5.0
+    assert loader.rfork_config.request_timeout_sec == 10.0
 
 
 def test_rfork_network_configuration_is_passed_without_logging_token(monkeypatch, caplog):
@@ -120,8 +120,8 @@ def test_rfork_network_configuration_is_passed_without_logging_token(monkeypatch
         )
     )
 
-    assert loader.seed_bind_host == "127.0.0.1"
-    assert loader.seed_advertise_host == "10.0.0.2"
+    assert loader.rfork_config.seed_bind_host == "127.0.0.1"
+    assert loader.rfork_config.seed_advertise_host == "10.0.0.2"
     assert "do-not-log" not in caplog.text
 
 
@@ -316,7 +316,7 @@ def test_rfork_draft_seed_key_isolated_by_ep_rank():
     )
 
 
-def test_rfork_worker_receives_parallel_ranks(monkeypatch):
+def test_rfork_session_receives_parallel_ranks(monkeypatch):
     load_config = DummyLoadConfig({"model_url": "model", "model_deploy_strategy_name": "strategy"})
     loader = RForkModelLoader(load_config)
     model_config = SimpleNamespace()
@@ -327,29 +327,30 @@ def test_rfork_worker_receives_parallel_ranks(monkeypatch):
         parallel_config=SimpleNamespace(node_rank=2),
     )
     captured = {}
-    expected_worker = SimpleNamespace()
+    expected_session = SimpleNamespace()
 
-    def fake_rfork_worker(**kwargs):
-        captured.update(kwargs)
-        return expected_worker
+    def fake_rfork_session(config, identity):
+        captured["config"] = config
+        captured["identity"] = identity
+        return expected_session
 
-    monkeypatch.setattr("vllm_ascend.model_loader.rfork.rfork_loader.RForkWorker", fake_rfork_worker)
+    monkeypatch.setattr("vllm_ascend.model_loader.rfork.rfork_loader.RForkSession", fake_rfork_session)
     monkeypatch.setattr("vllm_ascend.model_loader.rfork.rfork_loader._get_pp_rank", lambda config: 3)
     monkeypatch.setattr("vllm_ascend.model_loader.rfork.rfork_loader._get_ep_rank", lambda config: 7)
     monkeypatch.setattr("vllm_ascend.model_loader.rfork.rfork_loader.get_tensor_model_parallel_rank", lambda: 5)
     monkeypatch.setattr(torch.distributed, "get_rank", lambda: 11)
 
-    worker = loader._ensure_rfork_worker(vllm_config, model_config)
+    session = loader._ensure_rfork_session(vllm_config, model_config)
 
-    assert worker is expected_worker
-    assert captured["node_rank"] == 2
-    assert captured["tp_rank"] == 5
-    assert captured["pp_rank"] == 3
-    assert captured["ep_rank"] == 7
-    assert captured["device_id"] == 11
+    assert session is expected_session
+    assert captured["identity"].node_rank == 2
+    assert captured["identity"].tp_rank == 5
+    assert captured["identity"].pp_rank == 3
+    assert captured["identity"].ep_rank == 7
+    assert captured["identity"].device_id == 11
 
 
-def test_rfork_worker_receives_hardening_configuration(monkeypatch):
+def test_rfork_session_receives_hardening_configuration(monkeypatch):
     load_config = DummyLoadConfig(
         {
             "model_url": "model",
@@ -369,24 +370,25 @@ def test_rfork_worker_receives_hardening_configuration(monkeypatch):
         parallel_config=SimpleNamespace(node_rank=2, tensor_parallel_size=4, pipeline_parallel_size=1),
     )
     captured = {}
-    expected_worker = SimpleNamespace()
+    expected_session = SimpleNamespace()
 
-    def fake_rfork_worker(**kwargs):
-        captured.update(kwargs)
-        return expected_worker
+    def fake_rfork_session(config, identity):
+        captured["config"] = config
+        captured["identity"] = identity
+        return expected_session
 
-    monkeypatch.setattr("vllm_ascend.model_loader.rfork.rfork_loader.RForkWorker", fake_rfork_worker)
+    monkeypatch.setattr("vllm_ascend.model_loader.rfork.rfork_loader.RForkSession", fake_rfork_session)
     monkeypatch.setattr("vllm_ascend.model_loader.rfork.rfork_loader._get_pp_rank", lambda config: None)
     monkeypatch.setattr("vllm_ascend.model_loader.rfork.rfork_loader._get_ep_rank", lambda config: None)
     monkeypatch.setattr("vllm_ascend.model_loader.rfork.rfork_loader.get_tensor_model_parallel_rank", lambda: 1)
     monkeypatch.setattr(torch.distributed, "get_rank", lambda: 11)
 
-    assert loader._ensure_rfork_worker(vllm_config, model_config) is expected_worker
-    assert captured["request_timeout_sec"] == 2.5
-    assert captured["auth_token"] == "secret"
-    assert captured["seed_bind_host"] == "127.0.0.1"
-    assert captured["seed_advertise_host"] == "10.0.0.9"
-    assert len(captured["compatibility_fingerprint"]) == 64
+    assert loader._ensure_rfork_session(vllm_config, model_config) is expected_session
+    assert captured["config"].request_timeout_sec == 2.5
+    assert captured["config"].auth_token == "secret"
+    assert captured["config"].seed_bind_host == "127.0.0.1"
+    assert captured["config"].seed_advertise_host == "10.0.0.9"
+    assert len(captured["identity"].compatibility_fingerprint) == 64
 
 
 def test_rfork_fingerprint_changes_for_compatibility_inputs(monkeypatch):
@@ -509,7 +511,7 @@ def test_rfork_detects_explicit_draft_model_config():
     assert _is_draft_model(target_vllm_config, draft_model_config)
 
 
-def test_rfork_uses_separate_worker_attr_for_explicit_draft_model_config():
+def test_rfork_uses_separate_session_attr_for_explicit_draft_model_config():
     target_vllm_config = _vllm_config(
         model_config=SimpleNamespace(
             hf_config=SimpleNamespace(
@@ -525,8 +527,8 @@ def test_rfork_uses_separate_worker_attr_for_explicit_draft_model_config():
         )
     )
 
-    assert _get_rfork_worker_attr(target_vllm_config, target_vllm_config.model_config) == "rfork_worker"
-    assert _get_rfork_worker_attr(target_vllm_config, draft_model_config) == "rfork_draft_worker"
+    assert _get_rfork_session_attr(target_vllm_config, target_vllm_config.model_config) == "rfork_session"
+    assert _get_rfork_session_attr(target_vllm_config, draft_model_config) == "rfork_draft_session"
 
 
 def test_rfork_fallback_load_config_copy_does_not_mutate_original():
@@ -596,8 +598,8 @@ def test_rfork_dynamic_eplb_uses_default_loader(monkeypatch):
     vllm_config = _vllm_config(model_config=model_config)
     vllm_config.additional_config = {"eplb_config": {"dynamic_eplb": True}}
 
-    def fail_if_rfork_worker_is_created(*args, **kwargs):
-        raise AssertionError("RFork worker should not be initialized when dynamic EPLB is enabled.")
+    def fail_if_rfork_session_is_created(*args, **kwargs):
+        raise AssertionError("RFork session should not be initialized when dynamic EPLB is enabled.")
 
     expected_model = SimpleNamespace()
     captured = {}
@@ -606,7 +608,7 @@ def test_rfork_dynamic_eplb_uses_default_loader(monkeypatch):
         captured.update(kwargs)
         return expected_model
 
-    monkeypatch.setattr(loader, "_ensure_rfork_worker", fail_if_rfork_worker_is_created)
+    monkeypatch.setattr(loader, "_ensure_rfork_session", fail_if_rfork_session_is_created)
     monkeypatch.setattr(model_loader, "get_model", fake_get_model)
     monkeypatch.setattr(
         "vllm_ascend.model_loader.rfork.rfork_loader.get_ascend_config",
@@ -636,8 +638,8 @@ def test_rfork_native_eplb_uses_default_loader(monkeypatch):
     )
     vllm_config.additional_config = None
 
-    def fail_if_rfork_worker_is_created(*args, **kwargs):
-        raise AssertionError("RFork worker should not be initialized when native EPLB is enabled.")
+    def fail_if_rfork_session_is_created(*args, **kwargs):
+        raise AssertionError("RFork session should not be initialized when native EPLB is enabled.")
 
     expected_model = SimpleNamespace()
     captured = {}
@@ -646,7 +648,7 @@ def test_rfork_native_eplb_uses_default_loader(monkeypatch):
         captured.update(kwargs)
         return expected_model
 
-    monkeypatch.setattr(loader, "_ensure_rfork_worker", fail_if_rfork_worker_is_created)
+    monkeypatch.setattr(loader, "_ensure_rfork_session", fail_if_rfork_session_is_created)
     monkeypatch.setattr(model_loader, "get_model", fake_get_model)
 
     model = loader.load_model(vllm_config=vllm_config, model_config=model_config)
@@ -660,7 +662,7 @@ def test_rfork_native_eplb_uses_default_loader(monkeypatch):
     assert captured["load_config"].model_loader_extra_config == {}
 
 
-def test_rfork_worker_construction_failure_falls_back_without_starting_seed(monkeypatch):
+def test_rfork_session_construction_failure_falls_back_without_starting_seed(monkeypatch):
     import vllm.model_executor.model_loader as model_loader
 
     load_config = DummyLoadConfig({"model_url": "model", "model_deploy_strategy_name": "strategy"})
@@ -670,23 +672,23 @@ def test_rfork_worker_construction_failure_falls_back_without_starting_seed(monk
     expected_model = SimpleNamespace()
     start_calls = []
 
-    def fail_worker(*args, **kwargs):
+    def fail_session(*args, **kwargs):
         raise RuntimeError("TransferEngine unavailable")
 
-    monkeypatch.setattr(loader, "_ensure_rfork_worker", fail_worker)
+    monkeypatch.setattr(loader, "_ensure_rfork_session", fail_session)
     monkeypatch.setattr(model_loader, "get_model", lambda **kwargs: expected_model)
     monkeypatch.setattr(
         "vllm_ascend.model_loader.rfork.rfork_loader.get_ascend_config",
         lambda: SimpleNamespace(eplb_config=SimpleNamespace(dynamic_eplb=False, expert_map_record_path=None)),
     )
 
-    class _UnexpectedWorker:
+    class _UnexpectedSession:
         def start_seed_service(self, *args, **kwargs):
             start_calls.append((args, kwargs))
 
     monkeypatch.setattr(
-        "vllm_ascend.model_loader.rfork.rfork_loader.RForkWorker",
-        lambda **kwargs: _UnexpectedWorker(),
+        "vllm_ascend.model_loader.rfork.rfork_loader.RForkSession",
+        lambda *args, **kwargs: _UnexpectedSession(),
     )
 
     assert loader.load_model(vllm_config=vllm_config, model_config=model_config) is expected_model
@@ -707,33 +709,24 @@ def test_rfork_seed_start_failure_returns_valid_model_without_disk_reload(monkey
 
     model = _Model()
 
-    class _Worker:
-        def is_seed_available(self):
+    class _Session:
+        def acquire_seed(self):
             events.append("seed")
             return True
 
-        def pre_transfer(self, model, processed_layout):
-            events.append("pre_transfer")
-            return True
-
-        def transfer(self, model, processed_layout):
+        def transfer_from_seed(self, model, processed_layout):
             events.append("transfer")
-            return True
-
-        def post_transfer(self):
-            events.append("post_transfer")
             return True
 
         def start_seed_service(self, model, processed_layout):
             events.append("start_seed_service")
             return False
 
-        def reset_transfer_state(self):
-            events.append("reset_transfer_state")
+        def prepare_for_fallback(self):
             return True
 
-    worker = _Worker()
-    loader._ensure_rfork_worker = lambda vc, mc: worker
+    session = _Session()
+    loader._ensure_rfork_session = lambda vc, mc: session
     loader._requires_processed_layout_transfer = lambda mc: False
     monkeypatch.setattr(
         "vllm_ascend.model_loader.rfork.rfork_loader.get_ascend_config",
@@ -756,19 +749,6 @@ def test_rfork_seed_start_failure_returns_valid_model_without_disk_reload(monkey
 
     assert result is model
     assert events.index("eval") < events.index("start_seed_service")
-    assert events[-1] == "reset_transfer_state"
-
-
-def test_rfork_cleanup_retains_memory_while_seed_server_is_alive():
-    reset_calls = []
-    worker = SimpleNamespace(
-        stop_seed_service=lambda: False,
-        post_transfer=lambda: True,
-        reset_transfer_state=lambda: reset_calls.append(True) or True,
-    )
-
-    assert RForkModelLoader._cleanup_rfork_worker(worker) is False
-    assert reset_calls == []
 
 
 def test_rfork_fallback_clears_only_failed_model_state_before_reinit(monkeypatch):
@@ -819,16 +799,14 @@ def test_rfork_fallback_clears_only_failed_model_state_before_reinit(monkeypatch
         vllm_config.compilation_config.static_forward_context["model.layers.0.mlp.down_proj"] = fallback_down_proj
         return expected_model
 
-    rfork_worker = SimpleNamespace(
-        is_seed_available=lambda: True,
-        pre_transfer=lambda model, processed_layout: True,
-        transfer=lambda model, processed_layout: False,
-        post_transfer=lambda: True,
-        reset_transfer_state=lambda: None,
-        start_seed_service=lambda model, processed_layout: None,
+    rfork_session = SimpleNamespace(
+        acquire_seed=lambda: True,
+        transfer_from_seed=lambda model, processed_layout: False,
+        prepare_for_fallback=lambda: True,
+        start_seed_service=lambda model, processed_layout: True,
     )
 
-    monkeypatch.setattr(loader, "_ensure_rfork_worker", lambda vc, mc: rfork_worker)
+    monkeypatch.setattr(loader, "_ensure_rfork_session", lambda vc, mc: rfork_session)
     monkeypatch.setattr(model_loader, "get_model", fake_get_model)
     monkeypatch.setattr(
         "vllm_ascend.model_loader.rfork.rfork_loader.get_ascend_config",
@@ -882,14 +860,13 @@ def test_rfork_seed_miss_fallback_preserves_existing_process_global_state(monkey
         assert _ROPE_DICT[rope_key] is rope_value
         return expected_model
 
-    rfork_worker = SimpleNamespace(
-        is_seed_available=lambda: False,
-        post_transfer=lambda: True,
-        reset_transfer_state=lambda: None,
-        start_seed_service=lambda model, processed_layout: None,
+    rfork_session = SimpleNamespace(
+        acquire_seed=lambda: False,
+        prepare_for_fallback=lambda: True,
+        start_seed_service=lambda model, processed_layout: True,
     )
 
-    monkeypatch.setattr(loader, "_ensure_rfork_worker", lambda vc, mc: rfork_worker)
+    monkeypatch.setattr(loader, "_ensure_rfork_session", lambda vc, mc: rfork_session)
     monkeypatch.setattr(model_loader, "get_model", fake_get_model)
     monkeypatch.setattr(
         "vllm_ascend.model_loader.rfork.rfork_loader.get_ascend_config",
