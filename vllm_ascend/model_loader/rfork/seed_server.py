@@ -32,12 +32,14 @@ from fastapi import FastAPI
 from fastapi.responses import Response
 from vllm.logger import logger
 
+from vllm_ascend.model_loader.rfork.types import SeedTransferInfo
+
 SERVER_STARTUP_QUEUE_TIMEOUT_SEC = 15.0
 SERVER_STOP_TIMEOUT_SEC = 5.0
 HEALTH_POLL_INTERVAL_SEC = 0.01
 
 
-@dataclass
+@dataclass(slots=True)
 class _ServerStartup:
     server: uvicorn.Server
     sock: socket.socket
@@ -71,26 +73,6 @@ class RForkSeedServerHandle:
     @property
     def is_alive(self) -> bool:
         return self.thread.is_alive()
-
-    def __int__(self) -> int:
-        # Compatibility for integrations that historically treated
-        # start_rfork_server's return value as a port number.
-        return self.port
-
-    def __index__(self) -> int:
-        return self.port
-
-    def __gt__(self, other: object) -> bool:
-        return self.port > int(other)  # type: ignore[arg-type]
-
-    def __ge__(self, other: object) -> bool:
-        return self.port >= int(other)  # type: ignore[arg-type]
-
-    def __lt__(self, other: object) -> bool:
-        return self.port < int(other)  # type: ignore[arg-type]
-
-    def __le__(self, other: object) -> bool:
-        return self.port <= int(other)  # type: ignore[arg-type]
 
     def stop(self, timeout: float = SERVER_STOP_TIMEOUT_SEC) -> bool:
         """Request shutdown and join the server thread, idempotently."""
@@ -155,7 +137,7 @@ def _health_url(bind_host: str, sock: socket.socket, port: int) -> str:
 def start_fastapi_server(
     port_queue: queue.Queue[Any],
     local_seed_key,
-    info,
+    info: SeedTransferInfo,
     *,
     bind_host: str = "0.0.0.0",
     stop_event: threading.Event | None = None,
@@ -169,11 +151,8 @@ def start_fastapi_server(
         logger.debug("[RFork Seed] Assigned dynamic port: %s", port)
 
         app = FastAPI()
-        rfork_transfer_engine_info = info
-        rfork_transfer_engine_shape_info = None
-        if isinstance(info, (list, tuple)) and len(info) == 3:
-            rfork_transfer_engine_info = (info[0], info[1])
-            rfork_transfer_engine_shape_info = info[2]
+        rfork_transfer_engine_info = (info.session_id, info.weights)
+        rfork_transfer_engine_shape_info = info.shapes
 
         @app.get("/get_rfork_transfer_engine_info")
         def get_rfork_transfer_engine_info(seed_key: str):
@@ -246,11 +225,11 @@ def _stop_startup_thread(
 
 def start_rfork_server(
     local_seed_key,
-    rfork_transfer_engine_info,
+    rfork_transfer_engine_info: SeedTransferInfo,
     health_timeout_sec: float = 30.0,
     *,
     bind_host: str = "0.0.0.0",
-) -> RForkSeedServerHandle | int:
+) -> RForkSeedServerHandle:
     if isinstance(health_timeout_sec, bool) or not isinstance(health_timeout_sec, (int, float)):
         raise ValueError("health_timeout_sec must be a finite positive number")
     if not math.isfinite(float(health_timeout_sec)) or float(health_timeout_sec) <= 0:
@@ -284,7 +263,7 @@ def start_rfork_server(
     except Exception as exc:
         logger.error("[RFork Seed] start server error for seed_key=%s: %s", local_seed_key, exc)
         _stop_startup_thread(thread, startup_state, startup_stop_event)
-        return -1
+        raise RuntimeError("RFork seed server failed to start") from exc
 
     handle = RForkSeedServerHandle(
         server=startup.server,
@@ -335,4 +314,4 @@ def start_rfork_server(
     # The timeout is a total budget for health, but cleanup gets its own small
     # bounded budget so the caller never inherits a live server thread.
     handle.stop()
-    return -1
+    raise RuntimeError(f"RFork seed server health check failed: {last_error}")
