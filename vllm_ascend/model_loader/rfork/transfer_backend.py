@@ -15,6 +15,7 @@
 #
 
 import math
+import threading
 import time
 from bisect import bisect_left
 from collections.abc import Mapping
@@ -495,7 +496,10 @@ class RForkTransferBackend:
         self.rfork_transfer_engine_weights_info_dict = None
         self.rfork_transfer_engine_weights_shape_dict = None
         self.registered_weight_blocks = []
+        self.registered_memory_addresses = []
         self._registered_transferable_tensors: list[tuple[str, torch.Tensor]] | None = None
+        self._memory_registration_cls: Any | None = None
+        self._lifecycle_lock = threading.RLock()
         self.request_timeout_sec = _validate_request_timeout(request_timeout_sec)
         self.auth_token = auth_token if isinstance(auth_token, str) else ""
         self._is_initialized = False
@@ -503,11 +507,16 @@ class RForkTransferBackend:
 
     def init_transfer_engine(self):
         try:
-            from yr.datasystem import TransferEngine  # type: ignore[import-not-found]
+            from yr.datasystem import (  # type: ignore[import-not-found]
+                ErrorCode,
+                MemoryRegistration,
+                TransferEngine,
+            )
         except ImportError as e:
             err_msg = (
-                "Failed to import TransferEngine from yr.datasystem. "
-                "Please install @yuanrong-datasystem/transfer_engine."
+                "Failed to import the required TransferEngine, MemoryRegistration, and ErrorCode APIs from "
+                "yr.datasystem. Install a YuanRong TransferEngine release that supports RFork extended memory "
+                "registration and explicit finalization."
             )
             logger.error(err_msg)
             raise ImportError(err_msg) from e
@@ -526,6 +535,8 @@ class RForkTransferBackend:
 
         self.rfork_transfer_engine = transfer_engine
         self.rfork_transfer_engine_session_id = local_hostname
+        self._memory_registration_cls = MemoryRegistration
+        self._not_ready_error_code = ErrorCode.kNotReady
         self._is_initialized = True
 
     def is_initialized(self) -> bool:
@@ -536,7 +547,25 @@ class RForkTransferBackend:
             raise RuntimeError("TransferEngine is not initialized.")
         return self.rfork_transfer_engine
 
+    def _get_lifecycle_lock(self) -> threading.RLock:
+        lock = getattr(self, "_lifecycle_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._lifecycle_lock = lock
+        return lock
+
+    def _clear_registration_state(self) -> None:
+        self.rfork_transfer_engine_weights_info_dict = None
+        self.rfork_transfer_engine_weights_shape_dict = None
+        self.registered_weight_blocks = []
+        self.registered_memory_addresses = []
+        self._registered_transferable_tensors = None
+
     def register_memory_region(self, model, processed_layout: bool):
+        with self._get_lifecycle_lock():
+            return self._register_memory_region_locked(model, processed_layout)
+
+    def _register_memory_region_locked(self, model, processed_layout: bool):
         # A failed unregister deliberately leaves this state intact so it can
         # be retried.  Never replace it with a new registration.
         if getattr(self, "registered_weight_blocks", None):
@@ -634,20 +663,48 @@ class RForkTransferBackend:
             logger.error("RFork found no allocator blocks for %d transferable tensors", len(transferable_tensors))
             return False
 
-        addresses, sizes = zip(*merged_blocks)
+        logical_registrations: list[tuple[int, int, int, int]] = []
+        for tensor_start, tensor_end in sorted(set(tensor_ranges)):
+            backing_start, backing_size = next(
+                (start, size) for start, size in merged_blocks if start <= tensor_start and tensor_end <= start + size
+            )
+            if (
+                logical_registrations
+                and logical_registrations[-1][2:] == (backing_start, backing_size)
+                and tensor_start <= logical_registrations[-1][0] + logical_registrations[-1][1]
+            ):
+                logical_start, logical_size, _, _ = logical_registrations[-1]
+                logical_registrations[-1] = (
+                    logical_start,
+                    max(logical_start + logical_size, tensor_end) - logical_start,
+                    backing_start,
+                    backing_size,
+                )
+            else:
+                logical_registrations.append((tensor_start, tensor_end - tensor_start, backing_start, backing_size))
+
+        memory_registration_cls = self._memory_registration_cls
+        batch_register_memory_ex = getattr(transfer_engine, "batch_register_memory_ex", None)
+        if memory_registration_cls is None or not callable(batch_register_memory_ex):
+            logger.error(
+                "RFork requires YuanRong TransferEngine with MemoryRegistration and batch_register_memory_ex support."
+            )
+            return False
         try:
-            ret = transfer_engine.batch_register_memory(addresses, sizes)
+            registrations = [memory_registration_cls(*registration) for registration in logical_registrations]
+            ret = batch_register_memory_ex(registrations)
+            registered_memory_addresses = [registration[0] for registration in logical_registrations]
         except Exception as e:
             logger.error(
-                "batch_register_memory raised for %d blocks: %s",
-                len(merged_blocks),
+                "TransferEngine memory registration raised for %d logical regions: %s",
+                len(logical_registrations),
                 e,
             )
             return False
         if ret.is_error():
             logger.error(
-                "batch_register_memory failed for %d blocks, ret: %s",
-                len(merged_blocks),
+                "TransferEngine memory registration failed for %d logical regions, ret: %s",
+                len(logical_registrations),
                 ret.to_string(),
             )
             return False
@@ -657,6 +714,7 @@ class RForkTransferBackend:
         self.rfork_transfer_engine_weights_info_dict = weight_mr_dict
         self.rfork_transfer_engine_weights_shape_dict = weight_shape_dict
         self.registered_weight_blocks = merged_blocks
+        self.registered_memory_addresses = registered_memory_addresses
         self._registered_transferable_tensors = transferable_tensors
         logger.info(
             "register_memory_region time: %.4fs, weights: %d",
@@ -666,18 +724,23 @@ class RForkTransferBackend:
         return True
 
     def unregister_memory_region(self) -> bool:
+        with self._get_lifecycle_lock():
+            return self._unregister_memory_region_locked()
+
+    def _unregister_memory_region_locked(self) -> bool:
         transfer_engine = self._get_transfer_engine()
         start_unreg_mr_time = time.perf_counter()
         if not getattr(self, "registered_weight_blocks", None):
-            self.rfork_transfer_engine_weights_info_dict = None
-            self.rfork_transfer_engine_weights_shape_dict = None
-            self._registered_transferable_tensors = None
+            self._clear_registration_state()
             logger.debug("unregister_memory_region skipped because no blocks are registered.")
             return True
 
         registered_blocks = self.registered_weight_blocks
+        registered_memory_addresses = getattr(self, "registered_memory_addresses", None)
+        if not registered_memory_addresses:
+            registered_memory_addresses = [address for address, _ in registered_blocks]
         try:
-            ret = transfer_engine.batch_unregister_memory([address for address, _ in registered_blocks])
+            ret = transfer_engine.batch_unregister_memory(registered_memory_addresses)
         except Exception as e:
             # Keep all tracking and tensor owners for a subsequent retry.
             logger.error(
@@ -693,17 +756,67 @@ class RForkTransferBackend:
                 ret.to_string(),
             )
             return False
-        self.rfork_transfer_engine_weights_info_dict = None
-        self.rfork_transfer_engine_weights_shape_dict = None
-        self.registered_weight_blocks = []
-        self._registered_transferable_tensors = None
+        self._clear_registration_state()
         logger.info(
             "unregister_memory_region time: %.4fs",
             time.perf_counter() - start_unreg_mr_time,
         )
         return True
 
+    def finalize_transfer_engine(self, max_attempts: int = 2) -> bool:
+        if not isinstance(max_attempts, int) or isinstance(max_attempts, bool) or max_attempts <= 0:
+            raise ValueError("RFork TransferEngine finalize max_attempts must be a positive integer")
+        with self._get_lifecycle_lock():
+            if not getattr(self, "_is_initialized", False):
+                return True
+            transfer_engine = self._get_transfer_engine()
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    ret = transfer_engine.finalize()
+                except Exception as e:
+                    logger.error("TransferEngine finalize raised on attempt %d/%d: %s", attempt, max_attempts, e)
+                    return False
+                if not ret.is_error():
+                    self._clear_registration_state()
+                    self.rfork_transfer_engine_session_id = None
+                    self._is_initialized = False
+                    return True
+                logger.warning(
+                    "TransferEngine finalize failed on attempt %d/%d: %s",
+                    attempt,
+                    max_attempts,
+                    ret.to_string(),
+                )
+                not_ready_code = getattr(self, "_not_ready_error_code", None)
+                get_code = getattr(ret, "get_code", None)
+                if not_ready_code is None or not callable(get_code) or get_code() != not_ready_code:
+                    return False
+            return False
+
     def recv_from_source(
+        self,
+        model,
+        seed_instance_ip,
+        seed_instance_service_port,
+        local_seed_key,
+        processed_layout: bool,
+        manifest_metadata: Any | None = None,
+        request_timeout_sec: float | None = None,
+        auth_token: str | None = None,
+    ):
+        with self._get_lifecycle_lock():
+            return self._recv_from_source_locked(
+                model,
+                seed_instance_ip,
+                seed_instance_service_port,
+                local_seed_key,
+                processed_layout,
+                manifest_metadata,
+                request_timeout_sec,
+                auth_token,
+            )
+
+    def _recv_from_source_locked(
         self,
         model,
         seed_instance_ip,

@@ -289,7 +289,11 @@ class RForkWorker:
         """Release all RFork resources; safe for explicit and atexit calls."""
         service_ok = self.stop_seed_service()
         release_ok = self.post_transfer()
-        unregister_ok = self.reset_transfer_state() if service_ok else False
-        if not service_ok:
+        finalize_ok = self.transfer_backend.finalize_transfer_engine() if service_ok else False
+        if finalize_ok:
+            self.ready_to_start_seed_service = False
+        elif not service_ok:
             logger.warning("RFork shutdown retained registered memory because the seed server is still alive.")
-        return service_ok and release_ok and unregister_ok
+        else:
+            logger.warning("RFork shutdown retained TransferEngine state because finalization did not complete.")
+        return service_ok and release_ok and finalize_ok

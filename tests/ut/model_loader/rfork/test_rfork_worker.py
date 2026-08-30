@@ -48,6 +48,8 @@ class _FakeBackend:
         self.rfork_transfer_engine_weights_info_dict = {}
         self.rfork_transfer_engine_weights_shape_dict = {}
         self.unregister_calls = 0
+        self.finalize_result = True
+        self.finalize_calls = 0
 
     def is_initialized(self):
         return True
@@ -58,6 +60,10 @@ class _FakeBackend:
     def unregister_memory_region(self):
         self.unregister_calls += 1
         return self.unregister_result
+
+    def finalize_transfer_engine(self):
+        self.finalize_calls += 1
+        return self.finalize_result
 
 
 def _make_worker(monkeypatch, **kwargs):
@@ -200,4 +206,31 @@ def test_shutdown_retains_memory_when_server_cannot_stop(monkeypatch):
     worker.seed_server_handle = Handle()
     assert worker.shutdown() is False
     assert worker.transfer_backend.unregister_calls == 0
+    assert worker.transfer_backend.finalize_calls == 0
     assert worker.ready_to_start_seed_service is True
+
+
+def test_shutdown_finalizes_transfer_engine_without_unregistering_first(monkeypatch):
+    worker = _make_worker(monkeypatch)
+    worker.ready_to_start_seed_service = True
+
+    assert worker.shutdown() is True
+    assert worker.transfer_backend.finalize_calls == 1
+    assert worker.transfer_backend.unregister_calls == 0
+    assert worker.ready_to_start_seed_service is False
+
+
+def test_shutdown_preserves_transfer_state_when_finalize_is_not_ready(monkeypatch):
+    worker = _make_worker(monkeypatch)
+    worker.ready_to_start_seed_service = True
+    worker.transfer_backend.finalize_result = False
+
+    assert worker.shutdown() is False
+    assert worker.transfer_backend.finalize_calls == 1
+    assert worker.transfer_backend.unregister_calls == 0
+    assert worker.ready_to_start_seed_service is True
+
+    worker.transfer_backend.finalize_result = True
+    assert worker.shutdown() is True
+    assert worker.transfer_backend.finalize_calls == 2
+    assert worker.ready_to_start_seed_service is False
