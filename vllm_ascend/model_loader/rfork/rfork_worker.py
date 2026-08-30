@@ -14,6 +14,7 @@
 # limitations under the License.
 #
 
+import atexit
 import threading
 
 from vllm.logger import logger
@@ -60,6 +61,10 @@ class RForkWorker:
             pp_rank=pp_rank,
             ep_rank=ep_rank,
         )
+        # TransferEngine finalization may need to wait for remote read leases.
+        # Register cleanup as soon as this worker can own registered memory so
+        # interpreter shutdown does not depend on native object destruction.
+        atexit.register(self.shutdown)
 
     def is_seed_available(self) -> bool:
         self.rfork_seed = self.seed_protocol.get_seed()
@@ -118,6 +123,26 @@ class RForkWorker:
         self.seed_protocol.release_seed(self.rfork_seed)
         self.rfork_seed = None
         return True
+
+    def shutdown(self) -> bool:
+        """Release the planner lease and explicitly finalize TransferEngine."""
+        release_ok = False
+        try:
+            release_ok = self.post_transfer()
+        except Exception as e:
+            logger.warning("Failed to release RFork seed during shutdown: %s", e)
+
+        finalize_ok = False
+        try:
+            finalize_ok = self.transfer_backend.finalize_transfer_engine()
+        except Exception as e:
+            logger.warning("Failed to finalize RFork TransferEngine during shutdown: %s", e)
+
+        if finalize_ok:
+            self.ready_to_start_seed_service = False
+        else:
+            logger.warning("RFork shutdown retained TransferEngine registration state for safety.")
+        return release_ok and finalize_ok
 
     def start_seed_service(self, model, processed_layout: bool):
         if self.seed_service_started:

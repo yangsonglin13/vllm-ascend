@@ -399,6 +399,30 @@ def test_reset_transfer_state_survives_backend_exception():
     assert worker.ready_to_start_seed_service is False
 
 
+def test_rfork_worker_shutdown_finalizes_transfer_engine():
+    finalize_calls = []
+    worker: Any = RForkWorker.__new__(RForkWorker)
+    worker.rfork_seed = None
+    worker.ready_to_start_seed_service = True
+    worker.transfer_backend = SimpleNamespace(
+        finalize_transfer_engine=lambda: finalize_calls.append(True) or True,
+    )
+
+    assert worker.shutdown()
+    assert finalize_calls == [True]
+    assert worker.ready_to_start_seed_service is False
+
+
+def test_rfork_worker_shutdown_preserves_state_when_finalize_fails():
+    worker: Any = RForkWorker.__new__(RForkWorker)
+    worker.rfork_seed = None
+    worker.ready_to_start_seed_service = True
+    worker.transfer_backend = SimpleNamespace(finalize_transfer_engine=lambda: False)
+
+    assert not worker.shutdown()
+    assert worker.ready_to_start_seed_service is True
+
+
 def test_rfork_draft_load_passes_target_registered_blocks_to_worker(monkeypatch):
     import vllm.model_executor.model_loader as model_loader
 
