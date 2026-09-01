@@ -1,0 +1,32 @@
+vllm_ascend/model_loader/rfork/transfer_backend.py
+  s_add7ae26d83a8e::t_091cc2f4264897 453,460-476,478-481,483,485-496
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "5a3416aac2a1d8339a35507f6d572f35b825db7a",
+  "prompts": {},
+  "sessions": {
+    "s_add7ae26d83a8e": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a9627ae27bc3fc91014f0d6",
+        "model": "GLM-5.2"
+      },
+      "human_author": "yangsonglin13 <yangsonglin566@gmail.com>",
+      "custom_attributes": {
+        "external_session_id": "6a9627ae27bc3fc91014f0d6",
+        "client_type": "ide",
+        "operation_id": "6a96283b27bc3fc91014f0fe",
+        "tool_type": "agent",
+        "tool_use_id": "6a96283b27bc3fc91014f0fe",
+        "dedupe_key": "6a9627ae27bc3fc91014f0d6:6a96283b27bc3fc91014f0fe:afterEdit:5ac480b4",
+        "session_id": "6a9627ae27bc3fc91014f0d6",
+        "edit_kind": "file_edit",
+        "source_scene": "unknown",
+        "tool_id": "Edit",
+        "runtime_client": "trae-tob-git-ai"
+      }
+    }
+  }
+}
