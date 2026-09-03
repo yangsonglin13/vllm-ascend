@@ -251,6 +251,62 @@ def _block_contains_weight_ptr(address: int, size: int, sorted_weight_ptrs: list
     return index < len(sorted_weight_ptrs) and sorted_weight_ptrs[index] < address + size
 
 
+def _is_ptr_in_blocks(ptr: int, blocks: list[tuple[int, int]]) -> bool:
+    return any(address <= ptr < address + size for address, size in blocks)
+
+
+def _split_tensors_by_excluded_blocks(
+    transferable_tensors: list[tuple[str, torch.Tensor]],
+    excluded_blocks: list[tuple[int, int]],
+) -> tuple[list[tuple[str, torch.Tensor]], list[str]]:
+    """Split tensors into kept tensors and names whose storage is already registered.
+
+    Draft models can reference allocations owned by the target model. HCCL
+    global memory registration rejects overlapping device regions, so tensors
+    living inside ``excluded_blocks`` must not be registered again.
+    """
+    if not excluded_blocks:
+        return list(transferable_tensors), []
+
+    kept_tensors: list[tuple[str, torch.Tensor]] = []
+    excluded_names: list[str] = []
+    for name, tensor in transferable_tensors:
+        if _is_ptr_in_blocks(tensor.data_ptr(), excluded_blocks):
+            excluded_names.append(name)
+        else:
+            kept_tensors.append((name, tensor))
+    return kept_tensors, excluded_names
+
+
+def _subtract_weight_blocks(
+    weight_blocks: list[tuple[int, int]],
+    excluded_blocks: list[tuple[int, int]],
+) -> list[tuple[int, int]]:
+    """Cut excluded address ranges out of candidate registration blocks."""
+    if not weight_blocks or not excluded_blocks:
+        return list(weight_blocks)
+
+    sorted_excluded = sorted(excluded_blocks)
+    residual_blocks: list[tuple[int, int]] = []
+    for address, size in weight_blocks:
+        block_end = address + size
+        cursor = address
+        for excluded_address, excluded_size in sorted_excluded:
+            excluded_end = excluded_address + excluded_size
+            if excluded_end <= cursor:
+                continue
+            if excluded_address >= block_end:
+                break
+            if excluded_address > cursor:
+                residual_blocks.append((cursor, excluded_address - cursor))
+            cursor = max(cursor, excluded_end)
+            if cursor >= block_end:
+                break
+        if cursor < block_end:
+            residual_blocks.append((cursor, block_end - cursor))
+    return residual_blocks
+
+
 def _iter_transfer_chunks(
     weight_names: list[str],
     seed_ptr_list: list[int],
@@ -295,6 +351,7 @@ class RForkTransferBackend:
         self.rfork_transfer_engine_weights_info_dict = None
         self.rfork_transfer_engine_weights_shape_dict = None
         self.registered_weight_blocks = []
+        self.excluded_weight_blocks: list[tuple[int, int]] = []
         self._registered_transferable_tensors: list[tuple[str, torch.Tensor]] | None = None
         self._is_initialized = False
         self.init_transfer_engine()
@@ -334,15 +391,36 @@ class RForkTransferBackend:
             raise RuntimeError("TransferEngine is not initialized.")
         return self.rfork_transfer_engine
 
-    def register_memory_region(self, model, processed_layout: bool):
+    def register_memory_region(
+        self,
+        model,
+        processed_layout: bool,
+        exclude_blocks: list[tuple[int, int]] | None = None,
+    ):
         transfer_engine = self._get_transfer_engine()
         start_reg_mr_time = time.perf_counter()
         self._registered_transferable_tensors = None
 
+        # A draft model can reference allocations already registered by the
+        # target model in this process. HCCL rejects overlapping registrations,
+        # so these tensors and address ranges must not be registered again.
+        excluded_blocks = list(exclude_blocks) if exclude_blocks else []
+        self.excluded_weight_blocks = excluded_blocks
+
+        transferable_tensors, excluded_names = _split_tensors_by_excluded_blocks(
+            list(_iter_transferable_tensors(model, processed_layout)),
+            excluded_blocks,
+        )
+        if excluded_names:
+            logger.info(
+                "Skipping %d weights shared with the target model (already registered), e.g. %s",
+                len(excluded_names),
+                ", ".join(excluded_names[:3]),
+            )
+
         weight_mr_dict = {}
         weight_shape_dict = {}
         weight_addr_set = set()
-        transferable_tensors = list(_iter_transferable_tensors(model, processed_layout))
         for name, weight in transferable_tensors:
             weight_mr_dict[name] = (
                 weight.data_ptr(),
@@ -379,16 +457,24 @@ class RForkTransferBackend:
             if current_weight_block is not None:
                 weight_blocks_for_reg_mr.append(current_weight_block)
 
-        addresses, sizes = zip(*weight_blocks_for_reg_mr) if weight_blocks_for_reg_mr else ((), ())
-        ret = transfer_engine.batch_register_memory(addresses, sizes)
-        if ret.is_error():
-            self._registered_transferable_tensors = None
-            logger.error(
-                "batch_register_memory failed for %d blocks, ret: %s",
-                len(weight_blocks_for_reg_mr),
-                ret.to_string(),
+        weight_blocks_for_reg_mr = _subtract_weight_blocks(weight_blocks_for_reg_mr, excluded_blocks)
+
+        if weight_blocks_for_reg_mr:
+            addresses, sizes = zip(*weight_blocks_for_reg_mr)
+            ret = transfer_engine.batch_register_memory(addresses, sizes)
+            if ret.is_error():
+                self._registered_transferable_tensors = None
+                logger.error(
+                    "batch_register_memory failed for %d blocks, ret: %s",
+                    len(weight_blocks_for_reg_mr),
+                    ret.to_string(),
+                )
+                return False
+        else:
+            logger.info(
+                "No memory blocks left to register after excluding %d shared blocks.",
+                len(excluded_blocks),
             )
-            return False
 
         self.rfork_transfer_engine_weights_info_dict = weight_mr_dict
         self.rfork_transfer_engine_weights_shape_dict = weight_shape_dict
@@ -460,6 +546,18 @@ class RForkTransferBackend:
         for name, tensor in transferable_tensors:
             weight_info = seed_weight_info.get(name, None)
             if weight_info is None:
+                # Normal pre_transfer caches an already-filtered tensor list.
+                # This also handles direct/legacy callers that reconstruct the
+                # list after the draft seed excluded target-owned weights.
+                if _is_ptr_in_blocks(
+                    tensor.data_ptr(),
+                    getattr(self, "excluded_weight_blocks", None) or [],
+                ):
+                    logger.debug(
+                        "Skip RFork weight %s shared with the target model: not present in the seed manifest.",
+                        name,
+                    )
+                    continue
                 logger.error("Cannot find weight info for %s.", name)
                 return False
 

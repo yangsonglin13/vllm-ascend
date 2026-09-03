@@ -318,6 +318,24 @@ class RForkModelLoader(BaseModelLoader):
             )
         return rfork_worker
 
+    def _get_target_registered_blocks(
+        self,
+        vllm_config: VllmConfig,
+        model_config: ModelConfig,
+    ) -> list[tuple[int, int]]:
+        """Weight blocks registered by the target RFork worker in this process.
+
+        A draft model can reference device allocations that are already owned
+        by the target model. HCCL forbids registering overlapping device
+        memory twice, so the draft worker must exclude these blocks from its
+        own registration.
+        """
+        if not _is_draft_model(vllm_config, model_config):
+            return []
+        target_worker = getattr(self.load_config, "rfork_worker", None)
+        target_transfer_backend = getattr(target_worker, "transfer_backend", None)
+        return list(getattr(target_transfer_backend, "registered_weight_blocks", None) or [])
+
     def _requires_processed_layout_transfer(self, model_config: ModelConfig) -> bool:
         return getattr(model_config, "quantization", None) is not None
 
@@ -359,6 +377,7 @@ class RForkModelLoader(BaseModelLoader):
                     raise
 
             rfork_worker = self._ensure_rfork_worker(vllm_config, model_config)
+            rfork_worker.set_excluded_weight_blocks(self._get_target_registered_blocks(vllm_config, model_config))
             processed_layout_transfer = self._requires_processed_layout_transfer(model_config)
             try:
                 if not rfork_worker.is_seed_available():
