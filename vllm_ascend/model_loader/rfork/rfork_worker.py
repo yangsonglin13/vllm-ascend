@@ -46,6 +46,7 @@ class RForkWorker:
         self.transfer_backend = RForkTransferBackend()
         self.ready_to_start_seed_service = False
         self.seed_service_started = False
+        self._excluded_weight_blocks: list[tuple[int, int]] = []
         self.seed_timeout_sec = seed_timeout_sec
         self.seed_protocol = RForkSeedProtocol(
             disaggregation_mode=disaggregation_mode,
@@ -64,10 +65,23 @@ class RForkWorker:
         self.rfork_seed = self.seed_protocol.get_seed()
         return self.rfork_seed is not None
 
+    def set_excluded_weight_blocks(self, excluded_blocks: list[tuple[int, int]] | None) -> None:
+        """Set device-memory blocks already registered by the target model worker.
+
+        A draft model can reference allocations owned by the target model.
+        HCCL global memory registration rejects overlapping device regions, so
+        the draft worker must exclude these blocks from its own registration.
+        """
+        self._excluded_weight_blocks = list(excluded_blocks) if excluded_blocks else []
+
     def pre_transfer(self, model, processed_layout: bool) -> bool:
         try:
             assert self.transfer_backend.is_initialized(), "transfer_backend is not initialized, cannot pre_transfer."
-            result = self.transfer_backend.register_memory_region(model, processed_layout)
+            result = self.transfer_backend.register_memory_region(
+                model,
+                processed_layout,
+                self._excluded_weight_blocks,
+            )
             self.ready_to_start_seed_service = result
             return result
         except AssertionError as e:
