@@ -1,53 +1,7 @@
-tests/ut/model_loader/rfork/test_rfork_loader.py
-  s_e5f845234efb3b::t_d04c74e0e36148 657
-  s_e5f845234efb3b::t_047a48439dd6af 721
-  s_e5f845234efb3b::t_e5b1e568434d29 35
-  s_e5f845234efb3b::t_988a3247fa0e32 301-406
-tests/ut/model_loader/rfork/test_transfer_backend.py
-  s_e5f845234efb3b::t_3b2f5e2633f243 30-31
-  s_e5f845234efb3b::t_92d7bea44f1b0b 195-209,211-389
-  s_e5f845234efb3b::t_b6362709c98da3 210
-vllm_ascend/model_loader/rfork/rfork_worker.py
-  s_e5f845234efb3b::t_f83d1b80ab7d39 49
-  s_e5f845234efb3b::t_ade0c38390ddf5 68-76,80-84
-vllm_ascend/model_loader/rfork/transfer_backend.py
-  s_e5f845234efb3b::t_f1673efdd9a3e3 552-561
-  s_e5f845234efb3b::t_9680c36ba0dec7 254-309
-  s_e5f845234efb3b::t_feeef8446d3273 407-420
-  s_e5f845234efb3b::t_d54d2b79e64cee 354
-  s_e5f845234efb3b::t_a9637f02713de5 460-476
-  s_e5f845234efb3b::t_72073dc44f7341 404-406
-  s_e5f845234efb3b::t_5c8b032727e5e4 549-551
-vllm_ascend/model_loader/rfork/rfork_loader.py
-  s_e5f845234efb3b::t_f0e80d2aee6a13 319-336
-  s_e5f845234efb3b::t_e40dcaa31b8f02 378-380
 ---
 {
   "schema_version": "authorship/3.0.0",
   "git_ai_version": "1.6.2",
   "base_commit_sha": "192af99a92194378beb4a801dbaa0c12fc36a9c8",
-  "prompts": {},
-  "sessions": {
-    "s_e5f845234efb3b": {
-      "agent_id": {
-        "tool": "trae",
-        "id": "6a98ec7027bc3fc9101506d9",
-        "model": "glm-5.3__max"
-      },
-      "human_author": "yangsonglin13 <yangsonglin566@gmail.com>",
-      "custom_attributes": {
-        "tool_type": "agent",
-        "client_type": "ide",
-        "external_session_id": "6a98ec7027bc3fc9101506d9",
-        "dedupe_key": "6a98ec7027bc3fc9101506d9:6a99571d27bc3fc9101507a5:afterEdit:632a5657",
-        "operation_id": "6a99571d27bc3fc9101507a5",
-        "edit_kind": "file_edit",
-        "source_scene": "unknown",
-        "tool_use_id": "6a99571d27bc3fc9101507a5",
-        "session_id": "6a98ec7027bc3fc9101506d9",
-        "runtime_client": "trae-tob-git-ai",
-        "tool_id": "Edit"
-      }
-    }
-  }
+  "prompts": {}
 }
