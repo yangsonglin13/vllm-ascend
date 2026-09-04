@@ -1,0 +1,61 @@
+vllm_ascend/model_loader/rfork/rfork_worker.py
+  s_da1950eb7bc49f::t_b615593594d4ca 85-86
+  s_da1950eb7bc49f::t_74b6b17a0dcbdf 49,68-70,74-78,88,91,93
+tests/ut/model_loader/rfork/test_rfork_loader.py
+  s_da1950eb7bc49f::t_766ecaaf1d1b0e 420-441,692,696,756,758
+  s_da1950eb7bc49f::t_2af06006625b12 305,315,317,368-401
+  s_da1950eb7bc49f::t_b3c04f881835cc 304
+  s_da1950eb7bc49f::t_6e149fdad99fbd 306-308,312-314
+  s_da1950eb7bc49f::t_5f483b7c4f1fbc 316
+  s_da1950eb7bc49f::t_ecf08ee446cf93 318-320,365-367
+  s_da1950eb7bc49f::t_3386cdd3f0768c 402-404,417-419
+vllm_ascend/model_loader/rfork/rfork_loader.py
+  s_da1950eb7bc49f::t_1d4830b5b76866 413-417
+  s_da1950eb7bc49f::t_ec8146b749e8b9 445-449
+vllm_ascend/model_loader/rfork/transfer_backend.py
+  s_da1950eb7bc49f::t_4224c4bf0dfa0d 398-405,415,419,472,474
+  s_da1950eb7bc49f::t_b615593594d4ca 260,275-302,347,387-392,397
+  s_da1950eb7bc49f::t_5340e89af8f984 490,503-516
+  s_da1950eb7bc49f::t_f993d1695f63b5 257-259
+  s_da1950eb7bc49f::t_9c5604af42f43f 261-263,272-274
+  s_da1950eb7bc49f::t_c3fe63ecd2224a 406-408,412-414
+  s_da1950eb7bc49f::t_c99eb3369e0ac1 416-418
+  s_da1950eb7bc49f::t_624e55ae3ec2a7 420
+  s_da1950eb7bc49f::t_25808bce9f8735 469-471
+  s_da1950eb7bc49f::t_2f80abbe6378ef 473
+  s_da1950eb7bc49f::t_62e331d7723a49 475-476
+tests/ut/model_loader/rfork/test_transfer_backend.py
+  s_da1950eb7bc49f::t_4ebd7d9cf9ca4a 339,365
+  s_da1950eb7bc49f::t_b615593594d4ca 173-176,195-199,219-223
+  s_da1950eb7bc49f::t_4831691d778321 164-172,177-194,200-218,224-227
+  s_da1950eb7bc49f::t_9446daad32a50c 30-31,259-338,340-364,366-385,387-461
+  s_da1950eb7bc49f::t_23d17478df74ec 386
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "c88076653c9d19eeb49874d4c369809babca1e22",
+  "prompts": {},
+  "sessions": {
+    "s_da1950eb7bc49f": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a9a6bf771811b426ebc17d6",
+        "model": "glm-5.3__max"
+      },
+      "human_author": "yangsonglin13 <yangsonglin566@gmail.com>",
+      "custom_attributes": {
+        "session_id": "6a9a6bf771811b426ebc17d6",
+        "edit_kind": "bash",
+        "tool_name": "RunCommand",
+        "client_type": "ide",
+        "tool_use_id": "6a9a6ee871811b426ebc1847",
+        "display_model_name": "GLM-5.3",
+        "operation_id": "6a9a6ee871811b426ebc1847",
+        "source_scene": "agent",
+        "runtime_client": "trae-tob-git-ai",
+        "external_session_id": "6a9a6bf771811b426ebc17d6"
+      }
+    }
+  }
+}
