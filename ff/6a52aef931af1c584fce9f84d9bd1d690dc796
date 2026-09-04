@@ -1,0 +1,40 @@
+vllm_ascend/model_loader/rfork/rfork_loader.py
+  s_dc6090e1c97315::t_ae300e3ee0ced0 214-230
+tests/ut/model_loader/rfork/test_transfer_backend.py
+  s_dc6090e1c97315::t_ae300e3ee0ced0 166-313,319-320,330-334,338-339,342
+vllm_ascend/model_loader/rfork/transfer_backend.py
+  s_dc6090e1c97315::t_ae300e3ee0ced0 215-270,515
+tests/ut/model_loader/rfork/test_rfork_loader.py
+  s_dc6090e1c97315::t_ae300e3ee0ced0 300-402
+vllm_ascend/model_loader/rfork/rfork_worker.py
+  s_dc6090e1c97315::t_ae300e3ee0ced0 49,68-76,80-82
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "ff6a52aef931af1c584fce9f84d9bd1d690dc796",
+  "prompts": {},
+  "sessions": {
+    "s_dc6090e1c97315": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a997d84c1c7d042b0ac2b14",
+        "model": "glm-5.3__max"
+      },
+      "human_author": "yangsonglin13 <yangsonglin566@gmail.com>",
+      "custom_attributes": {
+        "edit_kind": "file_edit",
+        "tool_type": "agent",
+        "runtime_client": "trae-tob-git-ai",
+        "client_type": "ide",
+        "source_scene": "unknown",
+        "operation_id": "6a997e66c1c7d042b0ac2bb8",
+        "dedupe_key": "6a997d84c1c7d042b0ac2b14:6a997e66c1c7d042b0ac2bb8:afterEdit:5ac480b4",
+        "tool_id": "Edit",
+        "external_session_id": "6a997d84c1c7d042b0ac2b14",
+        "tool_use_id": "6a997e66c1c7d042b0ac2bb8",
+        "session_id": "6a997d84c1c7d042b0ac2b14"
+      }
+    }
+  }
+}
