@@ -1,29 +1,7 @@
-tests/ut/distributed/ascend_store/test_kv_transfer.py
-  s_91ce19844f562a::t_5dd93608ab308c 20,33,42,54,170-179,490-532,669-715
-tests/ut/distributed/mooncake/test_mooncake_kv_transfer.py
-  s_91ce19844f562a::t_7fada0fcb08134 21-22
-tests/ut/distributed/test_yuanrong_backend.py
-  s_91ce19844f562a::t_b4f9154b2a956d 29-32,229-235
-vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/base.py
-  s_91ce19844f562a::t_74c887c6699af1 16-17
-vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/yuanrong_backend.py
-  s_91ce19844f562a::t_d854eaefc2e0a2 53-55,61,72
-vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/kv_transfer.py
-  s_91ce19844f562a::t_0a8ca8ed6159ee 540-550,793,1158
 ---
 {
   "schema_version": "authorship/3.0.0",
   "git_ai_version": "1.6.2",
   "base_commit_sha": "3f92c74a3d3af9b92dc8ddb7e4009071a3de0e3b",
-  "prompts": {},
-  "sessions": {
-    "s_91ce19844f562a": {
-      "agent_id": {
-        "tool": "trae",
-        "id": "6a9a3cd071811b426ebc16b3",
-        "model": "glm-5.3__max"
-      },
-      "human_author": "yangsonglin13 <yangsonglin566@gmail.com>"
-    }
-  }
+  "prompts": {}
 }
