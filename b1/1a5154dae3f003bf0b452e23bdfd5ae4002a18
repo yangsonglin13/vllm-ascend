@@ -1,0 +1,34 @@
+tests/ut/model_loader/rfork/test_transfer_backend.py
+  s_dc6090e1c97315::t_ae300e3ee0ced0 17-18,86,88-90,96-97,108,114-140,147
+vllm_ascend/model_loader/rfork/transfer_backend.py
+  s_dc6090e1c97315::t_ae300e3ee0ced0 413,420-436,438-441,443-451,453-456
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "b11a5154dae3f003bf0b452e23bdfd5ae4002a18",
+  "prompts": {},
+  "sessions": {
+    "s_dc6090e1c97315": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a997d84c1c7d042b0ac2b14",
+        "model": "glm-5.3__max"
+      },
+      "human_author": "yangsonglin13 <yangsonglin566@gmail.com>",
+      "custom_attributes": {
+        "tool_type": "agent",
+        "dedupe_key": "6a997d84c1c7d042b0ac2b14:6a997e66c1c7d042b0ac2bb8:afterEdit:5ac480b4",
+        "operation_id": "6a997e66c1c7d042b0ac2bb8",
+        "client_type": "ide",
+        "source_scene": "unknown",
+        "edit_kind": "file_edit",
+        "tool_use_id": "6a997e66c1c7d042b0ac2bb8",
+        "tool_id": "Edit",
+        "runtime_client": "trae-tob-git-ai",
+        "session_id": "6a997d84c1c7d042b0ac2b14",
+        "external_session_id": "6a997d84c1c7d042b0ac2b14"
+      }
+    }
+  }
+}
