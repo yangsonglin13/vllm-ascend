@@ -14,6 +14,10 @@
 # limitations under the License.
 #
 
+import hashlib
+import json
+import math
+import threading
 import time
 from urllib.error import HTTPError
 
@@ -23,15 +27,15 @@ from vllm.utils.network_utils import get_ip
 
 REQUEST_TIMEOUT_SEC = 10.0
 HEARTBEAT_LOG_EVERY_N = 4
+RELEASE_MAX_RETRIES = 3
+RELEASE_RETRY_BACKOFF_SEC = 0.1
 
 
 def get_local_seed_key(
-    disaggregation_mode: str,
-    node_rank: int,
     tp_rank: int,
     model_url: str,
     model_deploy_strategy_name: str,
-    seed_key_separator: str = "$",
+    compatibility_fingerprint: str,
     is_draft_worker: bool = False,
     pp_rank: int | None = None,
     ep_rank: int | None = None,
@@ -46,52 +50,73 @@ def get_local_seed_key(
         )
         logger.error(err_msg)
         raise RuntimeError(err_msg)
+    if not isinstance(compatibility_fingerprint, str) or not compatibility_fingerprint:
+        raise RuntimeError(
+            "RFork requires a compatibility fingerprint for the seed key; "
+            "build one with _build_rfork_compatibility_fingerprint()."
+        )
 
-    seed_key = f"{model_url}{seed_key_separator}{model_deploy_strategy_name}"
-    key_parts = [disaggregation_mode, str(node_rank)]
-    if pp_rank is not None:
-        key_parts.append(f"pp{pp_rank}")
-    key_parts.append(str(tp_rank))
-    if ep_rank is not None:
-        key_parts.append(f"ep{ep_rank}")
-    if is_draft_worker:
-        key_parts.append("draft")
-    return f"{seed_key}{seed_key_separator}{seed_key_separator.join(key_parts)}"
+    descriptor = {
+        "compatibility_fingerprint": str(compatibility_fingerprint),
+        "model_url": model_url,
+        "model_deploy_strategy_name": model_deploy_strategy_name,
+        "tp_rank": tp_rank,
+        "pp_rank": pp_rank,
+        "ep_rank": ep_rank,
+        "is_draft_worker": bool(is_draft_worker),
+    }
+    canonical_descriptor = json.dumps(descriptor, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(canonical_descriptor.encode("utf-8")).hexdigest()
 
 
 class RForkSeedProtocol:
     def __init__(
         self,
         *,
-        disaggregation_mode: str,
-        node_rank: int,
         tp_rank: int,
         scheduler_url: str,
         model_url: str,
         model_deploy_strategy_name: str,
-        seed_key_separator: str = "$",
+        compatibility_fingerprint: str,
         is_draft_worker: bool = False,
         pp_rank: int | None = None,
         ep_rank: int | None = None,
+        request_timeout_sec: float = REQUEST_TIMEOUT_SEC,
+        release_max_retries: int = RELEASE_MAX_RETRIES,
+        release_retry_backoff_sec: float = RELEASE_RETRY_BACKOFF_SEC,
     ):
-        self.disaggregation_mode = disaggregation_mode
-        self.node_rank = node_rank
         self.tp_rank = tp_rank
         self.pp_rank = pp_rank
         self.ep_rank = ep_rank
         self.scheduler_url = scheduler_url
         self.model_url = model_url
         self.model_deploy_strategy_name = model_deploy_strategy_name
-        self.seed_key_separator = seed_key_separator
         self.is_draft_worker = is_draft_worker
+        self.compatibility_fingerprint = compatibility_fingerprint
+        if isinstance(request_timeout_sec, bool) or not isinstance(request_timeout_sec, (int, float)):
+            raise ValueError("request_timeout_sec must be a finite positive number")
+        if not math.isfinite(float(request_timeout_sec)) or float(request_timeout_sec) <= 0:
+            raise ValueError("request_timeout_sec must be a finite positive number")
+        if (
+            isinstance(release_max_retries, bool)
+            or not isinstance(release_max_retries, int)
+            or release_max_retries <= 0
+        ):
+            raise ValueError("release_max_retries must be a positive integer")
+        if isinstance(release_retry_backoff_sec, bool) or not isinstance(release_retry_backoff_sec, (int, float)):
+            raise ValueError("release_retry_backoff_sec must be a finite non-negative number")
+        if not math.isfinite(float(release_retry_backoff_sec)) or float(release_retry_backoff_sec) < 0:
+            raise ValueError("release_retry_backoff_sec must be a finite non-negative number")
+        self._request_timeout = float(request_timeout_sec)
+        self.release_max_retries = release_max_retries
+        self.release_retry_backoff_sec = float(release_retry_backoff_sec)
+        self._last_report: dict[str, object] | None = None
 
         self._local_seed_key = get_local_seed_key(
-            disaggregation_mode=self.disaggregation_mode,
-            node_rank=self.node_rank,
             tp_rank=self.tp_rank,
             model_url=self.model_url,
             model_deploy_strategy_name=self.model_deploy_strategy_name,
-            seed_key_separator=self.seed_key_separator,
+            compatibility_fingerprint=self.compatibility_fingerprint,
             is_draft_worker=self.is_draft_worker,
             pp_rank=self.pp_rank,
             ep_rank=self.ep_rank,
@@ -100,9 +125,8 @@ class RForkSeedProtocol:
     def get_local_seed_key(self) -> str:
         return self._local_seed_key
 
-    @staticmethod
-    def _request_timeout_sec() -> float:
-        return REQUEST_TIMEOUT_SEC
+    def _request_timeout_sec(self) -> float:
+        return self._request_timeout
 
     def _ensure_scheduler_url_set(self) -> None:
         if not self.scheduler_url:
@@ -130,6 +154,13 @@ class RForkSeedProtocol:
             seed_port = response.headers.get("SEED_PORT")
             user_id = response.headers.get("USER_ID")
             seed_rank = response.headers.get("SEED_RANK")
+            if not seed_ip or not seed_port or not user_id or not seed_rank:
+                raise RuntimeError("Planner returned incomplete seed lease headers")
+            try:
+                if int(seed_port) <= 0 or int(seed_rank) < 0:
+                    raise ValueError
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError("Planner returned invalid seed lease headers") from exc
             logger.debug(
                 "seed_ip: %s, seed_port: %s, user_id: %s, seed_rank: %s",
                 seed_ip,
@@ -142,6 +173,7 @@ class RForkSeedProtocol:
                 "seed_port": seed_port,
                 "user_id": user_id,
                 "seed_rank": seed_rank,
+                "seed_key": seed_key,
             }
 
         except RuntimeError as e:
@@ -155,70 +187,122 @@ class RForkSeedProtocol:
             return None
 
     def release_seed(self, seed) -> bool:
+        if not isinstance(seed, dict):
+            return False
+
         try:
             self._ensure_scheduler_url_set()
             user_id = seed["user_id"]
             seed_ip = seed["seed_ip"]
             seed_port = str(seed["seed_port"])
             seed_rank = str(seed["seed_rank"])
-
-            response = requests.post(
-                f"{self.scheduler_url}/put_seed",
-                headers={
-                    "SEED_IP": seed_ip,
-                    "SEED_PORT": seed_port,
-                    "USER_ID": user_id,
-                    "SEED_RANK": seed_rank,
-                },
-                timeout=self._request_timeout_sec(),
-            )
-
-            if response.status_code != 200:
-                raise RuntimeError(f"Failed to release seed to the planner, {response.status_code}")
-            return True
-        except RuntimeError as e:
-            logger.exception("release_seed to planner RuntimeError: %s", e)
-            return False
-        except HTTPError as e:
-            logger.exception("release_seed to planner HTTPError: %s", e)
-            return False
-        except Exception as e:
-            logger.exception("release_seed to planner Exception: %s", e)
+        except (RuntimeError, KeyError, TypeError) as e:
+            logger.warning("release_seed input/setup failed: %s", e)
             return False
 
-    def report_seed(self, port: int, sleep_interval: int = 30):
-        heartbeat_idx = 0
-        log_every_n = HEARTBEAT_LOG_EVERY_N
-        try:
-            self._ensure_scheduler_url_set()
-            seed_ip = get_ip()
-            seed_key = self.get_local_seed_key()
-            logger.debug("[rfork_heartbeat] reporting seed key: %s", seed_key)
-        except Exception as e:
-            logger.exception("report_seed setup Exception: %s", e)
-            return
-
-        while True:
-            heartbeat_idx += 1
-            result = False
+        headers = {
+            "SEED_IP": seed_ip,
+            "SEED_PORT": seed_port,
+            "USER_ID": user_id,
+            "SEED_RANK": seed_rank,
+        }
+        for attempt in range(self.release_max_retries):
             try:
                 response = requests.post(
-                    f"{self.scheduler_url}/add_seed",
-                    headers={
-                        "SEED_KEY": seed_key,
-                        "SEED_IP": seed_ip,
-                        "SEED_PORT": str(port),
-                        "SEED_RANK": str(self.tp_rank),
-                        "SEED_REFCNT": str(0),
-                    },
+                    f"{self.scheduler_url}/put_seed",
+                    headers=headers,
                     timeout=self._request_timeout_sec(),
                 )
                 if response.status_code == 200:
-                    result = True
-            except HTTPError as e:
-                logger.warning("report_seed to planner HTTPError: %s", e)
+                    return True
+                # Lease release is idempotent. A 404 commonly means the
+                # planner's lease TTL already reclaimed the lease, which is
+                # the desired final state and must not pin the worker forever.
+                if response.status_code == 404:
+                    logger.info("release_seed lease was already reclaimed by the planner.")
+                    return True
+                logger.warning(
+                    "release_seed attempt %d/%d returned status=%s",
+                    attempt + 1,
+                    self.release_max_retries,
+                    response.status_code,
+                )
             except Exception as e:
-                logger.warning("report_seed to planner Exception: %s", e)
+                # requests raises several concrete exception types depending
+                # on the transport; all are bounded by the request timeout.
+                logger.warning(
+                    "release_seed attempt %d/%d failed: %s",
+                    attempt + 1,
+                    self.release_max_retries,
+                    e,
+                )
+            if attempt + 1 < self.release_max_retries and self.release_retry_backoff_sec > 0:
+                time.sleep(self.release_retry_backoff_sec * (attempt + 1))
+        return False
+
+    def remove_seed(
+        self,
+        seed: dict[str, object] | None = None,
+        *,
+        port: int | None = None,
+        seed_ip: str | None = None,
+        seed_rank: int | None = None,
+    ) -> bool:
+        """Best-effort removal of this worker's advertised seed."""
+        try:
+            self._ensure_scheduler_url_set()
+            report = self._last_report or {}
+            if isinstance(seed, dict):
+                port = port if port is not None else seed.get("seed_port")  # type: ignore[assignment]
+                seed_ip = seed_ip or seed.get("seed_ip")  # type: ignore[assignment]
+                seed_rank = seed_rank if seed_rank is not None else seed.get("seed_rank")  # type: ignore[assignment]
+            reported_port = port if port is not None else report.get("seed_port")
+            reported_ip = seed_ip or report.get("seed_ip") or get_ip()
+            reported_rank = seed_rank if seed_rank is not None else report.get("seed_rank", self.tp_rank)
+            if reported_port is None:
+                return False
+            headers = {
+                "SEED_KEY": self.get_local_seed_key(),
+                "SEED_IP": str(reported_ip),
+                "SEED_PORT": str(reported_port),
+                "SEED_RANK": str(reported_rank),
+            }
+            response = requests.post(
+                f"{self.scheduler_url}/remove_seed",
+                headers=headers,
+                timeout=self._request_timeout_sec(),
+            )
+            # Removal is idempotent: a planner that already GC'd the seed is
+            # still in the desired state.
+            if response.status_code not in (200, 404):
+                logger.warning("remove_seed returned status=%s", response.status_code)
+                return False
+            self._last_report = None
+            return True
+        except Exception as e:
+            logger.warning("remove_seed best-effort cleanup failed: %s", e)
+            return False
+
+    def report_seed(
+        self,
+        port: int,
+        sleep_interval: float = 30,
+        stop_event: threading.Event | None = None,
+        seed_ip: str | None = None,
+        initial_delay: bool = False,
+    ):
+        heartbeat_idx = 0
+        log_every_n = HEARTBEAT_LOG_EVERY_N
+        if initial_delay:
+            if stop_event is not None:
+                if stop_event.wait(sleep_interval):
+                    return
+            else:
+                time.sleep(sleep_interval)
+        while stop_event is None or not stop_event.is_set():
+            heartbeat_idx += 1
+            result = self.report_seed_once(port, seed_ip=seed_ip)
+            seed_key = self.get_local_seed_key()
 
             # Keep heartbeat frequency unchanged, but reduce log noise.
             # Always print failures immediately; keep success in debug logs.
@@ -239,4 +323,41 @@ class RForkSeedProtocol:
                     log_every_n,
                     seed_key,
                 )
-            time.sleep(sleep_interval)
+            if stop_event is not None:
+                stop_event.wait(sleep_interval)
+            else:
+                time.sleep(sleep_interval)
+
+    def report_seed_once(self, port: int, seed_ip: str | None = None) -> bool:
+        """Advertise one healthy seed, returning whether the planner accepted it."""
+
+        try:
+            self._ensure_scheduler_url_set()
+            advertised_ip = seed_ip or get_ip()
+            seed_key = self.get_local_seed_key()
+            logger.debug("[rfork_heartbeat] reporting seed key: %s", seed_key)
+            response = requests.post(
+                f"{self.scheduler_url}/add_seed",
+                headers={
+                    "SEED_KEY": seed_key,
+                    "SEED_IP": advertised_ip,
+                    "SEED_PORT": str(port),
+                    "SEED_RANK": str(self.tp_rank),
+                    "SEED_REFCNT": str(0),
+                },
+                timeout=self._request_timeout_sec(),
+            )
+            if response.status_code != 200:
+                logger.warning("report_seed to planner returned status=%s", response.status_code)
+                return False
+            self._last_report = {
+                "seed_ip": advertised_ip,
+                "seed_port": port,
+                "seed_rank": self.tp_rank,
+            }
+            return True
+        except HTTPError as e:
+            logger.warning("report_seed to planner HTTPError: %s", e)
+        except Exception as e:
+            logger.warning("report_seed to planner Exception: %s", e)
+        return False
