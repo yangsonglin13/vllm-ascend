@@ -1,0 +1,112 @@
+docs/source/locale/zh_CN/LC_MESSAGES/user_guide/feature_guide/rfork.po
+  s_75392099f39946::t_d9b267885c41d2 56,58,66,73
+  s_c878e3a53b63de::t_cb593ab0d130d5 384
+  s_c878e3a53b63de::t_bfab6c39b55067 391
+  s_75392099f39946::t_7644d22ee43a94 340
+  s_75392099f39946::t_dd98b222cb7e90 270-336,338,341,359-360,368-371,373-376,378-383,385-390,392-393
+  s_75392099f39946::t_b1717daf117c08 342-358,361-366,372,377
+  s_c878e3a53b63de::t_5aba70fd996909 337,339
+  s_75392099f39946::t_7ef14e512b13d2 198,202
+  s_75392099f39946::t_4c01179f9621c9 367
+docs/source/user_guide/feature_guide/rfork.md
+  s_75392099f39946::t_0356af75ed0f60 28
+  s_75392099f39946::t_edb627001b3846 17-18,49-65,82,152-155,180-182
+  s_75392099f39946::t_3f7b81b953744e 70,77
+  s_75392099f39946::t_4818dcc8084d72 79-81,83-88,90
+  s_75392099f39946::t_6a2ce5c57f718a 102
+  s_c878e3a53b63de::t_9e1c955a35e3a8 183
+  s_c878e3a53b63de::t_f606007cdf1f6d 66
+  s_75392099f39946::t_075474040e0a1c 78
+tests/ut/model_loader/rfork/test_rfork_planner.py
+  s_c878e3a53b63de::t_a865ffc816b3b0 1-2,4-76
+  s_c878e3a53b63de::t_b30e180f72555e 3
+vllm_ascend/model_loader/rfork/seed_server.py
+  s_c878e3a53b63de::t_b22f1f378eb689 179,185,191,195
+  s_c878e3a53b63de::t_16eaec5a0bd36d 307
+  s_75392099f39946::t_466674956c95ce 17-19,24-25,27,35-153,156,159-161,163,165,167-169,171-178,180-184,186-190,192-194,196-265,267-269,271-286,289-295,298-302,309,313-314,316-319,325,327-328,332,335-337
+tests/ut/model_loader/rfork/test_rfork_worker.py
+  s_75392099f39946::t_466674956c95ce 1-53,55-85,87-199
+  s_c878e3a53b63de::t_18887cd7048a39 86
+  s_75392099f39946::t_0eeb1d343d0d5e 54
+vllm_ascend/model_loader/rfork/seed_protocol.py
+  s_75392099f39946::t_12d056a0e0dd63 17-20,30-31,59-68,84-86,95-113,128-129,157-163,176,190-192,199-241,243-269,271-272,275-280,283,286-293,296-302,304-305,326-363
+  s_75392099f39946::t_e9973060e9a5d8 55,69
+  s_75392099f39946::t_c6df394457ab13 38,53-54,56-57
+  s_75392099f39946::t_401942381b65c7 80
+  s_75392099f39946::t_ac6ad0ec3b3933 119
+tests/ut/model_loader/rfork/test_rfork_loader.py
+  s_75392099f39946::t_8e45c2b8f89c38 244-252,255,263,266,275,278,285,295-305
+  s_75392099f39946::t_0e1fc6678e4835 315
+  s_75392099f39946::t_109caafa91eef0 254
+  s_c878e3a53b63de::t_9547e9f2e434b0 110
+  s_75392099f39946::t_4e32fccc09932d 553-554
+  s_75392099f39946::t_8c28be72959efe 555-602
+  s_75392099f39946::t_1efb3f45bc441b 253
+  s_75392099f39946::t_65fb877ec754b4 494
+  s_75392099f39946::t_a4226b52be4635 17,27,82-109,111-123,414-415,417,436,479-493,495-552,603-627,828-938
+vllm_ascend/model_loader/rfork/rfork_worker.py
+  s_75392099f39946::t_f49b39245cfdd6 17,23-26,44-47,49-50,52-54,57-59,64-68,77-78,80-83,86-89,112,115-118,120,141,145-150,152,155,163-292
+  s_75392099f39946::t_16d44d8982bb15 51
+tests/ut/model_loader/rfork/test_seed_server.py
+  s_c878e3a53b63de::t_a865ffc816b3b0 1-80
+vllm_ascend/model_loader/rfork/rfork_loader.py
+  s_c878e3a53b63de::t_a865ffc816b3b0 18-20,26,46,49-252,448-462,465-468,470-473,476-529,534-535,540-542,559-565,567,573-575,579,583,586,602-674,689-691,717-723,736,757-772,776-778,780,805-822
+vllm_ascend/model_loader/rfork/transfer_backend.py
+  s_c878e3a53b63de::t_614ef68108ab95 820-821
+  s_c878e3a53b63de::t_a865ffc816b3b0 17,20,31-60,68,74-117,120,123-125,128-134,183-199,346-363,424-456,461,467-470,481-484,488-531,541,588-595,598-599,625-637,639-647,649-653,657-661,663-670,676,678-702,704-706,708-718,722,732-733,736,746-756,760,773,795-796,799-819,822-833,842-875,880-910,913-919,924-942,944-965,976-1006,1008-1060,1064-1069,1074-1081,1154-1159,1164,1176,1178-1186,1188-1193,1195-1202,1214-1219,1224
+  s_c878e3a53b63de::t_e87ccc8ef30f53 1177,1194
+  s_c878e3a53b63de::t_786505ab681945 533
+tests/ut/model_loader/rfork/test_seed_protocol.py
+  s_c878e3a53b63de::t_4d5c23cc55a894 59-60
+  s_c878e3a53b63de::t_a865ffc816b3b0 1-58,61-124,126-176
+  s_c878e3a53b63de::t_3a858f17a2f66f 125
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "8b64218407eae7a21b15a0fe4232c223abe598ff",
+  "prompts": {},
+  "sessions": {
+    "s_75392099f39946": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a9b6eef71811b426ebc1863",
+        "model": "glm-5.3__max"
+      },
+      "human_author": null,
+      "custom_attributes": {
+        "source_scene": "unknown",
+        "tool_use_id": "6a9b96f471811b426ebc213c",
+        "edit_kind": "file_edit",
+        "dedupe_key": "6a9b6eef71811b426ebc1863:6a9b96f471811b426ebc213c:afterEdit:ab54367f",
+        "operation_id": "6a9b96f471811b426ebc213c",
+        "external_session_id": "6a9b6eef71811b426ebc1863",
+        "runtime_client": "trae-tob-git-ai",
+        "tool_id": "Edit",
+        "tool_type": "agent",
+        "session_id": "6a9b6eef71811b426ebc1863",
+        "client_type": "ide"
+      }
+    },
+    "s_c878e3a53b63de": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a9bcb3171811b426ebc22f0",
+        "model": "glm-5.3-flash__max"
+      },
+      "human_author": "yangsonglin13 <yangsonglin566@gmail.com>",
+      "custom_attributes": {
+        "session_id": "6a9bcb3171811b426ebc22f0",
+        "source_scene": "agent",
+        "tool_name": "RunCommand",
+        "tool_use_id": "6a9bdfae71811b426ebc27f3",
+        "runtime_client": "trae-tob-git-ai",
+        "edit_kind": "bash",
+        "display_model_name": "GLM-5.3-Flash",
+        "operation_id": "6a9bdfae71811b426ebc27f3",
+        "client_type": "ide",
+        "external_session_id": "6a9bcb3171811b426ebc22f0"
+      }
+    }
+  }
+}
