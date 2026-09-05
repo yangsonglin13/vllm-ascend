@@ -1,0 +1,58 @@
+tests/ut/model_loader/rfork/test_rfork_worker.py
+  s_c878e3a53b63de::t_eb8af572a1b8e9 13,83,88
+docs/source/user_guide/feature_guide/rfork.md
+  s_c878e3a53b63de::t_eb8af572a1b8e9 50,63,68-69,186
+vllm_ascend/model_loader/rfork/seed_protocol.py
+  s_c878e3a53b63de::t_eb8af572a1b8e9 32-34,88,115,136-140,155,219,281,360
+vllm_ascend/model_loader/rfork/rfork_loader.py
+  s_c878e3a53b63de::t_eb8af572a1b8e9 517-521,579
+tests/ut/model_loader/rfork/test_transfer_backend.py
+  s_c878e3a53b63de::t_a865ffc816b3b0 21,29,51-79,97-115,122-124,137,145-146,171,201-278,316-416,672-680,706-707,709-731,733-738,740-747
+  s_c878e3a53b63de::t_eb8af572a1b8e9 708,732,739
+tests/ut/model_loader/rfork/test_rfork_loader.py
+  s_c878e3a53b63de::t_eb8af572a1b8e9 85,91,112-113,125,489,516
+tests/ut/model_loader/rfork/test_rfork_planner.py
+  s_c878e3a53b63de::t_eb8af572a1b8e9 3-5,79-93
+vllm_ascend/model_loader/rfork/seed_server.py
+  s_c878e3a53b63de::t_eb8af572a1b8e9 31,35-36,157-162,169,187-189,191-193,199-201,207-209,213-215,273,290,326-332
+examples/rfork/rfork_planner.py
+  s_c878e3a53b63de::t_eb8af572a1b8e9 39-40,50-51,60-61,74,77,90-93,127-129,137,147,180,200,208,223,236-251,259,277-298,310,346-347,376-383,424-433,436-440,443-444,463-464,484-485,502-522,524-526,530-532,542,557,587-592,605-609,621,624
+tests/ut/model_loader/rfork/test_seed_protocol.py
+  s_c878e3a53b63de::t_eb8af572a1b8e9 8,60-61,78,127,146
+vllm_ascend/model_loader/rfork/rfork_worker.py
+  s_c878e3a53b63de::t_eb8af572a1b8e9 46,60,81,180
+vllm_ascend/model_loader/rfork/transfer_backend.py
+  s_c878e3a53b63de::t_eb8af572a1b8e9 44-49,539,548,804,828-831,842,1169,1172,1177,1191,1198,1209,1216,1234,1237,1242
+docs/source/locale/zh_CN/LC_MESSAGES/user_guide/feature_guide/rfork.po
+  s_c878e3a53b63de::t_eb8af572a1b8e9 294-301,337-339,348-349,351-352,397,404
+tests/ut/model_loader/rfork/test_seed_server.py
+  s_c878e3a53b63de::t_eb8af572a1b8e9 5,9,12,18-24,78-108
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "6c56d296ead9ec97becc9fb240829adef3bf038b",
+  "prompts": {},
+  "sessions": {
+    "s_c878e3a53b63de": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a9bcb3171811b426ebc22f0",
+        "model": "glm-5.3-flash__max"
+      },
+      "human_author": "yangsonglin13 <yangsonglin566@gmail.com>",
+      "custom_attributes": {
+        "operation_id": "6a9bdfdd71811b426ebc27fc",
+        "client_type": "ide",
+        "display_model_name": "GLM-5.3-Flash",
+        "session_id": "6a9bcb3171811b426ebc22f0",
+        "edit_kind": "bash",
+        "runtime_client": "trae-tob-git-ai",
+        "tool_name": "RunCommand",
+        "external_session_id": "6a9bcb3171811b426ebc22f0",
+        "tool_use_id": "6a9bdfdd71811b426ebc27fc",
+        "source_scene": "agent"
+      }
+    }
+  }
+}
