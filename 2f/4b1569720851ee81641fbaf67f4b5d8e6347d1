@@ -1,0 +1,77 @@
+examples/rfork/rfork_planner.py
+  s_75392099f39946::t_466674956c95ce 39-41,51-52,61-62,75,78,91-94,128-130,138,148,181,201,209,224,237-252,260,278-299,311,347-348,377-384,425-434,437-444,447-448,467-468,488-489,506-526,528-530,534-536,546,561,591-596,609-613,625,628
+vllm_ascend/model_loader/rfork/transfer_backend.py
+  s_75392099f39946::t_76247c685ce09c 959-960
+  s_75392099f39946::t_965d2b9108a0ab 1022
+  s_75392099f39946::t_f1ce7d4f9e6cd8 634-636
+  s_75392099f39946::t_fd6d4f1fd361e7 930-931
+  s_75392099f39946::t_f2440dbdbc6188 709,713-715,717-727,731
+  s_75392099f39946::t_0640b3e2ced157 1091-1092
+  s_75392099f39946::t_106f046e2f8b8c 875,877-888,893-915
+  s_75392099f39946::t_466674956c95ce 17,20,31-66,74,80-123,126,129-136,139-140,189-205,352-369,430-462,467,473-476,487-490,494-539,541,549-550,597-604,637-646,648-656,658-662,666-670,672-679,685,687-708,710-711,741-742,745,755-765,769,804-806,809-846,855-874,876,916-923,926-929,936-954,956-958,961-977,988-995,997-1021,1023-1069,1072,1076-1081,1086-1090,1093,1166-1173,1178-1179,1191-1202,1204-1219,1231-1238,1243-1244
+  s_75392099f39946::t_0be3e8e2da320e 1070-1071
+  s_75392099f39946::t_0dfae57957f47c 782
+  s_75392099f39946::t_db6294418e59b4 607-608
+docs/source/user_guide/feature_guide/rfork.md
+  s_75392099f39946::t_466674956c95ce 17-18,49,51-72,87-94,106,156-159,184-187
+tests/ut/model_loader/rfork/test_rfork_loader.py
+  s_75392099f39946::t_4f7a82a68fc2d3 431-432,434,453
+  s_75392099f39946::t_466674956c95ce 17,27,82-131,496-606,807-917
+tests/ut/model_loader/rfork/test_seed_protocol.py
+  s_75392099f39946::t_466674956c95ce 1-183
+vllm_ascend/model_loader/rfork/rfork_loader.py
+  s_75392099f39946::t_466674956c95ce 18-20,25,44,46,48-245,442-457,460-463,465-468,471-539,544-545,550,552-553,566,572-585,588-589,595-598,603,607,610,626-699,714-716,742-745,761,782-797,801-803,805,830-847
+  s_75392099f39946::t_391d9d48c796de 746-747
+  s_75392099f39946::t_df853c9ef84e6e 748
+RFORK_RELIABILITY_HARDENING_PLAN.md
+  s_75392099f39946::t_466674956c95ce 1-149
+vllm_ascend/model_loader/rfork/rfork_worker.py
+  s_75392099f39946::t_466674956c95ce 17,23-26,47-51,53-59,62-65,70-74,86-88,90-93,96-99,122,125-128,130,151,155-160,162,165,173-303
+tests/ut/model_loader/rfork/test_rfork_worker.py
+  s_75392099f39946::t_0eeb1d343d0d5e 55
+  s_75392099f39946::t_466674956c95ce 1-54,56-203
+vllm_ascend/envs.py
+  s_75392099f39946::t_466674956c95ce 30-49,94-142
+vllm_ascend/model_loader/rfork/seed_server.py
+  s_75392099f39946::t_466674956c95ce 17-19,24-25,27,31,35-167,170,173-176,178,180,182-184,186-292,294-297,299-314,317-323,326-330,332-339,343-344,346-349,355,357-358,362,365-367
+vllm_ascend/model_loader/rfork/seed_protocol.py
+  s_75392099f39946::t_466674956c95ce 17-20,30-38,51,64-95,112-116,128-147,159,165-171,176-177,188,201-207,220,234-236,243-286,288-315,317-318,321-326,329,332-339,342-348,350-351,372-410
+tests/ut/model_loader/rfork/test_seed_server.py
+  s_75392099f39946::t_466674956c95ce 1-121
+tests/ut/model_loader/rfork/test_transfer_backend.py
+  s_75392099f39946::t_beb1fb1a28affe 75,106,212-213,215,217-218,222,229-232,235,243,251-252,254,256-257,261,316-414,717,728
+  s_75392099f39946::t_ee7914e9505270 698-699
+docs/source/locale/zh_CN/LC_MESSAGES/user_guide/feature_guide/rfork.po
+  s_75392099f39946::t_466674956c95ce 282-453
+tests/ut/model_loader/rfork/test_rfork_planner.py
+  s_75392099f39946::t_466674956c95ce 1-93
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "2f4b1569720851ee81641fbaf67f4b5d8e6347d1",
+  "prompts": {},
+  "sessions": {
+    "s_75392099f39946": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a9b6eef71811b426ebc1863",
+        "model": "glm-5.3__max"
+      },
+      "human_author": "yangsonglin13 <yangsonglin566@gmail.com>",
+      "custom_attributes": {
+        "tool_type": "agent",
+        "runtime_client": "trae-tob-git-ai",
+        "client_type": "ide",
+        "session_id": "6a9b6eef71811b426ebc1863",
+        "tool_use_id": "6a9b75ec71811b426ebc1b0b",
+        "external_session_id": "6a9b6eef71811b426ebc1863",
+        "dedupe_key": "6a9b6eef71811b426ebc1863:6a9b75ec71811b426ebc1b0b:afterEdit:088b9818",
+        "edit_kind": "file_edit",
+        "operation_id": "6a9b75ec71811b426ebc1b0b",
+        "source_scene": "unknown",
+        "tool_id": "Edit"
+      }
+    }
+  }
+}
