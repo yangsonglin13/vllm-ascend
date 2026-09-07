@@ -1,0 +1,820 @@
+From c4d8c2ce5de1167f57345d41063c7ee95d27b52b Mon Sep 17 00:00:00 2001
+From: yangsonglin13 <yangsonglin566@gmail.com>
+Date: Sun, 30 Aug 2026 11:24:16 +0800
+Subject: [PATCH 4/4] fix(rfork): align lifecycle with YuanRong transfer engine
+
+Use logical and backing memory registrations, serialize transfer-engine lifecycle operations, and explicitly finalize the engine during RFork shutdown.
+
+Signed-off-by: yangsonglin13 <yangsonglin566@gmail.com>
+---
+ .../model_loader/rfork/test_rfork_loader.py   |  24 ++
+ .../rfork/test_transfer_backend.py            | 324 +++++++++++++++++-
+ .../model_loader/rfork/rfork_worker.py        |  25 ++
+ .../model_loader/rfork/transfer_backend.py    | 228 ++++++++++--
+ 4 files changed, 568 insertions(+), 33 deletions(-)
+
+diff --git a/tests/ut/model_loader/rfork/test_rfork_loader.py b/tests/ut/model_loader/rfork/test_rfork_loader.py
+index 85f67b71d..60fd8b67b 100644
+--- a/tests/ut/model_loader/rfork/test_rfork_loader.py
++++ b/tests/ut/model_loader/rfork/test_rfork_loader.py
+@@ -399,6 +399,30 @@ def test_reset_transfer_state_survives_backend_exception():
+     assert worker.ready_to_start_seed_service is False
+ 
+ 
++def test_rfork_worker_shutdown_finalizes_transfer_engine():
++    finalize_calls = []
++    worker: Any = RForkWorker.__new__(RForkWorker)
++    worker.rfork_seed = None
++    worker.ready_to_start_seed_service = True
++    worker.transfer_backend = SimpleNamespace(
++        finalize_transfer_engine=lambda: finalize_calls.append(True) or True,
++    )
++
++    assert worker.shutdown()
++    assert finalize_calls == [True]
++    assert worker.ready_to_start_seed_service is False
++
++
++def test_rfork_worker_shutdown_preserves_state_when_finalize_fails():
++    worker: Any = RForkWorker.__new__(RForkWorker)
++    worker.rfork_seed = None
++    worker.ready_to_start_seed_service = True
++    worker.transfer_backend = SimpleNamespace(finalize_transfer_engine=lambda: False)
++
++    assert not worker.shutdown()
++    assert worker.ready_to_start_seed_service is True
++
++
+ def test_rfork_draft_load_passes_target_registered_blocks_to_worker(monkeypatch):
+     import vllm.model_executor.model_loader as model_loader
+ 
+diff --git a/tests/ut/model_loader/rfork/test_transfer_backend.py b/tests/ut/model_loader/rfork/test_transfer_backend.py
+index 9defe1554..2d5af7788 100644
+--- a/tests/ut/model_loader/rfork/test_transfer_backend.py
++++ b/tests/ut/model_loader/rfork/test_transfer_backend.py
+@@ -15,9 +15,12 @@
+ #
+ 
+ import gc
++import sys
++import threading
+ import weakref
+-from types import SimpleNamespace
++from types import ModuleType, SimpleNamespace
+ 
++import pytest
+ import torch
+ 
+ import vllm_ascend.model_loader.rfork.transfer_backend as transfer_backend
+@@ -37,6 +40,19 @@ def test_parse_weight_info_keeps_backward_compatibility():
+     assert _parse_weight_info([1, 2, 4]) == (1, 2, 4, None)
+ 
+ 
++def test_backend_initialization_rejects_transfer_engine_without_memory_registration(monkeypatch):
++    yr_module = ModuleType("yr")
++    datasystem_module = ModuleType("yr.datasystem")
++    datasystem_module.TransferEngine = object
++    datasystem_module.ErrorCode = SimpleNamespace(kNotReady=1)
++    yr_module.datasystem = datasystem_module
++    monkeypatch.setitem(sys.modules, "yr", yr_module)
++    monkeypatch.setitem(sys.modules, "yr.datasystem", datasystem_module)
++
++    with pytest.raises(ImportError, match="MemoryRegistration"):
++        RForkTransferBackend()
++
++
+ def test_parse_weight_info_accepts_shape_metadata_from_json():
+     assert _parse_weight_info([1, 6, 2, [2, 3]]) == (1, 6, 2, (2, 3))
+ 
+@@ -199,7 +215,7 @@ def test_register_memory_region_retries_stale_blocks_before_registering(monkeypa
+     assert backend.register_memory_region(object(), True)
+ 
+     assert unregistered_calls == [[stale_blocks[0][0]]]
+-    assert registered_calls == [([storage.data_ptr()], [40])]
++    assert registered_calls == [[(storage.data_ptr(), 40, storage.data_ptr(), 40)]]
+     assert backend.registered_weight_blocks == [(storage.data_ptr(), 40)]
+ 
+ 
+@@ -227,6 +243,259 @@ def test_register_memory_region_aborts_when_stale_unregister_fails(monkeypatch):
+     assert backend.registered_weight_blocks == stale_blocks
+ 
+ 
++def test_register_memory_region_uses_logical_ranges_with_allocator_backing(monkeypatch):
++    tensor = torch.arange(8, dtype=torch.uint8)
++    logical = tensor[2:6]
++    backing_start = tensor.data_ptr()
++    backing_size = tensor.numel() * tensor.element_size()
++    registrations = []
++
++    class _MemoryRegistration:
++        def __init__(self, logical_addr, logical_length, backing_addr, backing_length):
++            self.values = (logical_addr, logical_length, backing_addr, backing_length)
++
++    backend = RForkTransferBackend.__new__(RForkTransferBackend)
++    backend.rfork_transfer_engine = SimpleNamespace(
++        batch_register_memory_ex=lambda items: registrations.extend(item.values for item in items)
++        or SimpleNamespace(is_error=lambda: False)
++    )
++    backend._memory_registration_cls = _MemoryRegistration
++    backend.registered_weight_blocks = []
++    backend.registered_memory_addresses = []
++    monkeypatch.setattr(transfer_backend, "_iter_transferable_tensors", lambda *args: iter([("weight", logical)]))
++    monkeypatch.setattr(
++        transfer_backend.torch,
++        "npu",
++        SimpleNamespace(
++            memory=SimpleNamespace(
++                memory_snapshot=lambda: [
++                    {"blocks": [{"address": backing_start, "size": backing_size, "state": "active_allocated"}]}
++                ]
++            )
++        ),
++        raising=False,
++    )
++
++    assert backend.register_memory_region(object(), False)
++    assert registrations == [(logical.data_ptr(), logical.numel(), backing_start, backing_size)]
++    assert backend.registered_memory_addresses == [logical.data_ptr()]
++
++
++def test_extended_registration_merges_overlapping_logical_ranges(monkeypatch):
++    tensor = torch.arange(8, dtype=torch.uint8)
++    first = tensor[1:5]
++    second = tensor[3:7]
++    backing_start = tensor.data_ptr()
++    registrations = []
++
++    class _MemoryRegistration:
++        def __init__(self, *values):
++            self.values = values
++
++    backend = RForkTransferBackend.__new__(RForkTransferBackend)
++    backend.rfork_transfer_engine = SimpleNamespace(
++        batch_register_memory_ex=lambda items: registrations.extend(item.values for item in items)
++        or SimpleNamespace(is_error=lambda: False)
++    )
++    backend._memory_registration_cls = _MemoryRegistration
++    backend.registered_weight_blocks = []
++    backend.registered_memory_addresses = []
++    monkeypatch.setattr(
++        transfer_backend,
++        "_iter_transferable_tensors",
++        lambda *args: iter([("first", first), ("second", second)]),
++    )
++    monkeypatch.setattr(
++        transfer_backend.torch,
++        "npu",
++        SimpleNamespace(
++            memory=SimpleNamespace(
++                memory_snapshot=lambda: [
++                    {"blocks": [{"address": backing_start, "size": tensor.numel(), "state": "active_allocated"}]}
++                ]
++            )
++        ),
++        raising=False,
++    )
++
++    assert backend.register_memory_region(object(), False)
++    assert registrations == [(first.data_ptr(), 6, backing_start, tensor.numel())]
++
++
++def test_register_memory_region_rejects_transfer_engine_without_extended_registration(monkeypatch):
++    tensor = torch.arange(4, dtype=torch.uint8)
++    calls = []
++    backend = RForkTransferBackend.__new__(RForkTransferBackend)
++    backend.rfork_transfer_engine = SimpleNamespace(
++        batch_register_memory=lambda addresses, sizes: calls.append((list(addresses), list(sizes)))
++    )
++    backend._memory_registration_cls = None
++    backend.registered_weight_blocks = []
++    backend.registered_memory_addresses = []
++    monkeypatch.setattr(transfer_backend, "_iter_transferable_tensors", lambda *args: iter([("weight", tensor)]))
++    monkeypatch.setattr(
++        transfer_backend.torch,
++        "npu",
++        SimpleNamespace(
++            memory=SimpleNamespace(
++                memory_snapshot=lambda: [
++                    {"blocks": [{"address": tensor.data_ptr(), "size": tensor.numel(), "state": "active_allocated"}]}
++                ]
++            )
++        ),
++        raising=False,
++    )
++
++    assert not backend.register_memory_region(object(), False)
++    assert calls == []
++    assert backend.registered_weight_blocks == []
++    assert backend.registered_memory_addresses == []
++
++
++def test_unregister_uses_logical_registration_addresses():
++    calls = []
++    backend = RForkTransferBackend.__new__(RForkTransferBackend)
++    backend.rfork_transfer_engine = SimpleNamespace(
++        batch_unregister_memory=lambda addresses: calls.append(addresses) or SimpleNamespace(is_error=lambda: False)
++    )
++    backend.registered_weight_blocks = [(100, 1000)]
++    backend.registered_memory_addresses = [120, 400]
++    backend._registered_transferable_tensors = []
++
++    assert backend.unregister_memory_region()
++    assert calls == [[120, 400]]
++
++
++def test_unregister_splits_batches_and_preserves_only_unfinished_addresses(monkeypatch):
++    calls = []
++
++    def batch_unregister_memory(addresses):
++        calls.append(list(addresses))
++        return SimpleNamespace(
++            is_error=lambda: len(calls) == 2,
++            to_string=lambda: "mock unregister error",
++        )
++
++    backend = RForkTransferBackend.__new__(RForkTransferBackend)
++    backend.rfork_transfer_engine = SimpleNamespace(batch_unregister_memory=batch_unregister_memory)
++    backend.registered_weight_blocks = [(100, 1000)]
++    backend.registered_memory_addresses = [120, 400, 800]
++    backend._registered_transferable_tensors = [("weight", torch.ones(1))]
++    monkeypatch.setattr(transfer_backend, "MAX_MEMORY_REGISTRATION_BATCH_ITEMS", 2)
++
++    assert not backend.unregister_memory_region()
++    assert calls == [[120, 400], [800]]
++    assert backend.registered_memory_addresses == [800]
++    assert backend._registered_transferable_tensors is not None
++
++    assert backend.unregister_memory_region()
++    assert calls[-1] == [800]
++    assert backend.registered_memory_addresses == []
++    assert backend._registered_transferable_tensors is None
++
++
++def test_finalize_retries_not_ready_and_clears_state_only_after_success():
++    attempts = []
++
++    class _Ret:
++        def __init__(self, error, code):
++            self.error = error
++            self.code = code
++
++        def is_error(self):
++            return self.error
++
++        def get_code(self):
++            return self.code
++
++        def to_string(self):
++            return self.code
++
++    results = iter([_Ret(True, "not-ready"), _Ret(False, "ok")])
++    backend = RForkTransferBackend.__new__(RForkTransferBackend)
++    backend.rfork_transfer_engine = SimpleNamespace(finalize=lambda: attempts.append(True) or next(results))
++    backend.rfork_transfer_engine_session_id = "session"
++    backend.registered_weight_blocks = [(1, 1)]
++    backend.registered_memory_addresses = [1]
++    backend._registered_transferable_tensors = [("weight", torch.ones(1))]
++    backend._not_ready_error_code = "not-ready"
++    backend._is_initialized = True
++
++    assert backend.finalize_transfer_engine()
++    assert len(attempts) == 2
++    assert backend._is_initialized is False
++    assert backend.rfork_transfer_engine_session_id is None
++    assert backend.registered_weight_blocks == []
++    assert backend._registered_transferable_tensors is None
++
++
++def test_finalize_failure_preserves_registered_tensor_owners():
++    owners = [("weight", torch.ones(1))]
++    backend = RForkTransferBackend.__new__(RForkTransferBackend)
++    backend.rfork_transfer_engine = SimpleNamespace(
++        finalize=lambda: SimpleNamespace(
++            is_error=lambda: True,
++            get_code=lambda: "fatal",
++            to_string=lambda: "fatal",
++        )
++    )
++    backend.rfork_transfer_engine_session_id = "session"
++    backend.registered_weight_blocks = [(1, 1)]
++    backend.registered_memory_addresses = [1]
++    backend._registered_transferable_tensors = owners
++    backend._not_ready_error_code = "not-ready"
++    backend._is_initialized = True
++
++    assert not backend.finalize_transfer_engine()
++    assert backend._is_initialized is True
++    assert backend.registered_weight_blocks == [(1, 1)]
++    assert backend._registered_transferable_tensors is owners
++
++
++def test_finalize_is_idempotent_after_success():
++    calls = []
++    backend = RForkTransferBackend.__new__(RForkTransferBackend)
++    backend.rfork_transfer_engine = SimpleNamespace(finalize=lambda: calls.append(True))
++    backend._is_initialized = False
++
++    assert backend.finalize_transfer_engine()
++    assert calls == []
++
++
++def test_transfer_lifecycle_lock_serializes_concurrent_calls():
++    backend = RForkTransferBackend.__new__(RForkTransferBackend)
++    backend._lifecycle_lock = threading.RLock()
++    first_entered = threading.Event()
++    release_first = threading.Event()
++    second_done = threading.Event()
++    calls = []
++
++    def recv_locked(*args):
++        calls.append(args)
++        if len(calls) == 1:
++            first_entered.set()
++            assert release_first.wait(1)
++        return True
++
++    backend._recv_from_source_locked = recv_locked
++    args = (object(), "127.0.0.1", 8000, "key", False)
++    first = threading.Thread(target=backend.recv_from_source, args=args)
++    second = threading.Thread(target=lambda: (backend.recv_from_source(*args), second_done.set()))
++
++    first.start()
++    assert first_entered.wait(1)
++    second.start()
++    assert not second_done.wait(0.05)
++    assert len(calls) == 1
++    release_first.set()
++    first.join(1)
++    second.join(1)
++
++    assert not first.is_alive()
++    assert not second.is_alive()
++    assert len(calls) == 2
++
++
+ def test_transferable_tensor_scan_depends_on_runtime_layout(monkeypatch):
+     class _RuntimeImpl:
+         def __init__(self):
+@@ -305,8 +574,12 @@ def _make_register_memory_region_backend(
+     registered_calls = []
+     unregistered_calls = []
+ 
+-    def batch_register_memory(addresses, sizes):
+-        registered_calls.append((list(addresses), list(sizes)))
++    class _MemoryRegistration:
++        def __init__(self, logical_addr, logical_length, backing_addr, backing_length):
++            self.values = (logical_addr, logical_length, backing_addr, backing_length)
++
++    def batch_register_memory_ex(registrations):
++        registered_calls.append([registration.values for registration in registrations])
+         return SimpleNamespace(is_error=lambda: False)
+ 
+     def batch_unregister_memory(addresses):
+@@ -315,10 +588,12 @@ def _make_register_memory_region_backend(
+ 
+     backend = RForkTransferBackend.__new__(RForkTransferBackend)
+     backend.rfork_transfer_engine = SimpleNamespace(
+-        batch_register_memory=batch_register_memory,
++        batch_register_memory_ex=batch_register_memory_ex,
+         batch_unregister_memory=batch_unregister_memory,
+     )
++    backend._memory_registration_cls = _MemoryRegistration
+     backend.registered_weight_blocks = list(stale_blocks)
++    backend.registered_memory_addresses = [address for address, _ in stale_blocks]
+     monkeypatch.setattr(
+         transfer_backend,
+         "_iter_transferable_tensors",
+@@ -356,7 +631,16 @@ def test_register_memory_region_skips_shared_weights(monkeypatch):
+     assert set(backend.rfork_transfer_engine_weights_info_dict) == {"layers.0.fc.weight"}
+     assert [name for name, _ in backend._registered_transferable_tensors] == ["layers.0.fc.weight"]
+     assert backend.excluded_weight_blocks == excluded_blocks
+-    assert registered_calls == [([storage.data_ptr() + 40], [360])]
++    assert registered_calls == [
++        [
++            (
++                own_weight.data_ptr(),
++                own_weight.numel() * own_weight.element_size(),
++                storage.data_ptr() + 40,
++                360,
++            )
++        ]
++    ]
+     assert backend.registered_weight_blocks == [(storage.data_ptr() + 40, 360)]
+ 
+ 
+@@ -379,10 +663,36 @@ def test_register_memory_region_registers_all_weights_without_exclusion(monkeypa
+     assert backend.register_memory_region(object(), True)
+ 
+     assert set(backend.rfork_transfer_engine_weights_info_dict) == {"a.weight", "b.weight"}
+-    assert registered_calls == [([storage.data_ptr()], [400])]
++    assert registered_calls == [
++        [
++            (weight_a.data_ptr(), 40, storage.data_ptr(), 400),
++            (weight_b.data_ptr(), 48, storage.data_ptr(), 400),
++        ]
++    ]
+     assert backend.excluded_weight_blocks == []
+ 
+ 
++def test_register_memory_region_splits_large_registration_batches(monkeypatch):
++    storage = torch.arange(12, dtype=torch.uint8)
++    weights = [storage[0:2], storage[4:6], storage[8:10]]
++    backend, registered_calls, _ = _make_register_memory_region_backend(
++        monkeypatch,
++        [(f"weight_{index}", weight) for index, weight in enumerate(weights)],
++        [
++            {
++                "address": storage.data_ptr(),
++                "size": storage.numel(),
++                "state": "active_allocated",
++            }
++        ],
++    )
++    monkeypatch.setattr(transfer_backend, "MAX_MEMORY_REGISTRATION_BATCH_ITEMS", 2)
++
++    assert backend.register_memory_region(object(), False)
++    assert [len(batch) for batch in registered_calls] == [2, 1]
++    assert backend.registered_memory_addresses == [weight.data_ptr() for weight in weights]
++
++
+ def test_register_memory_region_skips_empty_batch_after_excluding_all_weights(monkeypatch):
+     storage = torch.arange(10, dtype=torch.float32)
+     backend, registered_calls, _ = _make_register_memory_region_backend(
+diff --git a/vllm_ascend/model_loader/rfork/rfork_worker.py b/vllm_ascend/model_loader/rfork/rfork_worker.py
+index 341113042..bab65d993 100644
+--- a/vllm_ascend/model_loader/rfork/rfork_worker.py
++++ b/vllm_ascend/model_loader/rfork/rfork_worker.py
+@@ -14,6 +14,7 @@
+ # limitations under the License.
+ #
+ 
++import atexit
+ import threading
+ 
+ from vllm.logger import logger
+@@ -60,6 +61,10 @@ class RForkWorker:
+             pp_rank=pp_rank,
+             ep_rank=ep_rank,
+         )
++        # TransferEngine finalization may need to wait for remote read leases.
++        # Register cleanup as soon as this worker can own registered memory so
++        # interpreter shutdown does not depend on native object destruction.
++        atexit.register(self.shutdown)
+ 
+     def is_seed_available(self) -> bool:
+         self.rfork_seed = self.seed_protocol.get_seed()
+@@ -119,6 +124,26 @@ class RForkWorker:
+         self.rfork_seed = None
+         return True
+ 
++    def shutdown(self) -> bool:
++        """Release the planner lease and explicitly finalize TransferEngine."""
++        release_ok = False
++        try:
++            release_ok = self.post_transfer()
++        except Exception as e:
++            logger.warning("Failed to release RFork seed during shutdown: %s", e)
++
++        finalize_ok = False
++        try:
++            finalize_ok = self.transfer_backend.finalize_transfer_engine()
++        except Exception as e:
++            logger.warning("Failed to finalize RFork TransferEngine during shutdown: %s", e)
++
++        if finalize_ok:
++            self.ready_to_start_seed_service = False
++        else:
++            logger.warning("RFork shutdown retained TransferEngine registration state for safety.")
++        return release_ok and finalize_ok
++
+     def start_seed_service(self, model, processed_layout: bool):
+         if self.seed_service_started:
+             logger.info("Seed service already started, skipping.")
+diff --git a/vllm_ascend/model_loader/rfork/transfer_backend.py b/vllm_ascend/model_loader/rfork/transfer_backend.py
+index 8321a998b..b230d7fa8 100644
+--- a/vllm_ascend/model_loader/rfork/transfer_backend.py
++++ b/vllm_ascend/model_loader/rfork/transfer_backend.py
+@@ -14,6 +14,7 @@
+ # limitations under the License.
+ #
+ 
++import threading
+ import time
+ from bisect import bisect_left
+ from typing import Any
+@@ -26,6 +27,7 @@ from vllm.utils.network_utils import get_ip, get_open_port, join_host_port
+ 
+ MAX_TRANSFER_CHUNK_BYTES = 1024**3
+ MAX_TRANSFER_CHUNK_WEIGHTS = 512
++MAX_MEMORY_REGISTRATION_BATCH_ITEMS = 4096
+ 
+ 
+ def _normalize_weight_shape(shape: Any) -> tuple[int, ...] | None:
+@@ -344,18 +346,26 @@ class RForkTransferBackend:
+         self.rfork_transfer_engine_weights_info_dict = None
+         self.rfork_transfer_engine_weights_shape_dict = None
+         self.registered_weight_blocks = []
++        self.registered_memory_addresses = []
+         self.excluded_weight_blocks: list[tuple[int, int]] = []
+         self._registered_transferable_tensors: list[tuple[str, torch.Tensor]] | None = None
++        self._memory_registration_cls: Any | None = None
++        self._lifecycle_lock = threading.RLock()
+         self._is_initialized = False
+         self.init_transfer_engine()
+ 
+     def init_transfer_engine(self):
+         try:
+-            from yr.datasystem import TransferEngine  # type: ignore[import-not-found]
++            from yr.datasystem import (  # type: ignore[import-not-found]
++                ErrorCode,
++                MemoryRegistration,
++                TransferEngine,
++            )
+         except ImportError as e:
+             err_msg = (
+-                "Failed to import TransferEngine from yr.datasystem. "
+-                "Please install @yuanrong-datasystem/transfer_engine."
++                "Failed to import the required TransferEngine, MemoryRegistration, and ErrorCode APIs from "
++                "yr.datasystem. Install a YuanRong TransferEngine release that supports RFork extended memory "
++                "registration and explicit finalization."
+             )
+             logger.error(err_msg)
+             raise ImportError(err_msg) from e
+@@ -374,6 +384,8 @@ class RForkTransferBackend:
+ 
+         self.rfork_transfer_engine = transfer_engine
+         self.rfork_transfer_engine_session_id = local_hostname
++        self._memory_registration_cls = MemoryRegistration
++        self._not_ready_error_code = ErrorCode.kNotReady
+         self._is_initialized = True
+ 
+     def is_initialized(self) -> bool:
+@@ -384,11 +396,34 @@ class RForkTransferBackend:
+             raise RuntimeError("TransferEngine is not initialized.")
+         return self.rfork_transfer_engine
+ 
++    def _get_lifecycle_lock(self) -> threading.RLock:
++        lock = getattr(self, "_lifecycle_lock", None)
++        if lock is None:
++            lock = threading.RLock()
++            self._lifecycle_lock = lock
++        return lock
++
++    def _clear_registration_state(self) -> None:
++        self.rfork_transfer_engine_weights_info_dict = None
++        self.rfork_transfer_engine_weights_shape_dict = None
++        self.registered_weight_blocks = []
++        self.registered_memory_addresses = []
++        self._registered_transferable_tensors = None
++
+     def register_memory_region(
+         self,
+         model,
+         processed_layout: bool,
+         exclude_blocks: list[tuple[int, int]] | None = None,
++    ):
++        with self._get_lifecycle_lock():
++            return self._register_memory_region_locked(model, processed_layout, exclude_blocks)
++
++    def _register_memory_region_locked(
++        self,
++        model,
++        processed_layout: bool,
++        exclude_blocks: list[tuple[int, int]] | None = None,
+     ):
+         transfer_engine = self._get_transfer_engine()
+         start_reg_mr_time = time.perf_counter()
+@@ -459,17 +494,88 @@ class RForkTransferBackend:
+ 
+         weight_blocks_for_reg_mr = _subtract_weight_blocks(weight_blocks_for_reg_mr, excluded_blocks)
+ 
+-        if weight_blocks_for_reg_mr:
+-            addresses, sizes = zip(*weight_blocks_for_reg_mr)
+-            ret = transfer_engine.batch_register_memory(addresses, sizes)
+-            if ret.is_error():
+-                self._registered_transferable_tensors = None
++        logical_registrations: list[tuple[int, int, int, int]] = []
++        tensor_ranges = sorted(
++            {
++                (weight.data_ptr(), weight.data_ptr() + weight.numel() * weight.element_size())
++                for _, weight in transferable_tensors
++            }
++        )
++        for tensor_start, tensor_end in tensor_ranges:
++            backing_block = next(
++                (
++                    (start, size)
++                    for start, size in weight_blocks_for_reg_mr
++                    if start <= tensor_start and tensor_end <= start + size
++                ),
++                None,
++            )
++            if backing_block is None:
+                 logger.error(
+-                    "batch_register_memory failed for %d blocks, ret: %s",
+-                    len(weight_blocks_for_reg_mr),
+-                    ret.to_string(),
++                    "RFork tensor range [%d, %d) is not fully covered by a registration block", tensor_start, tensor_end
++                )
++                return False
++            backing_start, backing_size = backing_block
++            if (
++                logical_registrations
++                and logical_registrations[-1][2:] == (backing_start, backing_size)
++                and tensor_start <= logical_registrations[-1][0] + logical_registrations[-1][1]
++            ):
++                logical_start, logical_size, _, _ = logical_registrations[-1]
++                logical_registrations[-1] = (
++                    logical_start,
++                    max(logical_start + logical_size, tensor_end) - logical_start,
++                    backing_start,
++                    backing_size,
++                )
++            else:
++                logical_registrations.append((tensor_start, tensor_end - tensor_start, backing_start, backing_size))
++
++        registered_memory_addresses: list[int] = []
++        if logical_registrations:
++            memory_registration_cls = self._memory_registration_cls
++            batch_register_memory_ex = getattr(transfer_engine, "batch_register_memory_ex", None)
++            if memory_registration_cls is None or not callable(batch_register_memory_ex):
++                logger.error(
++                    "RFork requires YuanRong TransferEngine with MemoryRegistration and "
++                    "batch_register_memory_ex support."
+                 )
+                 return False
++            for batch_start in range(0, len(logical_registrations), MAX_MEMORY_REGISTRATION_BATCH_ITEMS):
++                registration_batch = logical_registrations[
++                    batch_start : batch_start + MAX_MEMORY_REGISTRATION_BATCH_ITEMS
++                ]
++                try:
++                    registrations = [memory_registration_cls(*registration) for registration in registration_batch]
++                    ret = batch_register_memory_ex(registrations)
++                except Exception as e:
++                    logger.error(
++                        "TransferEngine memory registration raised for batch of %d logical regions: %s",
++                        len(registration_batch),
++                        e,
++                    )
++                    ret = None
++                if ret is None or ret.is_error():
++                    if ret is not None:
++                        logger.error(
++                            "TransferEngine memory registration failed for batch of %d logical regions, ret: %s",
++                            len(registration_batch),
++                            ret.to_string(),
++                        )
++                    if registered_memory_addresses:
++                        if not self._unregister_weight_blocks(transfer_engine):
++                            logger.error(
++                                "RFork registration rollback is incomplete; preserving registration state for retry."
++                            )
++                    return False
++                registered_memory_addresses.extend(registration[0] for registration in registration_batch)
++                # Keep native registration ownership visible after every
++                # successful batch, including while later batches are pending.
++                self.rfork_transfer_engine_weights_info_dict = weight_mr_dict
++                self.rfork_transfer_engine_weights_shape_dict = weight_shape_dict
++                self.registered_weight_blocks = weight_blocks_for_reg_mr
++                self.registered_memory_addresses = list(registered_memory_addresses)
++                self._registered_transferable_tensors = transferable_tensors
+         else:
+             logger.info(
+                 "No memory blocks left to register after excluding %d shared blocks.",
+@@ -479,6 +585,7 @@ class RForkTransferBackend:
+         self.rfork_transfer_engine_weights_info_dict = weight_mr_dict
+         self.rfork_transfer_engine_weights_shape_dict = weight_shape_dict
+         self.registered_weight_blocks = weight_blocks_for_reg_mr
++        self.registered_memory_addresses = registered_memory_addresses
+         self._registered_transferable_tensors = transferable_tensors
+         logger.info(
+             "register_memory_region time: %.4fs, weights: %d",
+@@ -488,27 +595,44 @@ class RForkTransferBackend:
+         return True
+ 
+     def _unregister_weight_blocks(self, transfer_engine: Any) -> bool:
+-        ret = transfer_engine.batch_unregister_memory([address for address, _ in self.registered_weight_blocks])
+-        if ret.is_error():
+-            logger.error(
+-                "batch_unregister_memory failed for %d blocks, ret: %s",
+-                len(self.registered_weight_blocks),
+-                ret.to_string(),
+-            )
+-            return False
+-        self.rfork_transfer_engine_weights_info_dict = None
+-        self.rfork_transfer_engine_weights_shape_dict = None
+-        self.registered_weight_blocks = []
+-        self._registered_transferable_tensors = None
++        registered_memory_addresses = getattr(self, "registered_memory_addresses", None)
++        if registered_memory_addresses is None:
++            registered_memory_addresses = [address for address, _ in self.registered_weight_blocks]
++        remaining_addresses = list(registered_memory_addresses)
++        while remaining_addresses:
++            address_batch = remaining_addresses[:MAX_MEMORY_REGISTRATION_BATCH_ITEMS]
++            try:
++                ret = transfer_engine.batch_unregister_memory(address_batch)
++            except Exception as e:
++                self.registered_memory_addresses = remaining_addresses
++                logger.error(
++                    "batch_unregister_memory raised for batch of %d regions: %s",
++                    len(address_batch),
++                    e,
++                )
++                return False
++            if ret.is_error():
++                self.registered_memory_addresses = remaining_addresses
++                logger.error(
++                    "batch_unregister_memory failed for batch of %d regions, ret: %s",
++                    len(address_batch),
++                    ret.to_string(),
++                )
++                return False
++            del remaining_addresses[: len(address_batch)]
++            self.registered_memory_addresses = remaining_addresses
++        self._clear_registration_state()
+         return True
+ 
+     def unregister_memory_region(self) -> bool:
++        with self._get_lifecycle_lock():
++            return self._unregister_memory_region_locked()
++
++    def _unregister_memory_region_locked(self) -> bool:
+         transfer_engine = self._get_transfer_engine()
+         start_unreg_mr_time = time.perf_counter()
+         if not self.registered_weight_blocks:
+-            self.rfork_transfer_engine_weights_info_dict = None
+-            self.rfork_transfer_engine_weights_shape_dict = None
+-            self._registered_transferable_tensors = None
++            self._clear_registration_state()
+             logger.debug("unregister_memory_region skipped because no blocks are registered.")
+             return True
+ 
+@@ -520,6 +644,41 @@ class RForkTransferBackend:
+         )
+         return True
+ 
++    def finalize_transfer_engine(self, max_attempts: int | None = None) -> bool:
++        if max_attempts is not None and (
++            not isinstance(max_attempts, int) or isinstance(max_attempts, bool) or max_attempts <= 0
++        ):
++            raise ValueError("RFork TransferEngine finalize max_attempts must be None or a positive integer")
++        with self._get_lifecycle_lock():
++            if not getattr(self, "_is_initialized", False):
++                return True
++            transfer_engine = self._get_transfer_engine()
++            attempt = 0
++            while max_attempts is None or attempt < max_attempts:
++                attempt += 1
++                attempt_limit = str(max_attempts) if max_attempts is not None else "until ready"
++                try:
++                    ret = transfer_engine.finalize()
++                except Exception as e:
++                    logger.error("TransferEngine finalize raised on attempt %d/%s: %s", attempt, attempt_limit, e)
++                    return False
++                if not ret.is_error():
++                    self._clear_registration_state()
++                    self.rfork_transfer_engine_session_id = None
++                    self._is_initialized = False
++                    return True
++                logger.warning(
++                    "TransferEngine finalize failed on attempt %d/%s: %s",
++                    attempt,
++                    attempt_limit,
++                    ret.to_string(),
++                )
++                not_ready_code = getattr(self, "_not_ready_error_code", None)
++                get_code = getattr(ret, "get_code", None)
++                if not_ready_code is None or not callable(get_code) or get_code() != not_ready_code:
++                    return False
++            return False
++
+     def recv_from_source(
+         self,
+         model,
+@@ -527,6 +686,23 @@ class RForkTransferBackend:
+         seed_instance_service_port,
+         local_seed_key,
+         processed_layout: bool,
++    ):
++        with self._get_lifecycle_lock():
++            return self._recv_from_source_locked(
++                model,
++                seed_instance_ip,
++                seed_instance_service_port,
++                local_seed_key,
++                processed_layout,
++            )
++
++    def _recv_from_source_locked(
++        self,
++        model,
++        seed_instance_ip,
++        seed_instance_service_port,
++        local_seed_key,
++        processed_layout: bool,
+     ):
+         transfer_engine = self._get_transfer_engine()
+         seed_url = f"http://{seed_instance_ip}:{seed_instance_service_port}"
+-- 
+2.51.0.windows.1
+
