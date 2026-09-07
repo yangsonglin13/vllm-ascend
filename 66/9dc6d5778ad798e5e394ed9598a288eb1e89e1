@@ -1,0 +1,69 @@
+vllm_ascend/model_loader/rfork/types.py
+  s_c878e3a53b63de::t_31d8b12049fece 9
+  s_c878e3a53b63de::t_c28bb3a01c698f 1-8,10-50
+vllm_ascend/model_loader/rfork/seed_client.py
+  s_c878e3a53b63de::t_63ca71c18e2e8e 1-54
+vllm_ascend/model_loader/rfork/rfork_loader.py
+  s_c878e3a53b63de::t_07ea85af24d97f 46-48,289-290,438,440,446-452,461-464,473-474,476,484-485,487,489,492,501-502,538,565,568,571-572,591,602-603,605,611-612,639,643-644
+vllm_ascend/model_loader/rfork/manifest.py
+  s_c878e3a53b63de::t_dc7f289c86bea7 95
+  s_c878e3a53b63de::t_66636ca786865a 1-50,52-60,62-68,70-71,73-94,96-288
+  s_c878e3a53b63de::t_b89861b6ae9409 51,61,69,72
+tests/ut/model_loader/rfork/test_rfork_loader.py
+  s_c878e3a53b63de::t_46ad667d0ac87a 375-377,389-391,421-422
+  s_c878e3a53b63de::t_6ff7278adc9154 24,30,60,75,84-85,102-103,116-117,241,245,247-248,256,268,278,292-294,296-297,302,312,314-317,319,325,327-331,334-352,354-357,359-363,365-369,400,409,424-446,458-469,638,654-655,725-726,735,765-766,775,789,799,802,809,814-815,836-837,841,849,852-853,926-930,933,987-990,993
+tests/ut/model_loader/rfork/test_session.py
+  s_c878e3a53b63de::t_39ad9ca5f6376a 1-313
+RFORK_INTERNAL_REFACTOR_PLAN.md
+  s_c878e3a53b63de::t_66636ca786865a 1-149
+tests/ut/model_loader/rfork/test_transfer_backend.py
+  s_c878e3a53b63de::t_9746676dd844d3 18-19,21,23,26-27,29-36,41,45-58,62,66-96,103,112,116-134,141-143,148-149,153-154,164-165,184,187-188,212-213,220-246,256,266-285,287-292,295-296,300-608,613,629,636,652,670,673-674,680,682,687,690-725,757,760-770,778,781,783-786,789-790,794,799,806,824-831,838,853,859,878,895-899,904-905,928-929
+examples/rfork/rfork_planner.py
+  s_c878e3a53b63de::t_143d98b9ab6b6a 48,57-58,71,86-89,123-125,133,143,176,196,204,219,232-247,255,273-294,306,342-343,372-379,420-428,487-505,521,566-571,595
+vllm_ascend/model_loader/rfork/seed_server.py
+  s_c878e3a53b63de::t_ef09c7b2770fc1 35-36
+  s_c878e3a53b63de::t_66636ca786865a 42,140,154-155,228,232,266,317
+vllm_ascend/model_loader/rfork/transfer_backend.py
+  s_c878e3a53b63de::t_676005804a3a43 7,15-33,68-70,72-76,79-81,84,86,88-91,93-105,107-110,116,121-134,140-151,153-155,157-159,161-166,168-171,173-176,178-180,183-199,201-205,207-218,220-235,238-258,260-264,266-268,270-271,274-279,282-297,300-325,327-341,347-348,350-355,357,360-373,376-380,382-384,386-387,390,397,407-408,414,422-423,427-428,431-432,435-437,439-443,445-448,450-451,453,455-457,460-462,464-465,467-469,473,476,478-479,481,483-487,490-493,495-496,498-501,503-505,510,512,514,517,520,524-529
+vllm_ascend/model_loader/rfork/planner_client.py
+  s_c878e3a53b63de::t_a1952dced9feaf 1-249
+vllm_ascend/model_loader/rfork/config.py
+  s_c878e3a53b63de::t_886c69a1ba2ba3 1-112
+tests/ut/model_loader/rfork/test_planner_client.py
+  s_c878e3a53b63de::t_7abb77531a6ab4 7-9,12,15-16,20,22-23,26,41-42,46,50,52-53,58-67,71,83,86,91,105,108,115,127,130,136,149,152,158,164,168,172,183,186
+  s_c878e3a53b63de::t_46ad667d0ac87a 54-56
+tests/ut/model_loader/rfork/test_seed_server.py
+  s_c878e3a53b63de::t_4c723d6f8db4d5 13,64-70,78
+vllm_ascend/model_loader/rfork/session.py
+  s_c878e3a53b63de::t_2ef45cdd06cf50 60-65,70
+  s_c878e3a53b63de::t_770ff99a009249 136
+  s_c878e3a53b63de::t_66636ca786865a 1-59,66-69,71-135,137-230
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "669dc6d5778ad798e5e394ed9598a288eb1e89e1",
+  "prompts": {},
+  "sessions": {
+    "s_c878e3a53b63de": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a9bcb3171811b426ebc22f0",
+        "model": "glm-5.3-flash__max"
+      },
+      "human_author": "yangsonglin13 <yangsonglin566@gmail.com>",
+      "custom_attributes": {
+        "display_model_name": "GLM-5.3-Flash",
+        "operation_id": "6a9c290271811b426ebc2c23",
+        "edit_kind": "bash",
+        "tool_name": "RunCommand",
+        "runtime_client": "trae-tob-git-ai",
+        "source_scene": "agent",
+        "session_id": "6a9bcb3171811b426ebc22f0",
+        "tool_use_id": "6a9c290271811b426ebc2c23",
+        "client_type": "ide",
+        "external_session_id": "6a9bcb3171811b426ebc22f0"
+      }
+    }
+  }
+}
