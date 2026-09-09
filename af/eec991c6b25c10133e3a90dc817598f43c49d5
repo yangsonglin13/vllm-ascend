@@ -1,0 +1,58 @@
+vllm_ascend/model_loader/rfork/rfork_loader.py
+  s_bb9a78864e9e2c::t_1d7a717eaaab82 48-54
+  s_bb9a78864e9e2c::t_112b13b2929736 55-57
+tests/ut/model_loader/rfork/test_session.py
+  s_bb9a78864e9e2c::t_1d7a717eaaab82 141,159-161,185,214,217-224,269,281,289,305-306,312
+  s_bb9a78864e9e2c::t_864b7f464be13f 138-140
+  s_bb9a78864e9e2c::t_589eb8ba936bca 142-144,156-158
+  s_bb9a78864e9e2c::t_054826e0192aac 162-164,182-184
+  s_bb9a78864e9e2c::t_c4c7c26a23527a 186-188
+  s_bb9a78864e9e2c::t_271973a1c20f0c 270-272
+  s_bb9a78864e9e2c::t_3b13938029b384 278-280
+  s_bb9a78864e9e2c::t_5178b0b3f7896f 282-284,286-288
+  s_bb9a78864e9e2c::t_cb31dbc46502b7 290-292,302-304
+  s_bb9a78864e9e2c::t_498d6928cbf07f 307-311
+  s_bb9a78864e9e2c::t_e571bb49f63e5a 313-315
+tests/ut/model_loader/rfork/test_rfork_loader.py
+  s_bb9a78864e9e2c::t_1d7a717eaaab82 890
+vllm_ascend/model_loader/rfork/planner_client.py
+  s_bb9a78864e9e2c::t_1d7a717eaaab82 184,187-205
+  s_bb9a78864e9e2c::t_34098bbedb7e42 206-208
+vllm_ascend/model_loader/rfork/session.py
+  s_bb9a78864e9e2c::t_1d7a717eaaab82 101,164,170,192,197-198,202-204,219,222-233,236-259,261,263-302,304-305,318,322
+  s_bb9a78864e9e2c::t_80644efb76edd7 98-100
+  s_bb9a78864e9e2c::t_194322f8ab036c 102-104
+  s_bb9a78864e9e2c::t_8e9ba26f121374 161-163
+  s_bb9a78864e9e2c::t_cd80404d39390d 165-169
+  s_bb9a78864e9e2c::t_48e9a195eb9c45 171
+  s_bb9a78864e9e2c::t_938fc0dd257076 317
+  s_bb9a78864e9e2c::t_e41b02b231bb9a 319-321
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "afeec991c6b25c10133e3a90dc817598f43c49d5",
+  "prompts": {},
+  "sessions": {
+    "s_bb9a78864e9e2c": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a9f761b71811b426ebc3086",
+        "model": "glm-5.3__max"
+      },
+      "human_author": "yangsonglin13 <yangsonglin566@gmail.com>",
+      "custom_attributes": {
+        "operation_id": "6a9f7a6771811b426ebc3147",
+        "runtime_client": "trae-tob-git-ai",
+        "tool_name": "RunCommand",
+        "external_session_id": "6a9f761b71811b426ebc3086",
+        "edit_kind": "bash",
+        "client_type": "ide",
+        "display_model_name": "GLM-5.3",
+        "session_id": "6a9f761b71811b426ebc3086",
+        "tool_use_id": "6a9f7a6771811b426ebc3147",
+        "source_scene": "agent"
+      }
+    }
+  }
+}
