@@ -1,0 +1,80 @@
+vllm_ascend/model_loader/rfork/session.py
+  s_bb9a78864e9e2c::t_80644efb76edd7 98-100
+  s_bb9a78864e9e2c::t_8e9ba26f121374 161-163
+  s_bb9a78864e9e2c::t_e41b02b231bb9a 315-317
+  s_bb9a78864e9e2c::t_194322f8ab036c 102-104
+  s_bb9a78864e9e2c::t_938fc0dd257076 313
+  s_bb9a78864e9e2c::t_1d7a717eaaab82 96,101,115,158,164,170,192,197-198,202-204,219,222-233,236-255,257,259-298,300-301,314,318,337,345
+  s_bb9a78864e9e2c::t_48e9a195eb9c45 171
+  s_bb9a78864e9e2c::t_cd80404d39390d 105,155,165-169
+  s_bb9a78864e9e2c::t_2ae7d1733bf9f1 95
+  s_bb9a78864e9e2c::t_eb5d05fc4cfe50 97
+  s_bb9a78864e9e2c::t_24b29b51d4c8e8 106-108,112-114
+  s_bb9a78864e9e2c::t_26454d37e3d782 116-118
+  s_bb9a78864e9e2c::t_97137f30b517f3 152-154
+  s_bb9a78864e9e2c::t_1af6472c48eb55 156-157
+  s_bb9a78864e9e2c::t_a5501c6883d577 159-160
+tests/ut/model_loader/rfork/test_rfork_loader.py
+  s_bb9a78864e9e2c::t_1d7a717eaaab82 890
+vllm_ascend/model_loader/rfork/planner_client.py
+  s_bb9a78864e9e2c::t_1d7a717eaaab82 184,187-205,212,219
+  s_bb9a78864e9e2c::t_34098bbedb7e42 206-208,214
+  s_bb9a78864e9e2c::t_c73ff20c8918e9 209-211
+  s_bb9a78864e9e2c::t_b943122a2925b1 213
+  s_bb9a78864e9e2c::t_344d469b033a1b 215-218
+  s_bb9a78864e9e2c::t_5b22d8da5eaf5a 220-222
+vllm_ascend/model_loader/rfork/rfork_loader.py
+  s_bb9a78864e9e2c::t_1d7a717eaaab82 48-54
+  s_bb9a78864e9e2c::t_112b13b2929736 55-57
+  s_bb9a78864e9e2c::t_8c18eff7cf59c4 58-60
+tests/ut/model_loader/rfork/test_session.py
+  s_bb9a78864e9e2c::t_1d7a717eaaab82 141,159-161,185,214,217-224,269,281,289,305-306,312
+  s_bb9a78864e9e2c::t_589eb8ba936bca 142-158
+  s_bb9a78864e9e2c::t_c4c7c26a23527a 186-188,318
+  s_bb9a78864e9e2c::t_271973a1c20f0c 270-272
+  s_bb9a78864e9e2c::t_864b7f464be13f 138-140
+  s_bb9a78864e9e2c::t_498d6928cbf07f 307-311
+  s_bb9a78864e9e2c::t_cb31dbc46502b7 290-304,451
+  s_bb9a78864e9e2c::t_e571bb49f63e5a 313-315
+  s_bb9a78864e9e2c::t_3b13938029b384 278-280
+  s_bb9a78864e9e2c::t_054826e0192aac 162-184
+  s_bb9a78864e9e2c::t_5178b0b3f7896f 189-190,193,282-288,320-321,324
+  s_bb9a78864e9e2c::t_4aaa65430e9a78 191-192
+  s_bb9a78864e9e2c::t_2a81eaa0f7c1cb 194-196
+  s_bb9a78864e9e2c::t_0f12a6ab6d2fe1 273
+  s_bb9a78864e9e2c::t_4585e6bbe3f4d2 277
+  s_bb9a78864e9e2c::t_6af997fce449a8 316-317
+  s_bb9a78864e9e2c::t_f1f271c3e056ef 319
+  s_bb9a78864e9e2c::t_a7c86c068399ee 322-323
+  s_bb9a78864e9e2c::t_37a6446f867b4b 325-327
+  s_bb9a78864e9e2c::t_8689e0b66c12b7 450
+  s_bb9a78864e9e2c::t_69a6c7cd5749bb 452-454
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "06ec62d08eae3d8fdae1a6d3575b47f170ca1c20",
+  "prompts": {},
+  "sessions": {
+    "s_bb9a78864e9e2c": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a9f761b71811b426ebc3086",
+        "model": "glm-5.3__max"
+      },
+      "human_author": "yangsonglin13 <yangsonglin566@gmail.com>",
+      "custom_attributes": {
+        "tool_name": "RunCommand",
+        "runtime_client": "trae-tob-git-ai",
+        "session_id": "6a9f761b71811b426ebc3086",
+        "source_scene": "agent",
+        "edit_kind": "bash",
+        "operation_id": "6a9f7a6771811b426ebc3147",
+        "external_session_id": "6a9f761b71811b426ebc3086",
+        "tool_use_id": "6a9f7a6771811b426ebc3147",
+        "display_model_name": "GLM-5.3",
+        "client_type": "ide"
+      }
+    }
+  }
+}
