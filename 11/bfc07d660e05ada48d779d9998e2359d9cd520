@@ -1,0 +1,35 @@
+tests/ut/model_loader/rfork/test_planner_client.py
+  s_4d0c34bfb35fc7::t_52cc6a538aa63b 26,44-48,50-52,54,56-60
+tests/ut/model_loader/rfork/test_rfork_loader.py
+  s_4d0c34bfb35fc7::t_52cc6a538aa63b 422-425,452,455,459,461-466
+tests/ut/model_loader/rfork/test_session.py
+  s_4d0c34bfb35fc7::t_52cc6a538aa63b 142-143,145,181,199,201-202,205-206
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "11bfc07d660e05ada48d779d9998e2359d9cd520",
+  "prompts": {},
+  "sessions": {
+    "s_4d0c34bfb35fc7": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6aa12b1c71811b426ebc326c",
+        "model": "glm-5.3__max"
+      },
+      "human_author": "yangsonglin13 <yangsonglin566@gmail.com>",
+      "custom_attributes": {
+        "tool_use_id": "6aa12c8c71811b426ebc32ad",
+        "display_model_name": "GLM-5.3",
+        "source_scene": "agent",
+        "edit_kind": "bash",
+        "operation_id": "6aa12c8c71811b426ebc32ad",
+        "session_id": "6aa12b1c71811b426ebc326c",
+        "client_type": "ide",
+        "runtime_client": "trae-tob-git-ai",
+        "external_session_id": "6aa12b1c71811b426ebc326c",
+        "tool_name": "RunCommand"
+      }
+    }
+  }
+}
