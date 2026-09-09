@@ -1,0 +1,64 @@
+tests/ut/model_loader/rfork/test_session.py
+  s_4d0c34bfb35fc7::t_52cc6a538aa63b 142
+  s_bb9a78864e9e2c::t_1d7a717eaaab82 199,201-202,205
+  s_bb9a78864e9e2c::t_054826e0192aac 143,145
+  s_bb9a78864e9e2c::t_5178b0b3f7896f 181
+  s_bb9a78864e9e2c::t_a9cbaaa4df6fd6 206
+tests/ut/model_loader/rfork/test_rfork_loader.py
+  s_4d0c34bfb35fc7::t_52cc6a538aa63b 425
+  s_bb9a78864e9e2c::t_1d7a717eaaab82 423,426
+  s_bb9a78864e9e2c::t_167366700cbc9b 424
+  s_bb9a78864e9e2c::t_14d8cb837c0ae8 460,462-467
+tests/ut/model_loader/rfork/test_planner_client.py
+  s_4d0c34bfb35fc7::t_52cc6a538aa63b 45-48,50-52
+  s_bb9a78864e9e2c::t_1d7a717eaaab82 26,56-60
+  s_4d0c34bfb35fc7::t_a17474625dcaa8 44
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "68c1b6ba9b6c057400c0551e4551f80c5af4fec1",
+  "prompts": {},
+  "sessions": {
+    "s_4d0c34bfb35fc7": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6aa12b1c71811b426ebc326c",
+        "model": "glm-5.3__max"
+      },
+      "human_author": "yangsonglin13 <yangsonglin566@gmail.com>",
+      "custom_attributes": {
+        "session_id": "6aa12b1c71811b426ebc326c",
+        "source_scene": "agent",
+        "tool_use_id": "6aa12c8c71811b426ebc32ad",
+        "client_type": "ide",
+        "external_session_id": "6aa12b1c71811b426ebc326c",
+        "edit_kind": "bash",
+        "tool_name": "RunCommand",
+        "operation_id": "6aa12c8c71811b426ebc32ad",
+        "runtime_client": "trae-tob-git-ai",
+        "display_model_name": "GLM-5.3"
+      }
+    },
+    "s_bb9a78864e9e2c": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a9f761b71811b426ebc3086",
+        "model": "glm-5.3__max"
+      },
+      "human_author": "yangsonglin13 <yangsonglin566@gmail.com>",
+      "custom_attributes": {
+        "tool_use_id": "6a9f7a6771811b426ebc3147",
+        "operation_id": "6a9f7a6771811b426ebc3147",
+        "external_session_id": "6a9f761b71811b426ebc3086",
+        "client_type": "ide",
+        "source_scene": "agent",
+        "session_id": "6a9f761b71811b426ebc3086",
+        "display_model_name": "GLM-5.3",
+        "runtime_client": "trae-tob-git-ai",
+        "tool_name": "RunCommand",
+        "edit_kind": "bash"
+      }
+    }
+  }
+}
