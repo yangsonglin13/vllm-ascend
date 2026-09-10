@@ -1,0 +1,75 @@
+tests/ut/model_loader/rfork/test_tensor_safety_isolated.py
+  s_3275e55ae6c5ea::t_29fe888b8e90a9 1-374
+tests/ut/model_loader/rfork/test_late_lease_isolated.py
+  s_3275e55ae6c5ea::t_29fe888b8e90a9 192-222,226-261
+  s_3275e55ae6c5ea::t_0eef197f919eb4 223-225
+  s_3275e55ae6c5ea::t_9cfa10a4c57ac2 262-263
+tests/ut/model_loader/rfork/test_rfork_loader.py
+  s_3275e55ae6c5ea::t_29fe888b8e90a9 323-325,827
+vllm_ascend/model_loader/rfork/seed_client.py
+  s_3275e55ae6c5ea::t_29fe888b8e90a9 9,17-24,27-29,31-44,47-86,124-140
+tests/ut/model_loader/rfork/test_seed_server_cleanup_isolated.py
+  s_3275e55ae6c5ea::t_29fe888b8e90a9 1-191
+vllm_ascend/model_loader/rfork/session.py
+  s_3275e55ae6c5ea::t_29fe888b8e90a9 16-20,93-102,117,137,257,263,267,292,307-335,357,399-400,406,430,434,450-452,477-481
+  s_3275e55ae6c5ea::t_93c2bd38a7b85c 114-116
+vllm_ascend/model_loader/rfork/manifest.py
+  s_3275e55ae6c5ea::t_29fe888b8e90a9 69-75
+tests/ut/model_loader/rfork/test_identity_validation.py
+  s_3275e55ae6c5ea::t_29fe888b8e90a9 1-280
+vllm_ascend/model_loader/rfork/rfork_loader.py
+  s_3275e55ae6c5ea::t_29fe888b8e90a9 57-59,101,512-520,585-588,593-598
+tests/ut/model_loader/rfork/test_lease_release.py
+  s_3275e55ae6c5ea::t_29fe888b8e90a9 44-55,210,260,272-393
+vllm_ascend/model_loader/rfork/transfer_backend.py
+  s_3275e55ae6c5ea::t_29fe888b8e90a9 71-73,86,155-185,198-199,202,232,259-260,271-279,297,333,338,396-402,411,418-419,438-444,447,454-455,466,468-470,488-504,519-543,551,645-652,682,699
+docs/source/locale/zh_CN/LC_MESSAGES/user_guide/feature_guide/rfork.po
+  s_3275e55ae6c5ea::t_29fe888b8e90a9 92-93,200-219,246,417-418,472-473,476,524-525,527-528,556-564,692,699
+  s_3275e55ae6c5ea::t_27f57d0d170ead 220-222
+  s_3275e55ae6c5ea::t_23ac6ebd09dc9b 243-245
+vllm_ascend/model_loader/rfork/types.py
+  s_3275e55ae6c5ea::t_29fe888b8e90a9 15-17
+tests/ut/model_loader/rfork/test_ops_config.py
+  s_3275e55ae6c5ea::t_29fe888b8e90a9 131
+vllm_ascend/model_loader/rfork/identity.py
+  s_3275e55ae6c5ea::t_29fe888b8e90a9 32-33,35-39,41-42,44-62,64-91,93-98,100-104
+docs/source/user_guide/feature_guide/rfork.md
+  s_3275e55ae6c5ea::t_29fe888b8e90a9 44,139-150,155-156,159-166,191-192,201-205,384
+  s_3275e55ae6c5ea::t_b632fef1c3ff2c 151-154
+vllm_ascend/model_loader/rfork/seed_server.py
+  s_3275e55ae6c5ea::t_29fe888b8e90a9 25,49-56,97-104,147,192-206,215-222,232,241,245-254,276,285,299-301,304-319,368-374
+vllm_ascend/model_loader/rfork/tensor_layout.py
+  s_3275e55ae6c5ea::t_29fe888b8e90a9 8,58-64,67-75,78-88,96-106,112,118-120,122-143,147,169
+docs/source/developer_guide/Design_Documents/rfork_lease_lifecycle.md
+  s_3275e55ae6c5ea::t_3cecfcf96a8c22 183-202
+vllm_ascend/model_loader/rfork/planner_client.py
+  s_3275e55ae6c5ea::t_29fe888b8e90a9 88-95,97-99
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "1373d3cca3a0f506955624d23fdc95d5fba39879",
+  "prompts": {},
+  "sessions": {
+    "s_3275e55ae6c5ea": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6aa289da71811b426ebc336a",
+        "model": "glm-5.3__max"
+      },
+      "human_author": "yangsonglin13 <yangsonglin566@gmail.com>",
+      "custom_attributes": {
+        "display_model_name": "GLM-5.3",
+        "tool_use_id": "6aa2dcc871811b426ebc36b4",
+        "tool_name": "RunCommand",
+        "client_type": "ide",
+        "session_id": "6aa289da71811b426ebc336a",
+        "external_session_id": "6aa289da71811b426ebc336a",
+        "operation_id": "6aa2dcc871811b426ebc36b4",
+        "source_scene": "agent",
+        "edit_kind": "bash",
+        "runtime_client": "trae-tob-git-ai"
+      }
+    }
+  }
+}
