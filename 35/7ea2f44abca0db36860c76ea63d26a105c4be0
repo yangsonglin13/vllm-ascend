@@ -1,0 +1,34 @@
+tests/ut/model_loader/rfork/test_late_lease_isolated.py
+  s_3c673679ee66c3::t_94deb0372b8f78 59-71
+  s_3c673679ee66c3::t_2c05522c60d130 56-58
+vllm_ascend/model_loader/rfork/identity.py
+  s_3c673679ee66c3::t_94deb0372b8f78 29
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "357ea2f44abca0db36860c76ea63d26a105c4be0",
+  "prompts": {},
+  "sessions": {
+    "s_3c673679ee66c3": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6aa35f6a71811b426ebc36d8",
+        "model": "GLM-5.3"
+      },
+      "human_author": "yangsonglin13 <yangsonglin566@gmail.com>",
+      "custom_attributes": {
+        "operation_id": "6aa3605571811b426ebc3719",
+        "client_type": "ide",
+        "external_session_id": "6aa35f6a71811b426ebc36d8",
+        "edit_kind": "bash",
+        "source_scene": "agent",
+        "tool_name": "RunCommand",
+        "tool_use_id": "6aa3605571811b426ebc3719",
+        "session_id": "6aa35f6a71811b426ebc36d8",
+        "runtime_client": "trae-tob-git-ai",
+        "display_model_name": "GLM-5.3"
+      }
+    }
+  }
+}
