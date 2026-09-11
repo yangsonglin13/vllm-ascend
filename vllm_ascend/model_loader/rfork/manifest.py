@@ -126,46 +126,10 @@ def update_registered_weight_info(info: dict[str, Any] | None, name: str, tensor
         info[name] = (*current[:3], tuple(tensor.shape))
 
 
-def _extract_manifest_entries(manifest_metadata: Any) -> Mapping[str, Any] | None:
-    if not isinstance(manifest_metadata, Mapping):
-        return None
-    for key in ("weights", "tensors", "manifest", "entries", "weight_info"):
-        entries = manifest_metadata.get(key)
-        if isinstance(entries, Mapping):
-            return entries
-
-    metadata_keys = {
-        "tensor_count",
-        "num_tensors",
-        "count",
-        "total_bytes",
-        "byte_count",
-        "bytes",
-    }
-    entries = {key: value for key, value in manifest_metadata.items() if key not in metadata_keys}
-    return entries if entries and all(isinstance(key, str) for key in entries) else None
-
-
-def _get_manifest_value(metadata: Mapping[str, Any], *keys: str) -> Any:
-    for key in keys:
-        if key in metadata:
-            return metadata[key]
-    return None
-
-
-def _parse_manifest_scalar(value: Any, *, allow_zero: bool = False) -> int | None:
-    if not isinstance(value, int) or isinstance(value, bool):
-        return None
-    if value < 0 or (value == 0 and not allow_zero):
-        return None
-    return value
-
-
 def validate_weight_manifest(
     seed_info: SeedTransferInfo,
     transferable_tensors: list[tuple[str, torch.Tensor]],
     skipped_shared_names: set[str],
-    manifest_metadata: Any | None = None,
 ) -> dict[str, tuple[int, int, int, tuple[int, ...], str]] | None:
     """Validate seed metadata against local tensors before any layout change or read."""
     remote_name_set = set(seed_info.weights)
@@ -250,60 +214,5 @@ def validate_weight_manifest(
             remote_total_bytes,
         )
         return None
-
-    if manifest_metadata is not None:
-        if not isinstance(manifest_metadata, Mapping):
-            logger.error("RFork manifest metadata is malformed.")
-            return None
-        count_value = _get_manifest_value(manifest_metadata, "tensor_count", "num_tensors", "count")
-        if count_value is not None and _parse_manifest_scalar(count_value) != len(local_by_name):
-            logger.error("RFork manifest tensor count mismatch: %s", count_value)
-            return None
-        bytes_value = _get_manifest_value(manifest_metadata, "total_bytes", "byte_count", "bytes")
-        if bytes_value is not None and _parse_manifest_scalar(bytes_value) != local_total_bytes:
-            logger.error("RFork manifest byte count mismatch: %s", bytes_value)
-            return None
-
-        metadata_entries = _extract_manifest_entries(manifest_metadata)
-        if metadata_entries is not None:
-            if set(metadata_entries) != set(local_by_name):
-                logger.error("RFork optional manifest names differ from local manifest.")
-                return None
-            for name, metadata in metadata_entries.items():
-                if not isinstance(metadata, Mapping):
-                    logger.error("RFork optional manifest entry for %s is malformed", name)
-                    return None
-                tensor = local_by_name[name]
-                remote_entry = parsed_remote[name]
-                expected_numel = _get_manifest_value(metadata, "numel", "count", "seed_len")
-                if expected_numel is not None and (
-                    _parse_manifest_scalar(expected_numel) != tensor.numel()
-                    or _parse_manifest_scalar(expected_numel) != remote_entry[1]
-                ):
-                    logger.error("RFork optional manifest numel mismatch for %s", name)
-                    return None
-                expected_size = _get_manifest_value(metadata, "element_size", "itemsize", "seed_size")
-                if expected_size is not None and (
-                    _parse_manifest_scalar(expected_size) != tensor.element_size()
-                    or _parse_manifest_scalar(expected_size) != remote_entry[2]
-                ):
-                    logger.error("RFork optional manifest element size mismatch for %s", name)
-                    return None
-                expected_shape = metadata.get("shape")
-                if expected_shape is not None:
-                    expected_shape = normalize_weight_shape(expected_shape)
-                    if (
-                        expected_shape is None
-                        or numel_from_shape(expected_shape) != tensor.numel()
-                        or expected_shape != remote_entry[3]
-                    ):
-                        logger.error("RFork optional manifest shape mismatch for %s", name)
-                        return None
-                expected_dtype = metadata.get("dtype")
-                if expected_dtype is not None:
-                    expected_dtype = normalize_dtype_name(expected_dtype)
-                    if expected_dtype != normalize_dtype_name(tensor.dtype) or expected_dtype != remote_entry[4]:
-                        logger.error("RFork optional manifest dtype mismatch for %s", name)
-                        return None
 
     return parsed_remote

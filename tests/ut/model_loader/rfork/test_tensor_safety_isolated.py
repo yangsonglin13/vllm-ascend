@@ -3,72 +3,16 @@
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 
-import importlib.util
-import logging
-import sys
-from dataclasses import dataclass
-from pathlib import Path
-from types import ModuleType, SimpleNamespace
+import ctypes
+import threading
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
 from torch import nn
 
-RFORK_ROOT = Path(__file__).resolve().parents[4] / "vllm_ascend/model_loader/rfork"
-
-
-def _load_module(monkeypatch, module_name: str, file_name: str):
-    spec = importlib.util.spec_from_file_location(module_name, RFORK_ROOT / file_name)
-    module = importlib.util.module_from_spec(spec)
-    monkeypatch.setitem(sys.modules, module_name, module)
-    spec.loader.exec_module(module)
-    return module
-
-
-def _stub(monkeypatch, module_name: str, **attributes):
-    module = ModuleType(module_name)
-    module.__dict__.update(attributes)
-    monkeypatch.setitem(sys.modules, module_name, module)
-    return module
-
-
-@pytest.fixture
-def tensor_runtime(monkeypatch):
-    _stub(monkeypatch, "vllm", __path__=[])
-    _stub(monkeypatch, "vllm.logger", logger=logging.getLogger("rfork-tensor-safety-test"))
-    _stub(monkeypatch, "vllm.utils", __path__=[])
-    _stub(
-        monkeypatch,
-        "vllm.utils.network_utils",
-        get_ip=lambda: "127.0.0.1",
-        get_open_port=lambda: 12345,
-        join_host_port=lambda host, port: f"{host}:{port}",
-    )
-    for module_name in (
-        "vllm_ascend",
-        "vllm_ascend.model_loader",
-        "vllm_ascend.model_loader.rfork",
-    ):
-        _stub(monkeypatch, module_name, __path__=[])
-
-    @dataclass(frozen=True)
-    class _SeedTransferInfo:
-        session_id: str
-        weights: dict
-        shapes: dict | None = None
-
-    _stub(monkeypatch, "vllm_ascend.model_loader.rfork.types", SeedTransferInfo=_SeedTransferInfo)
-    _load_module(monkeypatch, "vllm_ascend.model_loader.rfork.manifest", "manifest.py")
-    tensor_layout = _load_module(monkeypatch, "vllm_ascend.model_loader.rfork.tensor_layout", "tensor_layout.py")
-    transfer_backend = _load_module(
-        monkeypatch, "vllm_ascend.model_loader.rfork.transfer_backend", "transfer_backend.py"
-    )
-    return SimpleNamespace(
-        tensor_layout=tensor_layout,
-        transfer_backend=transfer_backend,
-        RForkTransferBackend=transfer_backend.RForkTransferBackend,
-        SeedTransferInfo=_SeedTransferInfo,
-    )
+from tests.ut.model_loader.rfork.rfork_test_support import _stub
 
 
 class _CallableImpl:
@@ -138,6 +82,150 @@ def test_collector_scans_custom_callable_impl_and_skips_function(tensor_runtime,
 
     assert "impl.weights" in names
     assert all(not name.startswith("impl.function") for name in names)
+
+
+def test_collector_accepts_dense_permutation_offset_and_singleton_views(tensor_runtime, monkeypatch):
+    base = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    model = nn.Module()
+    model.weight = nn.Parameter(base.t())
+    model.register_buffer("offset", base.reshape(-1)[1:9])
+    model.register_buffer("singleton", base[:1, :])
+    monkeypatch.setattr(tensor_runtime.tensor_layout, "is_tensor_on_transfer_device", lambda _tensor: True)
+
+    collected = tensor_runtime.tensor_layout.collect_processed_layout_tensors(model)
+
+    assert [name for name, _ in collected] == ["weight", "offset", "singleton"]
+    assert tensor_runtime.tensor_layout.is_non_overlapping_dense_tensor(base.t())
+    assert tensor_runtime.tensor_layout.is_non_overlapping_dense_tensor(base.reshape(-1)[1:9])
+    assert tensor_runtime.tensor_layout.is_non_overlapping_dense_tensor(base[:1, :])
+
+
+@pytest.mark.parametrize("state_kind", ["parameter", "buffer"])
+def test_collector_rejects_gapped_views_in_parameters_and_buffers(tensor_runtime, monkeypatch, state_kind):
+    base = torch.arange(8, dtype=torch.float32)
+    gapped = base[::2]
+    model = nn.Module()
+    if state_kind == "parameter":
+        model.register_parameter("weight", nn.Parameter(gapped))
+    else:
+        model.register_buffer("buffer", gapped)
+    monkeypatch.setattr(tensor_runtime.tensor_layout, "is_tensor_on_transfer_device", lambda _tensor: True)
+
+    with pytest.raises(ValueError, match="gapped or overlapping storage"):
+        tensor_runtime.tensor_layout.collect_processed_layout_tensors(model)
+
+
+@pytest.mark.parametrize(
+    "view_factory",
+    [
+        lambda base: base.expand(2, -1),
+        lambda base: base.as_strided((2, 2), (1, 1)),
+    ],
+    ids=["broadcast", "overlap"],
+)
+def test_collector_rejects_overlapping_views(tensor_runtime, monkeypatch, view_factory):
+    base = torch.arange(3, dtype=torch.float32)
+    model = nn.Module()
+    model.register_buffer("buffer", view_factory(base))
+    monkeypatch.setattr(tensor_runtime.tensor_layout, "is_tensor_on_transfer_device", lambda _tensor: True)
+
+    with pytest.raises(ValueError, match="gapped or overlapping storage"):
+        tensor_runtime.tensor_layout.collect_processed_layout_tensors(model)
+
+
+def test_registration_rejects_gapped_view_before_native_registration(tensor_runtime, monkeypatch):
+    base = torch.arange(8, dtype=torch.float32)
+    gapped = base[::2]
+    registrations = []
+
+    class _MemoryRegistration:
+        def __init__(self, *values):
+            self.values = values
+
+    backend = tensor_runtime.RForkTransferBackend.__new__(tensor_runtime.RForkTransferBackend)
+    backend.transfer_engine = SimpleNamespace(
+        batch_register_memory_ex=lambda items: registrations.extend(item.values for item in items),
+    )
+    backend._memory_registration_cls = _MemoryRegistration
+    backend.registered_weight_blocks = []
+    backend.registered_memory_addresses = []
+    backend._registered_transferable_tensors = None
+    backend._registered_transferable_storages = None
+    monkeypatch.setattr(tensor_runtime.transfer_backend, "find_non_npu_state_tensors", lambda _model: [])
+    monkeypatch.setattr(tensor_runtime.transfer_backend, "is_transferable_tensor", lambda _tensor: True)
+    monkeypatch.setattr(
+        tensor_runtime.transfer_backend,
+        "collect_transferable_tensors",
+        lambda *_args: [("gapped", gapped)],
+    )
+
+    with pytest.raises(ValueError, match="gapped or overlapping storage"):
+        backend.register_memory_region(object(), False)
+
+    assert registrations == []
+
+
+def test_read_rejects_gapped_cached_view_before_native_read(tensor_runtime):
+    base = torch.arange(8, dtype=torch.float32)
+    gapped = base[::2]
+    reads = []
+    backend = tensor_runtime.RForkTransferBackend.__new__(tensor_runtime.RForkTransferBackend)
+    backend.transfer_engine = SimpleNamespace(batch_transfer_sync_read=lambda *args: reads.append(args))
+    backend._registered_transferable_tensors = [("gapped", gapped)]
+    backend.weight_shapes = {}
+    seed_info = tensor_runtime.SeedTransferInfo(
+        "seed-session",
+        {"gapped": [1, gapped.numel(), gapped.element_size(), list(gapped.shape), "float32"]},
+    )
+
+    with pytest.raises(ValueError, match="gapped or overlapping storage"):
+        backend.read_weights_from_seed(object(), seed_info, True)
+
+    assert reads == []
+
+
+def test_read_copies_dense_transpose_view_as_contiguous_bytes(tensor_runtime):
+    source_storage = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    seed_view = source_storage.t()
+    target_storage = torch.full_like(source_storage, -1)
+    target_view = target_storage.t()
+    read_lengths = []
+
+    def read(_session_id, client_ptrs, seed_ptrs, lengths):
+        read_lengths.extend(lengths)
+        ctypes.memmove(client_ptrs[0], seed_ptrs[0], lengths[0])
+        return SimpleNamespace(is_error=lambda: False)
+
+    backend = tensor_runtime.RForkTransferBackend.__new__(tensor_runtime.RForkTransferBackend)
+    backend.transfer_engine = SimpleNamespace(batch_transfer_sync_read=read)
+    backend._registered_transferable_tensors = [("weight", target_view)]
+    backend.weight_shapes = {"weight": tuple(target_view.shape)}
+    backend.weight_manifest = {
+        "weight": (
+            target_view.data_ptr(),
+            target_view.numel(),
+            target_view.element_size(),
+            tuple(target_view.shape),
+            "float32",
+        )
+    }
+    seed_info = tensor_runtime.SeedTransferInfo(
+        "seed-session",
+        {
+            "weight": [
+                seed_view.data_ptr(),
+                seed_view.numel(),
+                seed_view.element_size(),
+                list(seed_view.shape),
+                "float32",
+            ]
+        },
+    )
+
+    assert backend.read_weights_from_seed(object(), seed_info, True)
+
+    assert read_lengths == [source_storage.numel() * source_storage.element_size()]
+    assert torch.equal(target_storage, source_storage)
 
 
 def test_registration_merges_small_then_large_alias_ranges(tensor_runtime, monkeypatch):
@@ -372,3 +460,101 @@ def test_shared_reuse_requires_all_tensor_bytes_and_nonempty_state(tensor_runtim
     assert not backend.can_reuse_shared_weights(object(), False, [(address, size - 1)])
     monkeypatch.setattr(tensor_runtime.transfer_backend, "collect_transferable_tensors", lambda *args: [])
     assert not backend.can_reuse_shared_weights(object(), False, [(address, size)])
+
+
+def test_shared_weights_and_empty_cleanup_do_not_create_engine(tensor_runtime, monkeypatch):
+    create_engine = Mock(side_effect=AssertionError("idle backend must not initialize"))
+    monkeypatch.setattr(tensor_runtime.RForkTransferBackend, "_initialize_transfer_engine", create_engine)
+    backend = tensor_runtime.RForkTransferBackend()
+    weight = torch.ones(8)
+    monkeypatch.setattr(tensor_runtime.transfer_backend, "find_non_npu_state_tensors", lambda model: [])
+    monkeypatch.setattr(tensor_runtime.transfer_backend, "collect_transferable_tensors", lambda *args: [("w", weight)])
+    assert backend.can_reuse_shared_weights(
+        object(), True, [(weight.data_ptr(), weight.numel() * weight.element_size())]
+    )
+    assert backend.unregister_memory_region()
+    assert backend.finalize_transfer_engine()
+    assert not backend.is_initialized()
+    assert backend.transfer_engine is None
+    create_engine.assert_not_called()
+
+
+def test_idle_session_fallback_and_shutdown_do_not_initialize_engine(request, tensor_runtime, monkeypatch):
+    session_runtime = request.getfixturevalue("runtime")
+    create_engine = Mock(side_effect=AssertionError("idle session must not initialize"))
+    monkeypatch.setattr(tensor_runtime.RForkTransferBackend, "_initialize_transfer_engine", create_engine)
+    monkeypatch.setattr(session_runtime.session, "RForkTransferBackend", tensor_runtime.RForkTransferBackend)
+    session = session_runtime.session.RForkSession(session_runtime.config, session_runtime.identity)
+    assert session.prepare_for_fallback().memory_reset
+    assert session.shutdown()
+    create_engine.assert_not_called()
+
+
+def test_first_registration_initializes_once_on_caller_and_reuses_engine(tensor_runtime, monkeypatch):
+    ok = SimpleNamespace(is_error=lambda: False)
+    engine = Mock()
+    initialized_on = []
+    engine.initialize.side_effect = lambda *args: initialized_on.append(threading.get_ident()) or ok
+    engine.batch_register_memory_ex.return_value = ok
+    engine.batch_unregister_memory.return_value = ok
+    engine.finalize.return_value = ok
+    factory = Mock(return_value=engine)
+    _stub(monkeypatch, "yr", __path__=[])
+    _stub(
+        monkeypatch,
+        "yr.datasystem",
+        TransferEngine=factory,
+        MemoryRegistration=lambda *args: args,
+        ErrorCode=SimpleNamespace(kNotReady=1, kNotFound=2),
+    )
+    weight = torch.ones(8)
+    monkeypatch.setattr(tensor_runtime.transfer_backend, "find_non_npu_state_tensors", lambda model: [])
+    monkeypatch.setattr(tensor_runtime.transfer_backend, "collect_transferable_tensors", lambda *args: [("w", weight)])
+    monkeypatch.setattr(tensor_runtime.transfer_backend, "is_transferable_tensor", lambda tensor: True)
+    monkeypatch.setattr(
+        torch,
+        "npu",
+        SimpleNamespace(
+            current_device=lambda: 3,
+            memory=SimpleNamespace(
+                memory_snapshot=lambda: [
+                    {
+                        "blocks": [
+                            {
+                                "address": weight.data_ptr(),
+                                "size": weight.numel() * weight.element_size(),
+                                "state": "active_allocated",
+                            }
+                        ]
+                    }
+                ]
+            ),
+        ),
+        raising=False,
+    )
+    backend = tensor_runtime.RForkTransferBackend()
+    factory.assert_not_called()
+    assert backend.register_memory_region(object(), True)
+    assert backend.is_initialized()
+    assert initialized_on == [threading.get_ident()]
+    engine.initialize.assert_called_once_with("127.0.0.1:12345", "ascend", "npu:3")
+    assert backend.unregister_memory_region()
+    assert backend.register_memory_region(object(), True)
+    factory.assert_called_once()
+    assert backend.finalize_transfer_engine()
+    assert backend.transfer_engine is None
+    assert backend.unregister_memory_region()
+    assert backend.finalize_transfer_engine()
+    engine.finalize.assert_called_once()
+    factory.assert_called_once()
+
+
+def test_failed_lazy_initialization_leaves_empty_cleanup_safe(tensor_runtime, monkeypatch):
+    _stub(monkeypatch, "yr", __path__=[])
+    _stub(monkeypatch, "yr.datasystem")
+    backend = tensor_runtime.RForkTransferBackend()
+    with pytest.raises(ImportError, match="MemoryRegistration"):
+        backend.register_memory_region(object(), True)
+    assert not backend.is_initialized()
+    assert backend.unregister_memory_region()
+    assert backend.finalize_transfer_engine()

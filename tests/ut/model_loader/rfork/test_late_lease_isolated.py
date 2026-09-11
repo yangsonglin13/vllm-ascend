@@ -2,7 +2,9 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 
 import importlib.util
+import logging
 import sys
+import weakref
 from contextlib import nullcontext
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -10,8 +12,6 @@ from unittest.mock import Mock
 
 import pytest
 import torch
-
-from tests.ut.model_loader.rfork.test_lease_release import runtime as runtime
 
 
 @pytest.fixture
@@ -81,6 +81,7 @@ def loader_runtime(request, monkeypatch):
     )
     rope._ROPE_DICT["existing"] = existing
     session = Mock(identity=lease_runtime.identity)
+    session.register_destination.side_effect = lambda *args: events.append("register") or True
     session.acquire_seed.side_effect = lambda: events.append("acquire") or True
     session.transfer_from_seed.side_effect = lambda *args: events.append("transfer") or True
     session.prepare_for_fallback.side_effect = lambda: events.append("cleanup") or True
@@ -117,16 +118,125 @@ def loader_runtime(request, monkeypatch):
 
 
 @pytest.mark.parametrize("processed", [False, True])
-def test_real_loader_acquires_only_after_preparation(loader_runtime, monkeypatch, processed):
+@pytest.mark.parametrize("draft", [False, True])
+def test_real_loader_acquires_only_after_preparation(loader_runtime, monkeypatch, processed, draft):
     r = loader_runtime
+    r.config.runner_type = "draft" if draft else "generate"
     monkeypatch.setattr(r.loader, "_requires_processed_layout_transfer", lambda config: processed)
     assert r.loader.load_model(r.vc, r.config) is r.model
     expected = (
-        ["initialize", "layout", "sync", "acquire", "transfer", "publish"]
+        ["initialize", "layout", "sync", "register", "acquire", "transfer", "publish"]
         if processed
-        else ["initialize", "acquire", "transfer", "layout", "publish"]
+        else ["initialize", "register", "acquire", "transfer", "layout", "publish"]
     )
     assert r.events == expected
+    r.session.acquire_seed.assert_called_once_with()
+
+
+@pytest.mark.parametrize("raises", [False, True])
+def test_registration_failure_never_acquires_formal_lease(loader_runtime, raises):
+    r = loader_runtime
+    r.session.register_destination.side_effect = RuntimeError("registration failed") if raises else lambda *args: False
+    assert r.loader.load_model(r.vc, r.config) is r.fallback
+    r.session.acquire_seed.assert_not_called()
+    r.session.transfer_from_seed.assert_not_called()
+    assert r.events.index("cleanup") < r.events.index("fallback")
+
+
+def test_finalized_session_reports_shutdown_instead_of_pinned_weights(loader_runtime, runtime, monkeypatch):
+    r = loader_runtime
+    session = runtime.session.RForkSession(runtime.config, runtime.identity)
+    assert session.shutdown()
+    monkeypatch.setattr(r.loader, "_ensure_rfork_session", lambda *args: session)
+
+    with pytest.raises(RuntimeError, match="RFork session has been finalized"):
+        r.loader.load_model(r.vc, r.config)
+
+    assert "fallback" not in r.events
+    assert r.vc.compilation_config.static_forward_context == {"existing": r.existing}
+    session.transfer_backend.register_memory_region.assert_not_called()
+    session.transfer_backend.unregister_memory_region.assert_not_called()
+    assert session.state is runtime.types.RForkLifecycleState.FINALIZED
+
+
+def test_registered_seed_miss_releases_model_before_fallback(loader_runtime, request, monkeypatch):
+    r = loader_runtime
+    lease_runtime = request.getfixturevalue("runtime")
+    session = lease_runtime.session.RForkSession(lease_runtime.config, lease_runtime.identity)
+    session.planner = Mock(seed_key="model-key")
+    session.planner.acquire_seed.return_value = None
+    session.planner.remove_seed.return_value = True
+    owners = []
+    references = []
+    operations = []
+
+    def initialize(**kwargs):
+        model = torch.nn.Module()
+        model.weight = torch.nn.Parameter(torch.ones(4))
+        references.extend([weakref.ref(model), weakref.ref(model.weight)])
+        r.vc.compilation_config.static_forward_context["new"] = model
+        return model
+
+    def register(model, *args):
+        operations.append("register")
+        owners.append(model.weight)
+        return True
+
+    def unregister():
+        operations.append("unregister")
+        owners.clear()
+        return True
+
+    def fallback(**kwargs):
+        assert references and all(ref() is None for ref in references)
+        assert not owners
+        return r.fallback
+
+    # Plain functions avoid Mock call history retaining the model under test.
+    session.transfer_backend = SimpleNamespace(register_memory_region=register, unregister_memory_region=unregister)
+    session.start_seed_service = Mock(return_value=True)
+    monkeypatch.setattr(r.loader, "_ensure_rfork_session", lambda *args: session)
+    monkeypatch.setattr(r.module, "initialize_model", initialize)
+    monkeypatch.setattr(sys.modules["vllm.model_executor.model_loader"], "get_model", fallback)
+    assert r.loader.load_model(r.vc, r.config) is r.fallback
+    assert operations == ["register", "unregister"]
+
+
+@pytest.mark.parametrize("tp_rank", [0, 3])
+@pytest.mark.parametrize("source", ["transfer", "local", "fallback", "shared_target"])
+def test_loader_logs_one_completion_with_actual_source(loader_runtime, monkeypatch, caplog, tp_rank, source):
+    r = loader_runtime
+    r.session.identity = SimpleNamespace(tp_rank=tp_rank, is_draft_model=source == "shared_target")
+    if source == "local":
+        r.session.acquire_seed.side_effect = lambda: False
+    elif source == "fallback":
+        r.session.transfer_from_seed.side_effect = lambda *args: False
+    elif source == "shared_target":
+        r.config.runner_type = "draft"
+        monkeypatch.setattr(r.loader, "_get_target_registered_blocks", lambda *args: [(100, 64)])
+        r.session.can_reuse_shared_weights.return_value = True
+    caplog.set_level(logging.DEBUG, logger="rfork-release-test")
+    expected = r.fallback if source in ("local", "fallback") else r.model
+    assert r.loader.load_model(r.vc, r.config) is expected
+    summaries = [record for record in caplog.records if "model loading completed:" in record.getMessage()]
+    assert len(summaries) == 1
+    assert summaries[0].levelno == (logging.INFO if tp_rank == 0 else logging.DEBUG)
+    assert f"source={source}, elapsed=" in summaries[0].getMessage()
+    assert ("draft" if source == "shared_target" else "main") in summaries[0].getMessage()
+
+
+def test_failed_fallback_does_not_log_completion(loader_runtime, monkeypatch, caplog):
+    r = loader_runtime
+    r.session.acquire_seed.side_effect = lambda: False
+    monkeypatch.setattr(
+        sys.modules["vllm.model_executor.model_loader"],
+        "get_model",
+        Mock(side_effect=RuntimeError("local loading failed")),
+    )
+    caplog.set_level(logging.DEBUG, logger="rfork-release-test")
+    with pytest.raises(RuntimeError, match="local loading failed"):
+        r.loader.load_model(r.vc, r.config)
+    assert "model loading completed:" not in caplog.text
 
 
 @pytest.mark.parametrize("failure", ["seed_miss", "initialize", "layout", "transfer"])
@@ -225,6 +335,7 @@ def test_fully_shared_draft_uses_target_without_post_load_or_seed(
     loader_runtime, monkeypatch, processed, same_parameter
 ):
     r = loader_runtime
+    r.config.runner_type = "draft"
     target = torch.nn.Module()
     target.weight = torch.nn.Parameter(torch.arange(8, dtype=torch.float32).reshape(2, 4))
     r.model.weight = target.weight if same_parameter else torch.nn.Parameter(target.weight.detach())
@@ -245,6 +356,7 @@ def test_fully_shared_draft_uses_target_without_post_load_or_seed(
     r.session.transfer_from_seed.assert_not_called()
     r.session.start_seed_service.assert_not_called()
     post_load.assert_not_called()
+    r.session.register_destination.assert_not_called()
     assert target.weight.data_ptr() == original_ptr
     torch.testing.assert_close(target.weight, original_weight)
     assert "fallback" not in r.events
@@ -259,5 +371,6 @@ def test_partially_shared_draft_still_processes_weights_and_transfers(loader_run
     r.session.can_reuse_shared_weights.return_value = False
     assert r.loader.load_model(r.vc, r.config) is r.model
     assert r.events.count("layout") == 1
-    r.session.transfer_from_seed.assert_called_once()
+    r.session.register_destination.assert_called_once_with(r.model, processed, [(100, 64)])
+    r.session.transfer_from_seed.assert_called_once_with(r.model, processed)
     r.session.start_seed_service.assert_called_once()

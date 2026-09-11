@@ -277,7 +277,7 @@ def test_rfork_target_registered_blocks_not_collected_for_target_model():
     load_config = DummyLoadConfig({"model_url": "model", "model_deploy_strategy_name": "strategy"})
     loader = RForkModelLoader(load_config)
     load_config.rfork_session = SimpleNamespace(
-        transfer_backend=SimpleNamespace(registered_weight_blocks=[(128, 4096)])
+        transfer_backend=SimpleNamespace(snapshot_registered_weight_blocks=lambda: [(128, 4096)])
     )
     target_model_config = SimpleNamespace()
     vllm_config = _vllm_config(model_config=target_model_config)
@@ -291,7 +291,7 @@ def test_rfork_target_registered_blocks_collected_for_draft_model():
     draft_model_config = SimpleNamespace(hf_config=SimpleNamespace(model_type="qwen3_5_mtp"))
     target_blocks = [(128, 4096), (8192, 1024)]
     load_config.rfork_session = SimpleNamespace(
-        transfer_backend=SimpleNamespace(registered_weight_blocks=target_blocks)
+        transfer_backend=SimpleNamespace(snapshot_registered_weight_blocks=lambda: list(target_blocks))
     )
     vllm_config = _vllm_config(model_config=draft_model_config)
 
@@ -314,7 +314,7 @@ def test_rfork_draft_load_passes_target_registered_blocks_to_session(monkeypatch
     vllm_config = _vllm_config(model_config=draft_model_config)
     target_blocks = [(128, 4096)]
     load_config.rfork_session = SimpleNamespace(
-        transfer_backend=SimpleNamespace(registered_weight_blocks=target_blocks)
+        transfer_backend=SimpleNamespace(snapshot_registered_weight_blocks=lambda: list(target_blocks))
     )
     captured_blocks = []
     events = []
@@ -323,13 +323,16 @@ def test_rfork_draft_load_passes_target_registered_blocks_to_session(monkeypatch
         def can_reuse_shared_weights(self, model, processed_layout, exclude_blocks):
             return False
 
+        def register_destination(self, model, processed_layout, exclude_blocks=None):
+            captured_blocks.append(list(exclude_blocks or []))
+            return True
+
         def acquire_seed(self):
             events.append("seed")
             return True
 
-        def transfer_from_seed(self, model, processed_layout, exclude_blocks):
+        def transfer_from_seed(self, model, processed_layout):
             events.append("transfer")
-            captured_blocks.append(list(exclude_blocks))
             return True
 
         def start_seed_service(self, model, processed_layout, exclude_blocks=None):
@@ -395,11 +398,14 @@ def test_rfork_acquires_seed_after_model_preparation(monkeypatch, processed_layo
     model = _Model()
 
     class _Session:
+        def register_destination(self, model, processed_layout, exclude_blocks=None):
+            return True
+
         def acquire_seed(self):
             events.append("acquire")
             return True
 
-        def transfer_from_seed(self, model, processed_layout, exclude_blocks=None):
+        def transfer_from_seed(self, model, processed_layout):
             events.append("transfer")
             return True
 
@@ -463,6 +469,9 @@ def test_rfork_model_preparation_failure_does_not_acquire_seed(monkeypatch, fail
     )
 
     class _Session:
+        def register_destination(self, model, processed_layout, exclude_blocks=None):
+            return True
+
         def acquire_seed(self):
             acquire_calls.append(True)
             raise AssertionError("seed acquisition must happen after model preparation")
@@ -781,11 +790,14 @@ def test_rfork_seed_start_failure_returns_valid_model_without_disk_reload(monkey
     model = _Model()
 
     class _Session:
+        def register_destination(self, model, processed_layout, exclude_blocks=None):
+            return True
+
         def acquire_seed(self):
             events.append("seed")
             return True
 
-        def transfer_from_seed(self, model, processed_layout, exclude_blocks=None):
+        def transfer_from_seed(self, model, processed_layout):
             events.append("transfer")
             return True
 
@@ -839,10 +851,13 @@ def test_rfork_fallback_seed_is_deferred_when_only_lease_release_is_pending(monk
     seed_start_models = []
 
     class _Session:
+        def register_destination(self, model, processed_layout, exclude_blocks=None):
+            return True
+
         def acquire_seed(self):
             return True
 
-        def transfer_from_seed(self, model, processed_layout, exclude_blocks=None):
+        def transfer_from_seed(self, model, processed_layout):
             return False
 
         def prepare_for_fallback(self):
@@ -947,8 +962,9 @@ def test_rfork_fallback_clears_only_failed_model_state_before_reinit(monkeypatch
         return expected_model
 
     rfork_session = SimpleNamespace(
+        register_destination=lambda model, processed_layout, exclude_blocks=None: True,
         acquire_seed=lambda: True,
-        transfer_from_seed=lambda model, processed_layout, exclude_blocks=None: False,
+        transfer_from_seed=lambda model, processed_layout: False,
         prepare_for_fallback=lambda: True,
         start_seed_service=lambda model, processed_layout, exclude_blocks=None: True,
     )
@@ -1030,6 +1046,7 @@ def test_rfork_seed_miss_fallback_preserves_existing_process_global_state(monkey
         return expected_model
 
     rfork_session = SimpleNamespace(
+        register_destination=lambda model, processed_layout, exclude_blocks=None: True,
         acquire_seed=lambda: False,
         prepare_for_fallback=lambda: True,
         start_seed_service=lambda model, processed_layout, exclude_blocks=None: True,

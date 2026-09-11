@@ -8,8 +8,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from tests.ut.model_loader.rfork.test_lease_release import make_session, run_and_join
-from tests.ut.model_loader.rfork.test_lease_release import runtime as runtime
+from tests.ut.model_loader.rfork.session_test_utils import make_session, run_and_join
 
 
 @pytest.fixture
@@ -44,6 +43,29 @@ def test_ops_config_explicit_json_values(ops_runtime):
     assert config.lease_release_max_attempts == 5
     assert config.lease_release_retry_interval_sec == 2.5
     assert config.request_timeout_sec == 8
+
+
+def test_planner_requests_use_configured_timeout_without_redirects(ops_runtime, monkeypatch):
+    client = ops_runtime.client.RForkPlannerClient(ops_runtime.config, ops_runtime.identity)
+    get = Mock(return_value=SimpleNamespace(status_code=404))
+    post = Mock(return_value=SimpleNamespace(status_code=200, text=""))
+    monkeypatch.setattr(ops_runtime.client.requests, "get", get)
+    monkeypatch.setattr(ops_runtime.client.requests, "post", post)
+
+    assert client.acquire_seed() is None
+    assert client.release_seed_once(ops_runtime.lease) is ops_runtime.types.LeaseReleaseResult.RELEASED
+    get.assert_called_once_with(
+        "http://planner/get_seed",
+        headers={"SEED_KEY": "model-key"},
+        timeout=ops_runtime.config.request_timeout_sec,
+        allow_redirects=False,
+    )
+    post.assert_called_once_with(
+        "http://planner/put_seed",
+        headers={"SEED_IP": "127.0.0.1", "SEED_PORT": "1234", "USER_ID": "private-user-id", "SEED_RANK": "0"},
+        timeout=ops_runtime.config.request_timeout_sec,
+        allow_redirects=False,
+    )
 
 
 @pytest.mark.parametrize("name", ["heartbeat_interval_sec", "lease_release_retry_interval_sec"])
@@ -94,7 +116,8 @@ def test_release_stop_interrupts_configured_long_wait(ops_runtime):
     session.lease_release_stop_event.wait = wait
     session.planner.release_seed_once.return_value = ops_runtime.types.LeaseReleaseResult.RETRYABLE
     with session._lock:
-        session.release_seed()
+        outcome = session.prepare_for_fallback()
+        assert not outcome.lease_released
         worker = session.lease_release_thread
     try:
         assert entered.wait(1)
@@ -105,18 +128,12 @@ def test_release_stop_interrupts_configured_long_wait(ops_runtime):
     session.planner.release_seed_once.assert_called_once()
 
 
-def test_sync_release_uses_same_config_but_seed_removal_keeps_internal_policy(ops_runtime, monkeypatch):
-    config = replace(ops_runtime.config, lease_release_max_attempts=2, lease_release_retry_interval_sec=7)
-    client = ops_runtime.client.RForkPlannerClient(config, ops_runtime.identity)
+def test_seed_removal_uses_internal_retry_policy(ops_runtime, monkeypatch):
+    client = ops_runtime.client.RForkPlannerClient(ops_runtime.config, ops_runtime.identity)
     post = Mock(return_value=SimpleNamespace(status_code=503, text="busy"))
     sleep = Mock()
     monkeypatch.setattr(ops_runtime.client.requests, "post", post)
     monkeypatch.setattr(ops_runtime.client.time, "sleep", sleep)
-    assert not client.release_seed(ops_runtime.lease)
-    assert post.call_count == 2
-    sleep.assert_called_once_with(7)
-    post.reset_mock()
-    sleep.reset_mock()
     advertisement = ops_runtime.types.SeedAdvertisement("127.0.0.1", 1234, 0)
     assert not client.remove_seed(advertisement)
     assert post.call_count == 3

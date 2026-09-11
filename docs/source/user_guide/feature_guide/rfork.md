@@ -76,32 +76,32 @@ The RFork loading flow is:
 
 1. vLLM starts with `--load-format rfork`.
 2. RFork builds a **seed key** from the model identity and deployment topology.
-3. RFork initializes the local model and prepares/synchronizes any required processed tensor layout, then asks the planner for a seed matching that key.
-4. If a seed is returned, the new instance registers local weight memory, fetches the remote transfer-engine metadata from the seed, and performs batch weight transfer into local parameter buffers.
-5. If no seed is available, or any transfer step fails, RFork cleans up and falls back to the default loader.
-6. After a successful transfer, RFork schedules asynchronous source-lease release, completes any remaining post-load processing, and switches the model to evaluation mode. It then starts a local seed service and advertises it to the planner when the source lease has been released. A seed-service startup failure retains the loaded model and cleans up Seed resources as far as safely possible.
+3. RFork initializes the main model (or prepares the draft model) and identifies fully shared draft weights; a fully shared draft reuses the target directly. It synchronizes any required processed tensor layout before registering local weight memory.
+4. RFork registers local weight memory, then makes the single formal seed-lease request. The lease covers remote metadata exchange and batch weight transfer into local parameter buffers. A request that finds no seed or loses a race unregisters the prepared memory, restores the loading state, and falls back to the default loader.
+5. After a successful transfer, RFork schedules asynchronous source-lease release, completes any remaining post-load processing, and switches the model to evaluation mode. An unresolved transfer lease is retained for bounded background release and delays seed publication without blocking inference. It then starts a local seed service and advertises it when eligible. A seed-service startup failure retains the loaded model and cleans up Seed resources as far as safely possible.
 
 ```mermaid
 %%{init: {"flowchart": {"nodeSpacing": 24, "rankSpacing": 26, "padding": 10, "curve": "linear"}}}%%
 flowchart TD
-    A["Build key; initialize model<br/>Prepare layout"]
-    B["Request seed lease"]
-    C["Register NPU memory<br/>Fetch / validate metadata<br/>Pull weights"]
+    A["Build key<br/>Initialize model<br/>Prepare layout + sync"]
+    B["Register NPU memory"]
+    C["Acquire lease<br/>Fetch metadata<br/>Pull weights"]
     D["Release lease asynchronously<br/>Post-load processing + eval"]
     E["Cleanup + lease release<br/>Default loader"]
     F["Publish Seed if eligible<br/>Keep model on startup failure"]
     A --> B
-    B -->|"Seed found"| C
-    B -->|"No seed"| E
+    B --> C
     C -->|"Failure"| E
     C -->|"Success"| D
     D --> F
     E --> F
 ```
 
-Model initialization and required layout preparation happen **before lease acquisition**, keeping the lease focused on registration, metadata exchange, and transfer. Session setup, initialization, layout, or post-load errors also use the fallback cleanup path. If the default loader itself fails, model loading fails.
+RFork intentionally performs model initialization, layout preparation, synchronization, and local memory registration before requesting a seed lease. This accepts the setup cost of a no-seed first instance and avoids speculative get/put requests and a second lease race. The single formal lease request follows registration and covers metadata exchange and transfer. A missing seed or a race with another receiver uses the fallback cleanup path, which unregisters the prepared memory and restores the loading state before the default loader runs. Session setup, initialization, layout, registration, or post-load errors use the same cleanup path. If the default loader itself fails, model loading fails.
 
 Source-lease release runs asynchronously with bounded retries. A pending release delays Seed publication without discarding the loaded model; publication can resume after release is acknowledged. Exhausted release retries or incomplete cleanup suppress publication. A Seed service startup or advertisement failure also **keeps the loaded model**, with no checkpoint reload. When dynamic EPLB disables RFork, the loader bypasses this flow and uses the default loader directly.
+
+After a processed-layout transfer, RFork refreshes FlatQuant's existing host clipping scalar from the received tensor without repeating layout conversion. Tensor views with storage gaps or overlapping elements are rejected before registration or transfer, causing local fallback and suppressing Seed publication for those layouts; dense transposes remain supported. Seed advertisements are tracked before the HTTP request so cleanup can revoke a potentially accepted advertisement even when its response is lost.
 
 TransferEngine metadata is exchanged through the seed HTTP service, while tensor contents are transferred through TransferEngine. Each worker owns its own TransferEngine session and listening port, so corresponding parallel ranks transfer their local weight shards independently.
 
@@ -121,18 +121,19 @@ The seed remains a normal serving instance. RFork does not ask it to reread the 
 
 The destination performs the following steps for each worker rank:
 
-1. Build the destination model structure and allocate the final NPU tensor layout.
-2. After required layout preparation and synchronization, acquire a seed lease and register the destination tensor ranges with its local TransferEngine session.
-3. Fetch the matching seed worker's session and tensor manifest over HTTP.
-4. Verify tensor names, element counts, element sizes, and shapes before transferring data.
-5. Group tensors into bounded chunks and use batched synchronous reads to copy them into the destination buffers.
-6. Schedule bounded asynchronous lease release after the transfer, whether it succeeds or falls back.
+1. Build the seed key, initialize the main model, and identify fully shared draft weights. A fully shared draft reuses the target directly; other drafts continue through layout preparation.
+2. Prepare the main model or draft layout, then synchronize any required processed tensor layout.
+3. Register the destination tensor ranges with its local TransferEngine session. Registration does not consume the source lease.
+4. After registration, make the single formal seed-lease request. If no seed is available or a race makes this request miss, unregister the prepared memory, restore the loading state, and fall back to the default loader.
+5. Fetch the matching seed worker's session and tensor manifest over HTTP, verify tensor names, element counts, element sizes, and shapes, then transfer the data.
+6. Group tensors into bounded chunks and use batched synchronous reads to copy them into the destination buffers.
+7. Schedule bounded asynchronous lease release after the transfer, whether it succeeds or falls back. An unresolved lease remains tracked for release and can delay seed publication without blocking inference.
 
 Once loading completes, the destination can publish itself as another seed. A deployment can therefore grow from one storage-loaded instance into a pool of reusable NPU-resident weight sources.
 
 ### Registration and Shutdown Lifecycle
 
-Each worker uses an `RForkSession` to own the planner lease, registered tensors, seed HTTP service, and heartbeat. The session coordinates fallback cleanup and finalizes TransferEngine only after the seed service stops and the outgoing lease is released. Configuration, manifest validation, and HTTP clients are separate RFork modules; startup arguments and environment variable names remain unchanged.
+Each worker uses an `RForkSession` to own the planner lease, registered tensors, seed HTTP service, and heartbeat. The session coordinates fallback cleanup and finalizes TransferEngine only after the seed service stops and the outgoing lease is released. Configuration, manifest validation, and HTTP clients are separate RFork modules; startup arguments and environment variable names remain unchanged. Seed startup and cleanup are serialized separately from session state updates. Cleanup stops and joins the heartbeat before removing its advertisement; heartbeat joining, removal HTTP, and server shutdown run outside the session state lock so lease-release acknowledgements can still be applied. Registered memory remains retained until seed cleanup succeeds. Seed health polling and initial advertisement also run outside the session state lock; a transitional state prevents new registration or reads until startup completes. Draft exclusion uses a backend-locked copy of target registration blocks, while target/draft model construction remains serialized.
 
 Registered NPU memory must remain valid while remote readers may still hold leases. RFork therefore keeps Python tensor owners and TransferEngine registration state alive until unregistration or finalization succeeds.
 
@@ -163,6 +164,13 @@ in-flight release is not retried automatically after shutdown; its cleanup
 depends on the planner's agreed expiry or reclamation behavior. Requests
 connect/read timeouts limit inactivity for each request, not a bounded total
 request duration.
+
+TransferEngine is initialized on the loading thread when memory registration
+is first requested. Creating a session, checking fully shared draft weights,
+and cleaning up or shutting down a session that never registered memory do not
+initialize the engine. Missing TransferEngine dependencies are reported at the
+first registration attempt, which follows the normal fallback or seed-start
+failure path.
 
 ## Application Scenarios
 
@@ -215,15 +223,14 @@ wins in the order shown here, with the `rfork_` field taking precedence.
 
 `model_loader_extra_config` takes precedence over environment values for fields
 that support environment fallbacks. Numeric values reject booleans, NaN,
-infinity, and non-positive values. The three operational fields above are
+infinity, and non-positive values. The four operational fields above are
 JSON-only; invalid explicit values raise `ValueError` rather than using an
 environment fallback.
 
 Heartbeat scheduling waits `rfork_heartbeat_interval_sec` after each heartbeat
 request completes (default: `30.0`); it is not a fixed-rate interval. Seed
 heartbeats report health and do not renew leases. The lease-release fields
-affect lease release only; the public synchronous release helper uses the same
-configured max-attempt and retry-interval values. Client-side seed deregistration
+affect lease release only. Client-side seed deregistration
 (`remove_seed`) keeps its internal retry policy of three attempts with
 `0.1`-second linear backoff.
 
@@ -253,13 +260,13 @@ Two instances must agree on model identity and parallel layout before the planne
 
 ### Planner Responsibilities
 
-Lease release runs asynchronously after transfer. Planner release requests never hold the session lock. The client makes at most `rfork_lease_release_max_attempts` release attempts per lease (default: `3`, including the initial request), waiting `rfork_lease_release_retry_interval_sec` seconds (default: `30.0`) between transient failures (network errors, HTTP 408/429, or 5xx). These settings affect lease release only. Other rejected responses stop immediately even when attempts remain; HTTP 200 and 404 retain their existing acknowledgement semantics. The public synchronous release helper uses the same configured max-attempt and retry-interval values. Failed releases do not reload valid weights or prevent model loading from continuing, but the worker is not advertised as a new seed until release is acknowledged. After retry exhaustion, the unresolved lease remains recorded and requires planner-side investigation/recovery. Shutdown does not wait for release I/O and retains TransferEngine resources if release is unresolved.
+Lease release runs asynchronously after transfer. Planner release requests never hold the session lock. The client makes at most `rfork_lease_release_max_attempts` release attempts per lease (default: `3`, including the initial request), waiting `rfork_lease_release_retry_interval_sec` seconds (default: `30.0`) between transient failures (network errors, HTTP 408/429, or 5xx). These settings affect lease release only. Other rejected responses stop immediately even when attempts remain; HTTP 200 and 404 retain their existing acknowledgement semantics. Failed releases do not reload valid weights or prevent model loading from continuing, but the worker is not advertised as a new seed until release is acknowledged. After retry exhaustion, the unresolved lease remains recorded and requires planner-side investigation/recovery. Shutdown does not wait for release I/O and retains TransferEngine resources if release is unresolved.
 
-Release logs include a hashed lease identifier, attempt count, elapsed acquisition-to-release time, HTTP status and a bounded response excerpt with control characters removed and the lease ID redacted. These allow diagnosis without printing the raw USER_ID credential. Per-request timeouts are connect/read inactivity limits, not a strict total wall-clock deadline.
+Release logs include a hashed lease identifier, attempt count, elapsed acquisition-to-release time, HTTP status and a bounded response excerpt with control characters removed and the lease ID redacted. These allow diagnosis without printing the raw USER_ID credential. Per-request timeouts are connect/read inactivity limits, not a strict total wall-clock deadline. Successful lease acquisition/release details are logged at DEBUG; HTTP 404 release acknowledgements remain at INFO because they do not verify timely release. Release failures remain visible at WARNING/ERROR.
 
-The example planner reclaims abandoned leases after 60 seconds by default, independently of seed heartbeat expiry. Configure a positive integer duration with `--lease-ttl-sec` or `RFORK_MOCK_LEASE_TTL_SEC`; an explicit CLI value takes precedence over a valid environment value. The loader acquires its lease after model initialization and any required layout preparation/synchronization. Size the timeout for memory registration, metadata fetch, transfer and asynchronous release, including retry delays. Initialization and layout timings are logged separately. Seed heartbeats do not renew leases. Expired leases return 404 on release, which the current client accepts as already released; successful startup alone does not prove that the lease remained valid throughout transfer.
+The example planner reclaims abandoned leases after 60 seconds by default, independently of seed heartbeat expiry. Configure a positive integer duration with `--lease-ttl-sec` or `RFORK_MOCK_LEASE_TTL_SEC`; an explicit CLI value takes precedence over a valid environment value. The loader acquires the single formal lease after local registration; it then covers metadata fetch and transfer. The formal request can still race with another receiver and miss, which follows the cleanup and fallback path. A transfer lease is retained for bounded background release; its first release request counts toward the configured maximum of three attempts, and unresolved release delays seed publication without blocking inference. Initialization and layout timings are logged separately at DEBUG. Seed heartbeats do not renew leases. Expired leases return 404 on release, which the current client accepts as already released; successful startup alone does not prove that the lease remained valid throughout transfer.
 
-If no seed is available after preparation, the loader discards the prepared model and loads from the checkpoint. This adds preparation cost to a seed miss. Before fallback, it restores the pre-attempt compilation registries and rotary cache so shared main/draft state is preserved. Model construction and rollback in a worker are assumed to be serialized. Lease renewal is not enabled: it requires explicit support from both planner and client.
+The first instance may complete model initialization, layout preparation, and memory registration before the planner reports that no seed is available. In that case, the loader unregisters the prepared memory, restores the compilation registries and rotary cache, and loads from the checkpoint. A fully shared draft reuses the target model directly; other drafts follow the same layout and registration path. Model construction and rollback in a worker are assumed to be serialized. Lease renewal is not enabled: seed heartbeats report health but do not renew leases, and renewal requires explicit support from both planner and client.
 
 For example, start the planner with a 60-second lease TTL:
 
@@ -290,7 +297,9 @@ When validating RFork for a quantized model:
 - Apply the same vLLM Ascend code to both the seed instance and the receiver instance.
 - Restart the planner and all vLLM instances after changing RFork code, because existing seeds keep their old transfer metadata.
 - Use a new `model_deploy_strategy_name` after changing model arguments or RFork code when operating with an older planner; compatibility fingerprints also reject incompatible old seeds before native transfer.
-- A successful RFork transfer logs `transfer weights starts` and `transfer weights time`. The fallback path logs `RFork transfer failed`.
+- Successful model loading logs `RFork main model loading completed` (or `draft`) with `source=transfer`, `local` (seed miss), `fallback` (RFork failure), or `shared_target`. Transfer failures also log `RFork transfer failed`.
+
+Loading summaries are INFO on TP rank 0 of each group and DEBUG on other ranks. Their elapsed time covers that worker's loader call, including any failed RFork attempt, local fallback, and synchronous seed-service startup; it is not the maximum across ranks or time until the engine is ready, and does not wait for deferred seed promotion to finish. Set `VLLM_LOGGING_LEVEL=DEBUG` before startup to inspect per-rank initialization, layout, registration, metadata, read, lease release, and seed publication details. Normal deferred seed publication is DEBUG; failures remain WARNING/ERROR on every rank.
 
 ## Supported Models
 
@@ -305,7 +314,7 @@ RFork performance depends on model size, parallelism, NPU memory layout, Transfe
 For an NPU deployment, compare RFork with the default loader using at least these metrics:
 
 - time from process start until the service becomes ready;
-- `transfer weights time` and transferred bytes reported in the vLLM logs;
+- registration/metadata/read timings in `RFork transfer stages`, and transferred bytes/throughput in `RFork weight transfer completed` (DEBUG logs);
 - storage and host-memory traffic during startup;
 - seed-instance inference latency while transfers are active;
 - seed hit rate, transfer failure rate, and fallback rate.
@@ -381,5 +390,8 @@ vllm serve <model_path> \
 - If RFork is used, **each worker process** must bind a listening port. The seed bind host is configurable and the port is assigned randomly.
 - RFork currently requires all materialized model parameters and registered buffers to reside on NPU. Mixed CPU/NPU or CPU-offloaded model state is rejected and falls back to the default loader rather than performing a partial transfer.
 - Keep the seed bind/advertise addresses reachable from the receiver workers. Transport encryption and access control remain the deployment's responsibility, so use HTTPS and network isolation for untrusted networks.
+- RFork serializes metadata fetches and RDMA reads with shutdown and fallback cleanup to keep registered buffers alive until reads finish. Shutdown may wait for an active transfer before stopping services and finalizing the backend. HTTP request timeouts do not impose an end-to-end RDMA or shutdown deadline; measure shutdown latency during large-model transfers when setting deployment termination grace periods.
+- The seed HTTP server defaults to `0.0.0.0` and has no client authentication. `seed_key` is a model compatibility identifier, not a secret credential, and query parameters may appear in access or proxy logs. Bind `rfork_seed_bind_host` to a trusted local interface, restrict network access to authorized workers, and protect metadata logs. Changing the key to an HTTP header alone would not provide authentication.
+- On hosts with multiple network interfaces, configure `rfork_seed_bind_host` and `rfork_seed_advertise_host` explicitly. The advertised seed address serves HTTP metadata; the TransferEngine endpoint in `session_id` is selected separately through `get_ip()`. Changing the HTTP advertise address does not change the RDMA endpoint. The addresses need not match, but receivers must be able to reach both over the intended networks.
 - RFork weight transfer does not support dynamic EPLB because expert weights and placement can change after the seed service starts. If `parallel_config.enable_eplb`, `eplb_config.dynamic_eplb`, or `eplb_config.expert_map_record_path` enables EPLB, RFork transfer is bypassed and the model is loaded through the default model loader.
 - The example [`rfork_planner.py`](https://github.com/vllm-project/vllm-ascend/blob/main/examples/rfork/rfork_planner.py) is only a simple mock implementation. If you need stronger scheduling, capacity management, or production-grade availability behavior, implement your own planner based on the RFork seed protocol.

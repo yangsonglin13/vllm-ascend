@@ -98,7 +98,7 @@ def test_registration_requires_full_coverage_across_allocator_blocks(monkeypatch
     assert bool(registrations) is (gap == 0)
 
 
-def test_backend_initialization_rejects_transfer_engine_without_memory_registration(monkeypatch):
+def test_first_registration_rejects_transfer_engine_without_memory_registration(monkeypatch):
     yr_module = ModuleType("yr")
     datasystem_module = ModuleType("yr.datasystem")
     datasystem_module.TransferEngine = object  # type: ignore[attr-defined]
@@ -107,8 +107,12 @@ def test_backend_initialization_rejects_transfer_engine_without_memory_registrat
     monkeypatch.setitem(sys.modules, "yr", yr_module)
     monkeypatch.setitem(sys.modules, "yr.datasystem", datasystem_module)
 
+    backend = RForkTransferBackend()
+    assert not backend.is_initialized()
     with pytest.raises(ImportError, match="MemoryRegistration"):
-        RForkTransferBackend()
+        backend.register_memory_region(object(), False)
+    assert backend.unregister_memory_region()
+    assert backend.finalize_transfer_engine()
 
 
 def test_iter_transfer_chunks_splits_single_large_tensor():
@@ -125,7 +129,7 @@ def test_iter_transfer_chunks_splits_single_large_tensor():
     assert len(chunks) == 2
     assert [length for _, _, _, lengths in chunks for length in lengths] == [chunk_limit, 17]
     assert all(sum(lengths) <= chunk_limit for _, _, _, lengths in chunks)
-    assert all(len(lengths) <= transfer_backend.MAX_TRANSFER_CHUNK_WEIGHTS for _, _, _, lengths in chunks)
+    assert all(len(lengths) <= transfer_backend.MAX_TRANSFER_CHUNK_SEGMENTS for _, _, _, lengths in chunks)
     assert chunks[1][1] == [10_000 + chunk_limit]
     assert chunks[1][2] == [20_000 + chunk_limit]
 

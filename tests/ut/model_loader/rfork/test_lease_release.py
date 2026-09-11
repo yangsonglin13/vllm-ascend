@@ -1,70 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 
-import importlib.util
-import logging
-import sys
 import threading
-from pathlib import Path
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 import requests
 
-
-@pytest.fixture
-def runtime(monkeypatch):
-    """Load the real lease/session code with only external runtime dependencies stubbed.
-
-    This fixture is isolated from other UT modules and needs no vLLM/NPU installation.
-    Transport, model preparation and seed HTTP serving are injected independently.
-    """
-    prefix = "vllm_ascend.model_loader.rfork"
-    root = Path(__file__).resolve().parents[4] / "vllm_ascend/model_loader/rfork"
-
-    def stub(name, **attrs):
-        module = ModuleType(name)
-        module.__dict__.update(attrs)
-        monkeypatch.setitem(sys.modules, name, module)
-        return module
-
-    def load(name):
-        full_name = f"{prefix}.{name}"
-        spec = importlib.util.spec_from_file_location(full_name, root / f"{name}.py")
-        module = importlib.util.module_from_spec(spec)
-        monkeypatch.setitem(sys.modules, full_name, module)
-        spec.loader.exec_module(module)
-        return module
-
-    stub("vllm.logger", logger=logging.getLogger("rfork-release-test"))
-    stub("vllm.utils.network_utils", get_ip=lambda: "127.0.0.1", join_host_port=lambda host, port: f"{host}:{port}")
-    stub(f"{prefix}.identity", build_seed_key=lambda **kwargs: "model-key")
-    stub(f"{prefix}.transfer_backend", RForkTransferBackend=Mock)
-
-    class StartupError(RuntimeError):
-        def __init__(self, message, *, handle=None):
-            super().__init__(message)
-            self.handle = handle
-
-    stub(
-        f"{prefix}.seed_server",
-        RForkSeedServerHandle=Mock,
-        RForkSeedServerStartupError=StartupError,
-        start_rfork_server=Mock(),
-    )
-    types = load("types")
-    config = load("config")
-    load("seed_client")
-    client = load("planner_client")
-    session = load("session")
-    monkeypatch.setattr(session.atexit, "register", lambda callback: None)
-    cfg = config.RForkConfig(
-        "model", "strategy", "http://planner", request_timeout_sec=0.1, lease_release_retry_interval_sec=0.001
-    )
-    identity = types.RForkIdentity(0, 0, compatibility_fingerprint="fingerprint")
-    lease = types.SeedLease("127.0.0.1", 1234, "private-user-id", 0, "model-key")
-    return SimpleNamespace(types=types, client=client, session=session, config=cfg, identity=identity, lease=lease)
+from tests.ut.model_loader.rfork.session_test_utils import make_session, run_and_join
 
 
 @pytest.mark.parametrize(
@@ -106,7 +50,7 @@ def test_release_body_is_bounded_sanitized_and_redacts_lease(runtime, monkeypatc
         ),
     )
     client = runtime.client.RForkPlannerClient(runtime.config, runtime.identity)
-    assert not client.release_seed(runtime.lease)
+    assert client.release_seed_once(runtime.lease) is runtime.types.LeaseReleaseResult.REJECTED
     assert "private-user-id" not in caplog.text
     assert "<lease-id> not found" in caplog.text
     assert "\x1b" not in caplog.text
@@ -114,36 +58,13 @@ def test_release_body_is_bounded_sanitized_and_redacts_lease(runtime, monkeypatc
     runtime.client.requests.post.assert_called_once()
 
 
-def test_transient_requests_are_bounded(runtime, monkeypatch):
-    post = Mock(side_effect=requests.Timeout("slow"))
+@pytest.mark.parametrize("error", [requests.Timeout, requests.ConnectionError])
+def test_release_transport_error_is_retryable(runtime, monkeypatch, error):
+    post = Mock(side_effect=error("unavailable"))
     monkeypatch.setattr(runtime.client.requests, "post", post)
     client = runtime.client.RForkPlannerClient(runtime.config, runtime.identity)
-    assert not client.release_seed(runtime.lease)
-    assert post.call_count == runtime.config.lease_release_max_attempts
-
-
-def make_session(runtime):
-    session = runtime.session.RForkSession(runtime.config, runtime.identity)
-    session.planner = Mock(seed_key="model-key")
-    session.planner.acquire_seed.return_value = runtime.lease
-    session.planner.remove_seed.return_value = True
-    session.transfer_backend = Mock()
-    session.transfer_backend.register_memory_region.return_value = True
-    session.transfer_backend.read_weights_from_seed.return_value = True
-    session.transfer_backend.unregister_memory_region.return_value = True
-    session.transfer_backend.finalize_transfer_engine.return_value = True
-    assert session.acquire_seed()
-    return session
-
-
-def run_and_join(session):
-    # Hold the session lock until the worker reference is captured to avoid racing its completion.
-    with session._lock:
-        assert session.release_seed() is False
-        worker = session.lease_release_thread
-    assert worker is not None
-    worker.join(2)
-    assert not worker.is_alive()
+    assert client.release_seed_once(runtime.lease) is runtime.types.LeaseReleaseResult.RETRYABLE
+    post.assert_called_once()
 
 
 def test_blocked_release_does_not_block_transfer_return_seed_start_or_shutdown(runtime, monkeypatch):
@@ -170,8 +91,6 @@ def test_blocked_release_does_not_block_transfer_return_seed_start_or_shutdown(r
         assert entered.wait(1)
         assert startup_done.wait(1), "startup is waiting for lease release I/O"
         assert results == [True, runtime.types.RForkSeedServiceStartResult.DEFERRED]
-        for _ in range(5):
-            assert session.release_seed() is False
         worker = session.lease_release_thread
         # Shutdown must return without joining the blocked release or freeing live resources.
         assert session.shutdown() is False
@@ -196,7 +115,6 @@ def test_release_failure_budget_does_not_restart_or_discard_lease(runtime, resul
     assert session.seed_lease is runtime.lease
     assert session._lease_release_exhausted
     for _ in range(3):
-        assert session.release_seed() is False
         assert session.start_seed_service(object(), True) is runtime.types.RForkSeedServiceStartResult.FAILED
     assert session.planner.release_seed_once.call_count == attempts
     assert not session.acquire_seed()
@@ -213,7 +131,7 @@ def test_retry_eventually_acknowledged_promotes_prepared_model_once(runtime, mon
         runtime.types.LeaseReleaseResult.RELEASED,
     ]
     promote = Mock(return_value=True)
-    monkeypatch.setattr(session, "_start_seed_service_locked", promote)
+    monkeypatch.setattr(session, "_start_seed_service", promote)
     with session._lock:
         assert session.start_seed_service(model, True) is runtime.types.RForkSeedServiceStartResult.DEFERRED
         worker = session.lease_release_thread
@@ -261,7 +179,7 @@ def test_deferred_fallback_memory_preparation_stays_on_calling_thread(runtime, m
         promoted.append(threading.get_ident())
         return True
 
-    monkeypatch.setattr(session, "_start_seed_service_locked", publish)
+    monkeypatch.setattr(session, "_start_seed_service", publish)
     with session._lock:
         assert session.start_seed_service(model, True) is runtime.types.RForkSeedServiceStartResult.DEFERRED
         worker = session.lease_release_thread
@@ -271,7 +189,7 @@ def test_deferred_fallback_memory_preparation_stays_on_calling_thread(runtime, m
     assert len(promoted) == 1 and promoted[0] != caller
 
 
-@pytest.mark.parametrize("failure", ["registration", "metadata", "read"])
+@pytest.mark.parametrize("failure", ["metadata", "read"])
 def test_failed_transfer_cannot_publish_after_lease_release(runtime, monkeypatch, failure):
     session = make_session(runtime)
     session.transfer_backend.register_memory_region.return_value = failure != "registration"
@@ -283,13 +201,14 @@ def test_failed_transfer_cannot_publish_after_lease_release(runtime, monkeypatch
     assert not session.transfer_from_seed(object(), True)
     assert session.state is runtime.types.RForkLifecycleState.CLEANUP_REQUIRED
     run_and_join(session)
+    assert session.state is runtime.types.RForkLifecycleState.CLEANUP_REQUIRED
     assert session.start_seed_service(object(), True) is runtime.types.RForkSeedServiceStartResult.FAILED
     runtime.session.start_rfork_server.assert_not_called()
     assert session.prepare_for_fallback().memory_reset
     assert session.state is runtime.types.RForkLifecycleState.INITIALIZED
 
 
-@pytest.mark.parametrize("failure", ["registration", "metadata", "read"])
+@pytest.mark.parametrize("failure", ["metadata", "read"])
 def test_transfer_exceptions_also_require_cleanup(runtime, monkeypatch, failure):
     session = make_session(runtime)
     metadata = Mock(return_value=object())
@@ -316,7 +235,6 @@ def test_shutdown_reports_unresolved_lease_without_promising_another_retry(runti
     session.transfer_backend.finalize_transfer_engine.assert_not_called()
     assert "No new release retries" in caplog.text
     assert "expiry/reclamation policy" in caplog.text
-    assert not session.release_seed()
     assert not session.shutdown()
     session.planner.release_seed_once.assert_not_called()
 

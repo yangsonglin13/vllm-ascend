@@ -11,6 +11,7 @@ from typing import Any
 
 class RForkLifecycleState(Enum):
     INITIALIZED = auto()
+    REGISTERED = auto()
     LEASED = auto()
     TRANSFERRED = auto()
     READY = auto()

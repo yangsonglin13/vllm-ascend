@@ -27,11 +27,12 @@ from vllm_ascend.model_loader.rfork.tensor_layout import (
     find_non_npu_state_tensors,
     is_transferable_tensor,
     reshape_tensor_to_seed_shape,
+    validate_transferable_tensor_layout,
 )
 from vllm_ascend.model_loader.rfork.types import SeedTransferInfo
 
 MAX_TRANSFER_CHUNK_BYTES = 1024**3
-MAX_TRANSFER_CHUNK_WEIGHTS = 512
+MAX_TRANSFER_CHUNK_SEGMENTS = 512
 MAX_MEMORY_REGISTRATION_BATCH_ITEMS = 4096
 MAX_TRANSFER_ENGINE_FINALIZE_ATTEMPTS = 10
 TRANSFER_ENGINE_FINALIZE_RETRY_INTERVAL_SEC = 1.0
@@ -140,7 +141,7 @@ def iter_transfer_chunks(
     chunk_bytes = 0
     for index, segment in enumerate(segments):
         should_flush = index > start and (
-            chunk_bytes + segment[3] > MAX_TRANSFER_CHUNK_BYTES or index - start >= MAX_TRANSFER_CHUNK_WEIGHTS
+            chunk_bytes + segment[3] > MAX_TRANSFER_CHUNK_BYTES or index - start >= MAX_TRANSFER_CHUNK_SEGMENTS
         )
         if should_flush:
             chunk = segments[start:index]
@@ -183,6 +184,11 @@ def _append_unique_addresses(addresses: list[int], new_addresses: list[int]) -> 
             known.add(address)
 
 
+def _validate_transferable_tensor_layouts(transferable_tensors: list[tuple[str, torch.Tensor]]) -> None:
+    for name, tensor in transferable_tensors:
+        validate_transferable_tensor_layout(name, tensor)
+
+
 class RForkTransferBackend:
     """Own one YuanRong TransferEngine and its registered model memory."""
 
@@ -202,7 +208,6 @@ class RForkTransferBackend:
         self._not_found_error_code: Any | None = None
         self._lifecycle_lock = threading.RLock()
         self._is_initialized = False
-        self._initialize_transfer_engine()
 
     def _initialize_transfer_engine(self) -> None:
         try:
@@ -247,9 +252,6 @@ class RForkTransferBackend:
             self._lifecycle_lock = lock
         return lock
 
-    def _get_transfer_engine(self) -> Any:
-        return self._engine()
-
     def _clear_registration_state(self) -> None:
         self.weight_manifest = None
         self.weight_shapes = None
@@ -259,6 +261,11 @@ class RForkTransferBackend:
         self._registered_transferable_storages = None
         self._all_transferable_tensors_excluded = False
 
+    def snapshot_registered_weight_blocks(self) -> list[tuple[int, int]]:
+        """Return a consistent copy for draft exclusion; this does not pin its lifetime."""
+        with self._get_lifecycle_lock():
+            return list(self.registered_weight_blocks)
+
     def register_memory_region(
         self,
         model,
@@ -266,15 +273,19 @@ class RForkTransferBackend:
         exclude_blocks: list[tuple[int, int]] | None = None,
     ) -> bool:
         with self._get_lifecycle_lock():
+            # Create native resources on the calling NPU thread only when
+            # registration is needed. Shared-only drafts never enter this path.
+            if self.transfer_engine is None:
+                self._initialize_transfer_engine()
             return self._register_memory_region_locked(model, processed_layout, exclude_blocks)
 
     def can_reuse_shared_weights(self, model, processed_layout: bool, exclude_blocks: list[tuple[int, int]]) -> bool:
         """Whether every live weight is already owned by the loaded target model."""
         if not exclude_blocks or find_non_npu_state_tensors(model):
             return False
-        independent, shared_names = _split_tensors_by_excluded_blocks(
-            list(collect_transferable_tensors(model, processed_layout)), exclude_blocks
-        )
+        transferable_tensors = list(collect_transferable_tensors(model, processed_layout))
+        _validate_transferable_tensor_layouts(transferable_tensors)
+        independent, shared_names = _split_tensors_by_excluded_blocks(transferable_tensors, exclude_blocks)
         return bool(shared_names) and not independent
 
     def _register_memory_region_locked(
@@ -283,7 +294,7 @@ class RForkTransferBackend:
         processed_layout: bool,
         exclude_blocks: list[tuple[int, int]] | None = None,
     ) -> bool:
-        transfer_engine = self._get_transfer_engine()
+        transfer_engine = self._engine()
         start_reg_mr_time = time.perf_counter()
 
         non_npu_state = find_non_npu_state_tensors(model)
@@ -305,12 +316,14 @@ class RForkTransferBackend:
 
         excluded_blocks = list(exclude_blocks) if exclude_blocks else []
         self.excluded_weight_blocks = excluded_blocks
+        all_transferable_tensors = list(collect_transferable_tensors(model, processed_layout))
+        _validate_transferable_tensor_layouts(all_transferable_tensors)
         transferable_tensors, excluded_names = _split_tensors_by_excluded_blocks(
-            list(collect_transferable_tensors(model, processed_layout)),
+            all_transferable_tensors,
             excluded_blocks,
         )
         if excluded_names:
-            logger.info(
+            logger.debug(
                 "Skipping %d weights shared with the target model (already registered), e.g. %s",
                 len(excluded_names),
                 ", ".join(excluded_names[:3]),
@@ -393,6 +406,9 @@ class RForkTransferBackend:
                 logical_registrations.append((tensor_start, tensor_end - tensor_start, backing_start, backing_size))
 
         registered_memory_addresses: list[int] = []
+        # Publish a provisional manifest and retain tensor/storage owners
+        # before native registration. If a batch fails, attempted addresses
+        # remain available for rollback and for a later cleanup retry.
         self.weight_manifest = weight_mr_dict
         self.weight_shapes = weight_shape_dict
         self.registered_weight_blocks = list(merged_blocks)
@@ -446,14 +462,10 @@ class RForkTransferBackend:
 
                 _append_unique_addresses(registered_memory_addresses, attempted_addresses)
 
-        self.weight_manifest = weight_mr_dict
-        self.weight_shapes = weight_shape_dict
-        self.registered_weight_blocks = list(merged_blocks)
+        # All batches succeeded: publish only the addresses confirmed by the
+        # engine while retaining the manifest and owners for active transfers.
         self.registered_memory_addresses = list(registered_memory_addresses)
-        self._registered_transferable_tensors = transferable_tensors
-        self._registered_transferable_storages = transferable_storages
-        self._all_transferable_tensors_excluded = bool(not transferable_tensors and excluded_names)
-        logger.info(
+        logger.debug(
             "register_memory_region time: %.4fs, weights: %d",
             time.perf_counter() - start_reg_mr_time,
             len(weight_mr_dict),
@@ -546,15 +558,15 @@ class RForkTransferBackend:
             return self._unregister_memory_region_locked()
 
     def _unregister_memory_region_locked(self) -> bool:
-        transfer_engine = self._get_transfer_engine()
         start_unreg_mr_time = time.perf_counter()
         if not self.registered_weight_blocks and not self.registered_memory_addresses:
             self._clear_registration_state()
             logger.debug("unregister_memory_region skipped because no blocks are registered.")
             return True
+        transfer_engine = self._engine()
         if not self._unregister_weight_blocks(transfer_engine):
             return False
-        logger.info(
+        logger.debug(
             "unregister_memory_region time: %.4fs",
             time.perf_counter() - start_unreg_mr_time,
         )
@@ -578,7 +590,7 @@ class RForkTransferBackend:
         with self._get_lifecycle_lock():
             if not getattr(self, "_is_initialized", False):
                 return True
-            transfer_engine = self._get_transfer_engine()
+            transfer_engine = self._engine()
             for attempt in range(1, max_attempts + 1):
                 try:
                     result = transfer_engine.finalize()
@@ -593,6 +605,7 @@ class RForkTransferBackend:
                 if not result.is_error():
                     self._clear_registration_state()
                     self.transfer_session_id = None
+                    self.transfer_engine = None
                     self._is_initialized = False
                     return True
 
@@ -618,17 +631,15 @@ class RForkTransferBackend:
         model,
         seed_info: SeedTransferInfo,
         processed_layout: bool,
-        manifest_metadata: Any | None = None,
     ) -> bool:
         with self._get_lifecycle_lock():
-            return self._read_weights_from_seed_locked(model, seed_info, processed_layout, manifest_metadata)
+            return self._read_weights_from_seed_locked(model, seed_info, processed_layout)
 
     def _read_weights_from_seed_locked(
         self,
         model,
         seed_info: SeedTransferInfo,
         processed_layout: bool,
-        manifest_metadata: Any | None = None,
     ) -> bool:
         if (
             not isinstance(seed_info.session_id, str)
@@ -641,6 +652,7 @@ class RForkTransferBackend:
         transferable_tensors = getattr(self, "_registered_transferable_tensors", None)
         if transferable_tensors is None:
             transferable_tensors = list(collect_transferable_tensors(model, processed_layout))
+        _validate_transferable_tensor_layouts(transferable_tensors)
         if not transferable_tensors:
             if (
                 getattr(self, "_all_transferable_tensors_excluded", False)
@@ -648,7 +660,7 @@ class RForkTransferBackend:
                 and not seed_info.weights
                 and (seed_info.shapes is None or seed_info.shapes == {})
             ):
-                logger.info("RFork seed transfer has no local weights because all tensors are shared.")
+                logger.debug("RFork seed transfer has no local weights because all tensors are shared.")
                 return True
             logger.error("RFork refuses to transfer an empty local tensor manifest.")
             return False
@@ -693,7 +705,9 @@ class RForkTransferBackend:
                 )
                 return False
         if remote_only:
-            full_model_tensors = dict(collect_transferable_tensors(model, processed_layout))
+            full_model_transferable_tensors = list(collect_transferable_tensors(model, processed_layout))
+            _validate_transferable_tensor_layouts(full_model_transferable_tensors)
+            full_model_tensors = dict(full_model_transferable_tensors)
             for name in remote_only:
                 tensor = full_model_tensors.get(name)
                 if tensor is not None and _is_tensor_in_blocks(tensor, excluded_blocks):
@@ -706,9 +720,7 @@ class RForkTransferBackend:
                 )
                 return False
 
-        parsed_remote = validate_weight_manifest(
-            seed_info, transferable_tensors, skipped_shared_names, manifest_metadata
-        )
+        parsed_remote = validate_weight_manifest(seed_info, transferable_tensors, skipped_shared_names)
         if parsed_remote is None:
             return False
 
@@ -728,6 +740,10 @@ class RForkTransferBackend:
                 name,
                 tensor,
             )
+
+        # A cached tensor may have been rebound or reshaped after registration;
+        # validate again immediately before constructing raw byte reads.
+        _validate_transferable_tensor_layouts(transferable_tensors)
 
         weight_names: list[str] = []
         seed_ptr_list: list[int] = []
@@ -757,7 +773,7 @@ class RForkTransferBackend:
         )
         for index, (chunk_names, chunk_seed_ptrs, chunk_client_ptrs, chunk_lengths) in enumerate(chunks, 1):
             chunk_start = time.perf_counter()
-            result = self._get_transfer_engine().batch_transfer_sync_read(
+            result = self._engine().batch_transfer_sync_read(
                 seed_info.session_id,
                 chunk_client_ptrs,
                 chunk_seed_ptrs,
@@ -781,7 +797,7 @@ class RForkTransferBackend:
             )
         transfer_elapsed = time.perf_counter() - transfer_start
         throughput_gib_s = total_gib / transfer_elapsed if transfer_elapsed > 0 else 0.0
-        logger.info(
+        logger.debug(
             "RFork weight transfer completed: weights=%d, chunks=%d, bytes=%.2f GiB, "
             "elapsed=%.4fs, throughput=%.2f GiB/s",
             len(client_len_list),
@@ -796,7 +812,7 @@ class RForkTransferBackend:
 __all__ = [
     "MAX_MEMORY_REGISTRATION_BATCH_ITEMS",
     "MAX_TRANSFER_CHUNK_BYTES",
-    "MAX_TRANSFER_CHUNK_WEIGHTS",
+    "MAX_TRANSFER_CHUNK_SEGMENTS",
     "MAX_TRANSFER_ENGINE_FINALIZE_ATTEMPTS",
     "RForkTransferBackend",
 ]

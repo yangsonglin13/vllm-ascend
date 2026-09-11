@@ -11,6 +11,7 @@ from urllib.parse import urlsplit, urlunsplit
 import requests
 from vllm.logger import logger
 
+from vllm_ascend.model_loader.rfork.manifest import parse_weight_info, unpack_weight_info
 from vllm_ascend.model_loader.rfork.types import SeedTransferInfo
 
 
@@ -61,27 +62,11 @@ def _weight_manifest_has_shape_and_dtype(weights: Mapping[str, Any]) -> bool:
     if not weights:
         return False
     for weight_info in weights.values():
-        shape = dtype = None
-        if isinstance(weight_info, Mapping):
-            shape = weight_info.get("shape")
-            dtype = weight_info.get("dtype")
-        elif isinstance(weight_info, (list, tuple)) and len(weight_info) == 5:
-            shape_or_metadata = weight_info[3]
-            if isinstance(shape_or_metadata, Mapping):
-                shape = shape_or_metadata.get("shape")
-                dtype = shape_or_metadata.get("dtype")
-                if dtype is None:
-                    dtype = weight_info[4]
-            else:
-                shape = shape_or_metadata
-                dtype = weight_info[4]
-        if not isinstance(shape, (list, tuple)) or dtype is None:
+        parsed = parse_weight_info(weight_info)
+        if parsed is None:
             return False
-        if not all(isinstance(dim, int) and not isinstance(dim, bool) and dim >= 0 for dim in shape):
-            return False
-        if isinstance(dtype, str):
-            dtype = dtype.strip()
-        if not dtype:
+        _, _, _, shape, dtype = unpack_weight_info(parsed)
+        if shape is None or dtype is None:
             return False
     return True
 
@@ -147,6 +132,18 @@ def fetch_seed_transfer_info(
                     logger.error("RFork seed returned a malformed shape manifest.")
                     return None
                 shapes = candidate
+            elif _weight_manifest_has_shape_and_dtype(weights):
+                logger.warning(
+                    "RFork optional shape metadata request returned status=%s; using complete weight metadata.",
+                    shape_response.status_code,
+                )
+                shapes = None
+            else:
+                logger.error(
+                    "RFork shape metadata request returned status=%s and weight metadata is incomplete.",
+                    shape_response.status_code,
+                )
+                return None
         return SeedTransferInfo(session_id=session_id, weights=weights, shapes=shapes)
     except Exception as exc:
         logger.error("RFork seed metadata request failed for %s: %s", seed_url, exc)

@@ -44,6 +44,7 @@ class RForkPlannerClient:
         self.request_timeout_sec = float(request_timeout_sec)
         self.config = config
         self.last_advertisement: SeedAdvertisement | None = None
+        self._advertisement_lock = threading.Lock()
         compatibility_fingerprint = identity.compatibility_fingerprint
         if compatibility_fingerprint is None:
             raise RuntimeError(
@@ -73,6 +74,7 @@ class RForkPlannerClient:
                 f"{self.planner_url}/get_seed",
                 headers={"SEED_KEY": self.seed_key},
                 timeout=self.request_timeout_sec,
+                allow_redirects=False,
             )
             if response.status_code == 404:
                 logger.debug("RFork planner has no available seed for seed_key=%s", self.seed_key)
@@ -130,7 +132,8 @@ class RForkPlannerClient:
                 allow_redirects=False,
             )
             if response.status_code in (200, 404):
-                logger.info(
+                log_release = logger.debug if response.status_code == 200 else logger.info
+                log_release(
                     "RFork lease release acknowledged: lease=%s status=%s "
                     "(404 means absent, not verified timely release)",
                     lease_log_id(lease),
@@ -154,18 +157,6 @@ class RForkPlannerClient:
             )
             return LeaseReleaseResult.RETRYABLE
 
-    def release_seed(self, lease: SeedLease) -> bool:
-        """Synchronous bounded retry helper; startup uses release_seed_once in a worker."""
-        for attempt in range(self.config.lease_release_max_attempts):
-            result = self.release_seed_once(lease)
-            if result is LeaseReleaseResult.RELEASED:
-                return True
-            if result is LeaseReleaseResult.REJECTED:
-                return False
-            if attempt + 1 < self.config.lease_release_max_attempts:
-                time.sleep(self.config.lease_release_retry_interval_sec)
-        return False
-
     def remove_seed(self, advertisement: SeedAdvertisement | None = None) -> bool:
         try:
             self._require_planner()
@@ -173,7 +164,10 @@ class RForkPlannerClient:
             logger.warning("RFork planner seed removal setup failed: %s", exc)
             return False
 
-        target = advertisement or self.last_advertisement
+        # The session stops and joins heartbeats before removal. This lock
+        # protects the local snapshot only; it does not serialize remote HTTP.
+        with self._advertisement_lock:
+            target = advertisement or self.last_advertisement
         if target is None:
             return True
         headers = {
@@ -190,8 +184,9 @@ class RForkPlannerClient:
                     timeout=self.request_timeout_sec,
                 )
                 if response.status_code in (200, 404):
-                    if target == self.last_advertisement:
-                        self.last_advertisement = None
+                    with self._advertisement_lock:
+                        if target is self.last_advertisement:
+                            self.last_advertisement = None
                     return True
                 logger.warning(
                     "RFork planner seed removal attempt %d/%d returned status=%s",
@@ -214,6 +209,14 @@ class RForkPlannerClient:
         try:
             self._require_planner()
             advertisement = SeedAdvertisement(seed_ip or get_ip(), port, self.tp_rank)
+            # Reserve the advertisement before sending the request.  The
+            # planner may commit add_seed even when its response is lost (for
+            # example, because the request times out), so cleanup must retain
+            # enough identity to issue an idempotent remove_seed request.
+            # Keep the lock out of the network request; teardown can snapshot
+            # this value without waiting on planner I/O.
+            with self._advertisement_lock:
+                self.last_advertisement = advertisement
             response = requests.post(
                 f"{self.planner_url}/add_seed",
                 headers={
@@ -228,7 +231,6 @@ class RForkPlannerClient:
             if response.status_code != 200:
                 logger.warning("RFork planner seed report returned status=%s", response.status_code)
                 return False
-            self.last_advertisement = advertisement
             return True
         except Exception as exc:
             logger.warning("RFork planner seed report failed: %s", exc)

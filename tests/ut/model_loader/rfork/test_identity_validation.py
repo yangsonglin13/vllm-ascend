@@ -62,6 +62,7 @@ def seed_module(monkeypatch):
         shapes: dict | None = None
 
     _stub(monkeypatch, "vllm_ascend.model_loader.rfork.types", SeedTransferInfo=SeedTransferInfo)
+    _load_module(monkeypatch, "vllm_ascend.model_loader.rfork.manifest", "manifest.py")
     return _load_module(monkeypatch, "rfork_test_seed_client", "seed_client.py")
 
 

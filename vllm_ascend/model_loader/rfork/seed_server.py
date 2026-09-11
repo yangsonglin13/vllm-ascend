@@ -36,7 +36,7 @@ from vllm_ascend.model_loader.rfork.types import SeedTransferInfo
 
 SERVER_STARTUP_QUEUE_TIMEOUT_SEC = 15.0
 SERVER_STOP_TIMEOUT_SEC = 5.0
-HEALTH_POLL_INTERVAL_SEC = 0.01
+HEALTH_POLL_INTERVAL_SEC = 0.05
 
 
 @dataclass(slots=True)

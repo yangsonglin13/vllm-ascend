@@ -46,6 +46,41 @@ def is_transferable_tensor(tensor: torch.Tensor) -> bool:
     return not tensor.is_meta and tensor.numel() > 0 and is_tensor_on_transfer_device(tensor)
 
 
+def is_non_overlapping_dense_tensor(tensor: torch.Tensor) -> bool:
+    """Return whether a tensor's logical elements cover a dense byte range.
+
+    RFork transfers one contiguous byte range starting at ``data_ptr()`` for
+    each tensor.  A non-contiguous tensor can still be safe when it is a dense
+    permutation of its backing storage (for example, a transpose), so
+    ``Tensor.is_contiguous()`` is too strict here.  Sort dimensions with more
+    than one element by stride and require the usual dense-stride recurrence.
+    Dimensions of size one do not contribute an address and are intentionally
+    ignored; this also permits offset views and singleton dimensions with an
+    arbitrary stride.
+    """
+    if tensor.numel() <= 1:
+        return True
+
+    dense_stride = 1
+    for stride, size in sorted(
+        (int(stride), int(size)) for size, stride in zip(tensor.shape, tensor.stride(), strict=True) if size > 1
+    ):
+        if stride != dense_stride:
+            return False
+        dense_stride *= size
+    return True
+
+
+def validate_transferable_tensor_layout(name: str, tensor: torch.Tensor) -> None:
+    """Reject tensor views that cannot be represented by RFork byte ranges."""
+    if is_non_overlapping_dense_tensor(tensor):
+        return
+    raise ValueError(
+        "RFork cannot transfer a tensor with gapped or overlapping storage: "
+        f"{name!r}; shape={tuple(tensor.shape)}, stride={tuple(tensor.stride())}."
+    )
+
+
 def _iter_tensors_in_value(
     prefix: str,
     value: Any,
@@ -114,6 +149,7 @@ def _try_collect(
 ) -> None:
     if not is_transferable_tensor(tensor):
         return
+    validate_transferable_tensor_layout(name, tensor)
     data_ptr = tensor.data_ptr()
     existing_index = seen_names.get(name)
     if existing_index is None:
