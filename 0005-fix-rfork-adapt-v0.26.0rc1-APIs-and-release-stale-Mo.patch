@@ -1,0 +1,547 @@
+From 996d9bd078731c0eaa65044f3ddda3a5b0684834 Mon Sep 17 00:00:00 2001
+From: yangsonglin13 <yangsonglin566@gmail.com>
+Date: Tue, 8 Sep 2026 16:58:12 +0800
+Subject: [PATCH 5/5] fix(rfork): adapt v0.26.0rc1 APIs and release stale MoE
+ weights on fallback
+
+Share lazy hardware profile resolution between the RFork loader and fingerprint generation, preserving legacy 310P FORCE_NZ behavior without masking unrelated import failures. Resolve the legacy MoE API and cover post-load hook restoration.
+
+Snapshot and restore the Ascend EPLB registry during fallback. Its unconditional MoE registrations otherwise retain discarded expert weights and can exhaust NPU memory when the default loader constructs a second model. Preserve preexisting target registrations, collect partially initialized models, and avoid retaining exception tracebacks in log arguments.
+
+Add eight regression cases using the real EPLB registry and weak references to verify discarded layers and weights are released before fallback construction. Validation: 149 CPU-isolated tests passed; Ruff, spelling and diff checks passed. Full vLLM and NPU/RDMA integration validation remains pending.
+
+Signed-off-by: yangsonglin13 <yangsonglin566@gmail.com>
+---
+ .../rfork/test_compat_isolated.py             | 132 ++++++++++++++++
+ .../rfork/test_identity_validation.py         |   1 +
+ .../rfork/test_late_lease_isolated.py         | 143 +++++++++++++++++-
+ .../model_loader/rfork/test_rfork_loader.py   |   4 +-
+ vllm_ascend/model_loader/rfork/compat.py      |  23 +++
+ vllm_ascend/model_loader/rfork/identity.py    |   2 +-
+ .../model_loader/rfork/rfork_loader.py        |  41 ++++-
+ 7 files changed, 330 insertions(+), 16 deletions(-)
+ create mode 100644 tests/ut/model_loader/rfork/test_compat_isolated.py
+ create mode 100644 vllm_ascend/model_loader/rfork/compat.py
+
+diff --git a/tests/ut/model_loader/rfork/test_compat_isolated.py b/tests/ut/model_loader/rfork/test_compat_isolated.py
+new file mode 100644
+index 000000000..835ce8b5c
+--- /dev/null
++++ b/tests/ut/model_loader/rfork/test_compat_isolated.py
+@@ -0,0 +1,132 @@
++# SPDX-License-Identifier: Apache-2.0
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
++
++import builtins
++import importlib.util
++import sys
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++
++RFORK_ROOT = Path(__file__).resolve().parents[4] / "vllm_ascend/model_loader/rfork"
++HARDWARE_PROFILE_MODULE = "vllm_ascend.device.hardware_profile"
++UTILS_MODULE = "vllm_ascend.utils"
++_MISSING = object()
++
++
++def _load_compat(monkeypatch):
++    module_name = "vllm_ascend.model_loader.rfork._compat_isolated_test"
++    spec = importlib.util.spec_from_file_location(module_name, RFORK_ROOT / "compat.py")
++    assert spec is not None and spec.loader is not None
++    module = importlib.util.module_from_spec(spec)
++    monkeypatch.setitem(sys.modules, module_name, module)
++    spec.loader.exec_module(module)
++    return module
++
++
++def _route_imports(monkeypatch, *, hardware_profile, is_310p):
++    original_import = builtins.__import__
++    calls = []
++
++    def import_router(name, globals=None, locals=None, fromlist=(), level=0):
++        if name == HARDWARE_PROFILE_MODULE:
++            calls.append(name)
++            if hardware_profile is _MISSING:
++                raise ModuleNotFoundError(
++                    f"No module named '{HARDWARE_PROFILE_MODULE}'",
++                    name=HARDWARE_PROFILE_MODULE,
++                )
++            if isinstance(hardware_profile, BaseException):
++                raise hardware_profile
++            return hardware_profile
++        if name == UTILS_MODULE:
++            calls.append(name)
++            return SimpleNamespace(is_310p=is_310p)
++        return original_import(name, globals, locals, fromlist, level)
++
++    monkeypatch.setattr(builtins, "__import__", import_router)
++    return calls
++
++
++def test_native_hardware_profile_is_loaded_lazily_and_returned_unchanged(monkeypatch):
++    expected = object()
++    calls = []
++
++    def native_get_current_hardware_profile():
++        calls.append("native")
++        return expected
++
++    imports = _route_imports(
++        monkeypatch,
++        hardware_profile=SimpleNamespace(get_current_hardware_profile=native_get_current_hardware_profile),
++        is_310p=lambda: pytest.fail("legacy fallback should not be imported"),
++    )
++
++    compat = _load_compat(monkeypatch)
++    assert imports == []
++    assert compat.get_current_hardware_profile() is expected
++    assert calls == ["native"]
++    assert imports == [HARDWARE_PROFILE_MODULE]
++
++
++@pytest.mark.parametrize(
++    ("is_310p", "expected_layout"),
++    [(True, "FORCE_NZ"), (False, "CONFIGURABLE")],
++)
++def test_missing_hardware_profile_uses_legacy_layout(monkeypatch, is_310p, expected_layout):
++    compat = _load_compat(monkeypatch)
++    is_310p_calls = []
++
++    def detect_310p():
++        is_310p_calls.append(True)
++        return is_310p
++
++    imports = _route_imports(
++        monkeypatch,
++        hardware_profile=_MISSING,
++        is_310p=detect_310p,
++    )
++
++    profile = compat.get_current_hardware_profile()
++
++    assert profile.weight_layout_policy.name == expected_layout
++    assert is_310p_calls == [True]
++    assert imports == [HARDWARE_PROFILE_MODULE, UTILS_MODULE]
++
++
++def test_nested_hardware_profile_dependency_error_is_not_swallowed(monkeypatch):
++    compat = _load_compat(monkeypatch)
++    nested_error = ModuleNotFoundError(
++        "No module named 'native_profile_dependency'",
++        name="native_profile_dependency",
++    )
++    imports = _route_imports(
++        monkeypatch,
++        hardware_profile=nested_error,
++        is_310p=lambda: pytest.fail("nested dependency errors must not use fallback"),
++    )
++
++    with pytest.raises(ModuleNotFoundError, match="native_profile_dependency"):
++        compat.get_current_hardware_profile()
++
++    assert imports == [HARDWARE_PROFILE_MODULE]
++
++
++def test_native_hardware_profile_call_error_is_not_replaced_by_fallback(monkeypatch):
++    compat = _load_compat(monkeypatch)
++    native_error = RuntimeError("native hardware profile failed")
++
++    def fail_native_profile():
++        raise native_error
++
++    imports = _route_imports(
++        monkeypatch,
++        hardware_profile=SimpleNamespace(get_current_hardware_profile=fail_native_profile),
++        is_310p=lambda: pytest.fail("native call errors must not use fallback"),
++    )
++
++    with pytest.raises(RuntimeError, match="native hardware profile failed"):
++        compat.get_current_hardware_profile()
++
++    assert imports == [HARDWARE_PROFILE_MODULE]
+diff --git a/tests/ut/model_loader/rfork/test_identity_validation.py b/tests/ut/model_loader/rfork/test_identity_validation.py
+index 20bfdbd1e..3b29bd135 100644
+--- a/tests/ut/model_loader/rfork/test_identity_validation.py
++++ b/tests/ut/model_loader/rfork/test_identity_validation.py
+@@ -34,6 +34,7 @@ def _stub(monkeypatch, module_name: str, **attributes):
+ 
+ @pytest.fixture
+ def identity_module(monkeypatch):
++    _load_module(monkeypatch, "vllm_ascend.model_loader.rfork.compat", "compat.py")
+     _stub(monkeypatch, "vllm.config", ModelConfig=object, VllmConfig=object)
+     _stub(monkeypatch, "vllm_ascend.ascend_config", get_ascend_config=lambda: SimpleNamespace(weight_nz_mode=None))
+     _stub(
+diff --git a/tests/ut/model_loader/rfork/test_late_lease_isolated.py b/tests/ut/model_loader/rfork/test_late_lease_isolated.py
+index 6cc2cf2ae..8d5721959 100644
+--- a/tests/ut/model_loader/rfork/test_late_lease_isolated.py
++++ b/tests/ut/model_loader/rfork/test_late_lease_isolated.py
+@@ -3,6 +3,7 @@
+ 
+ import importlib.util
+ import sys
++import weakref
+ from contextlib import nullcontext
+ from pathlib import Path
+ from types import ModuleType, SimpleNamespace
+@@ -14,6 +15,77 @@ import torch
+ from tests.ut.model_loader.rfork.test_lease_release import runtime as runtime
+ 
+ 
++@pytest.mark.parametrize("failure", ["seed_miss", "initialize", "layout", "transfer"])
++@pytest.mark.parametrize("preexisting_registry", [False, True])
++def test_fallback_releases_eplb_weights_before_second_model(loader_runtime, monkeypatch, failure, preexisting_registry):
++    r = loader_runtime
++    root = Path(__file__).resolve().parents[4]
++    adaptor_name = "vllm_ascend.eplb.adaptor.vllm_adaptor"
++    monkeypatch.delitem(sys.modules, adaptor_name, raising=False)
++
++    def load(name, path):
++        spec = importlib.util.spec_from_file_location(name, root / path)
++        module = importlib.util.module_from_spec(spec)
++        monkeypatch.setitem(sys.modules, name, module)
++        spec.loader.exec_module(module)
++        return module
++
++    load("vllm_ascend.quantization.quant_type", "vllm_ascend/quantization/quant_type.py")
++
++    def get_adaptor():
++        if adaptor_name not in sys.modules:
++            load(adaptor_name, "vllm_ascend/eplb/adaptor/vllm_adaptor.py")
++        return sys.modules[adaptor_name].VllmEplbAdaptor
++
++    existing_target = torch.nn.Linear(4, 4)
++    baseline = [existing_target] if preexisting_registry else []
++    original_registry = None
++    if preexisting_registry:
++        adaptor = get_adaptor()
++        adaptor.register_layer(existing_target)
++        original_registry = adaptor._registered_moe_layers
++    refs = {}
++
++    def initialize(**kwargs):
++        model = torch.nn.Module()
++        model.moe = torch.nn.Linear(4, 4)
++        model.moe.self_reference = model.moe
++        refs["layer"] = weakref.ref(model.moe)
++        refs["weight"] = weakref.ref(model.moe.weight)
++        # This is the real registry used unconditionally by AscendMoERunner.
++        get_adaptor().register_layer(model.moe)
++        if failure == "initialize":
++            raise RuntimeError("partial model construction")
++        return model
++
++    def fallback(**kwargs):
++        registry = get_adaptor()._registered_moe_layers
++        assert registry == baseline
++        if original_registry is not None:
++            assert registry is original_registry
++        assert refs["layer"]() is None, "discarded MoE layer survives into fallback"
++        assert refs["weight"]() is None, "discarded expert weight survives into fallback"
++        get_adaptor().register_layer(r.fallback)
++        return r.fallback
++
++    monkeypatch.setattr(r.module, "initialize_model", initialize)
++    monkeypatch.setattr(r.loader, "_requires_processed_layout_transfer", lambda config: True)
++    monkeypatch.setattr(sys.modules["vllm.model_executor.model_loader"], "get_model", fallback)
++    if failure == "seed_miss":
++        r.session.acquire_seed.side_effect = lambda: False
++    elif failure == "layout":
++
++        def fail_layout(*args):
++            raise RuntimeError("layout")
++
++        monkeypatch.setattr(r.module, "process_weights_after_loading", fail_layout)
++    elif failure == "transfer":
++        # Mock call histories themselves would retain the model argument.
++        monkeypatch.setattr(r.session, "transfer_from_seed", lambda *args: False)
++    assert r.loader.load_model(r.vc, r.config) is r.fallback
++    assert get_adaptor()._registered_moe_layers == baseline + [r.fallback]
++
++
+ @pytest.fixture
+ def loader_runtime(request, monkeypatch):
+     """Execute real load_model/rollback logic on CPU with external model construction injected."""
+@@ -52,10 +124,23 @@ def loader_runtime(request, monkeypatch):
+             eplb_config=SimpleNamespace(dynamic_eplb=False, expert_map_record_path=None)
+         ),
+     )
+-    stub("vllm_ascend.device.hardware_profile", get_current_hardware_profile=Mock())
+-    monkeypatch.setattr(
+-        sys.modules["vllm_ascend.model_loader.rfork.identity"], "build_compatibility_fingerprint", Mock(), raising=False
+-    )
++    if getattr(request, "param", None) == "legacy_hardware":
++        monkeypatch.setitem(sys.modules, "vllm_ascend.device.hardware_profile", None)
++        stub("vllm_ascend.utils", is_310p=lambda: True)
++    else:
++        stub("vllm_ascend.device.hardware_profile", get_current_hardware_profile=Mock())
++    compat_path = Path(__file__).resolve().parents[4] / "vllm_ascend/model_loader/rfork/compat.py"
++    compat_name = "vllm_ascend.model_loader.rfork.compat"
++    compat_spec = importlib.util.spec_from_file_location(compat_name, compat_path)
++    compat_module = importlib.util.module_from_spec(compat_spec)
++    monkeypatch.setitem(sys.modules, compat_name, compat_module)
++    compat_spec.loader.exec_module(compat_module)
++    identity_path = Path(__file__).resolve().parents[4] / "vllm_ascend/model_loader/rfork/identity.py"
++    identity_name = "vllm_ascend.model_loader.rfork.identity"
++    identity_spec = importlib.util.spec_from_file_location(identity_name, identity_path)
++    identity_module = importlib.util.module_from_spec(identity_spec)
++    monkeypatch.setitem(sys.modules, identity_name, identity_module)
++    identity_spec.loader.exec_module(identity_module)
+     path = Path(__file__).resolve().parents[4] / "vllm_ascend/model_loader/rfork/rfork_loader.py"
+     name = "vllm_ascend.model_loader.rfork.rfork_loader"
+     spec = importlib.util.spec_from_file_location(name, path)
+@@ -67,6 +152,7 @@ def loader_runtime(request, monkeypatch):
+         torch, "npu", SimpleNamespace(synchronize=lambda: events.append("sync"), empty_cache=Mock()), raising=False
+     )
+     monkeypatch.setattr(module, "_rfork_pre_transfer_weight_processing", lambda model: nullcontext())
++    moe_processing = module._rfork_skip_unquantized_moe_post_load_processing
+     monkeypatch.setattr(module, "_rfork_skip_unquantized_moe_post_load_processing", lambda model: nullcontext())
+     load_config = SimpleNamespace(device=None, model_loader_extra_config={}, load_format="rfork")
+     loader = module.RForkModelLoader(load_config)
+@@ -113,7 +199,56 @@ def loader_runtime(request, monkeypatch):
+         existing=existing,
+         model=model,
+         fallback=fallback,
++        identity_module=identity_module,
++        moe_processing=moe_processing,
++    )
++
++
++@pytest.mark.parametrize("loader_runtime", ["legacy_hardware"], indirect=True)
++def test_loader_and_identity_import_without_hardware_profiles(loader_runtime):
++    r = loader_runtime
++    assert r.loader._requires_processed_layout_transfer(r.config)
++    assert r.identity_module.get_current_hardware_profile().weight_layout_policy.name == "FORCE_NZ"
++    fingerprint = r.module.build_compatibility_fingerprint(
++        r.vc, r.config, model_url="model", model_deploy_strategy_name="strategy"
++    )
++    assert len(fingerprint) == 64
++
++
++@pytest.mark.parametrize("raise_during_processing", [False, True])
++def test_legacy_moe_import_skips_and_restores_only_unquantized_hooks(
++    loader_runtime, monkeypatch, raise_during_processing
++):
++    r = loader_runtime
++
++    class LegacyMethod:
++        def __init__(self):
++            self.process_weights_after_loading = Mock()
++
++    class LegacyRunner:
++        def __init__(self, method):
++            self._quant_method = method
++
++    legacy_module = ModuleType("vllm_ascend.ops.fused_moe.fused_moe")
++    legacy_module.AscendUnquantizedFusedMoEMethod = LegacyMethod
++    legacy_module.AscendMoERunner = LegacyRunner
++    monkeypatch.setitem(sys.modules, legacy_module.__name__, legacy_module)
++    monkeypatch.setitem(sys.modules, "vllm_ascend.ops.fused_moe.routed_experts", None)
++    unquantized = LegacyMethod()
++    original_hook = unquantized.process_weights_after_loading
++    quantized = SimpleNamespace(process_weights_after_loading=Mock())
++    model = SimpleNamespace(
++        modules=lambda: iter([LegacyRunner(unquantized), LegacyRunner(quantized), LegacyRunner(unquantized)])
+     )
++    expected_error = pytest.raises(RuntimeError, match="post-load failed") if raise_during_processing else nullcontext()
++    with expected_error, r.moe_processing(model):
++        unquantized.process_weights_after_loading()
++        quantized.process_weights_after_loading()
++        original_hook.assert_not_called()
++        quantized.process_weights_after_loading.assert_called_once()
++        if raise_during_processing:
++            raise RuntimeError("post-load failed")
++    assert unquantized.process_weights_after_loading is original_hook
+ 
+ 
+ @pytest.mark.parametrize("processed", [False, True])
+diff --git a/tests/ut/model_loader/rfork/test_rfork_loader.py b/tests/ut/model_loader/rfork/test_rfork_loader.py
+index e524f1244..747180c3f 100644
+--- a/tests/ut/model_loader/rfork/test_rfork_loader.py
++++ b/tests/ut/model_loader/rfork/test_rfork_loader.py
+@@ -1092,8 +1092,6 @@ def test_rfork_pre_transfer_weight_processing_unwraps_and_restores_quant_methods
+ 
+ 
+ def test_rfork_skips_only_unquantized_moe_post_load_processing(monkeypatch):
+-    import vllm_ascend.ops.fused_moe.routed_experts as routed_experts_module
+-
+     import vllm_ascend.ops.fused_moe.fused_moe as fused_moe_module
+ 
+     class _FakeAscendUnquantizedFusedMoEMethod:
+@@ -1130,7 +1128,7 @@ def test_rfork_skips_only_unquantized_moe_post_load_processing(monkeypatch):
+             )
+ 
+     monkeypatch.setattr(
+-        routed_experts_module,
++        fused_moe_module,
+         "AscendUnquantizedFusedMoEMethod",
+         _FakeAscendUnquantizedFusedMoEMethod,
+     )
+diff --git a/vllm_ascend/model_loader/rfork/compat.py b/vllm_ascend/model_loader/rfork/compat.py
+new file mode 100644
+index 000000000..8bbc6d8f7
+--- /dev/null
++++ b/vllm_ascend/model_loader/rfork/compat.py
+@@ -0,0 +1,23 @@
++# SPDX-License-Identifier: Apache-2.0
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
++
++"""Compatibility with Ascend releases predating hardware profiles."""
++
++from types import SimpleNamespace
++from typing import Any
++
++
++def get_current_hardware_profile() -> Any:
++    # Resolve lazily so RFork can be inspected without initializing NPU utilities.
++    try:
++        from vllm_ascend.device.hardware_profile import get_current_hardware_profile as get_native_profile
++    except ModuleNotFoundError as exc:
++        if exc.name != "vllm_ascend.device.hardware_profile":
++            raise
++
++        from vllm_ascend.utils import is_310p
++
++        policy_name = "FORCE_NZ" if is_310p() else "CONFIGURABLE"
++        return SimpleNamespace(weight_layout_policy=SimpleNamespace(name=policy_name))
++
++    return get_native_profile()
+diff --git a/vllm_ascend/model_loader/rfork/identity.py b/vllm_ascend/model_loader/rfork/identity.py
+index b4abef79e..294c7f73b 100644
+--- a/vllm_ascend/model_loader/rfork/identity.py
++++ b/vllm_ascend/model_loader/rfork/identity.py
+@@ -26,7 +26,7 @@ import torch
+ from vllm.config import ModelConfig, VllmConfig
+ 
+ from vllm_ascend.ascend_config import get_ascend_config
+-from vllm_ascend.device.hardware_profile import get_current_hardware_profile
++from vllm_ascend.model_loader.rfork.compat import get_current_hardware_profile
+ 
+ 
+ def _canonicalize_fingerprint_value(value: Any, *, _active_ids: set[int] | None = None) -> Any:
+diff --git a/vllm_ascend/model_loader/rfork/rfork_loader.py b/vllm_ascend/model_loader/rfork/rfork_loader.py
+index 250d2e3ce..1ebea67a0 100644
+--- a/vllm_ascend/model_loader/rfork/rfork_loader.py
++++ b/vllm_ascend/model_loader/rfork/rfork_loader.py
+@@ -15,6 +15,7 @@
+ #
+ 
+ import gc
++import sys
+ import time
+ from collections.abc import Iterator
+ from contextlib import contextmanager
+@@ -39,7 +40,7 @@ from vllm.model_executor.model_loader.utils import (
+ from vllm.utils.torch_utils import set_default_torch_dtype
+ 
+ from vllm_ascend.ascend_config import get_ascend_config
+-from vllm_ascend.device.hardware_profile import get_current_hardware_profile
++from vllm_ascend.model_loader.rfork.compat import get_current_hardware_profile
+ from vllm_ascend.model_loader.rfork.config import RForkConfig
+ from vllm_ascend.model_loader.rfork.identity import build_compatibility_fingerprint
+ from vllm_ascend.model_loader.rfork.session import RForkSession
+@@ -64,6 +65,7 @@ class _RForkProcessGlobalModelState:
+     static_forward_context: tuple[dict[Any, Any], dict[Any, Any]] | None
+     static_all_moe_layers: tuple[list[Any], list[Any]] | None
+     rope_cache: dict[Any, Any] | None
++    ascend_moe_layers: list[Any] | None = None
+ 
+ 
+ def _is_rfork_summary_rank(session: RForkSession) -> bool:
+@@ -174,6 +176,15 @@ def _make_fallback_load_config(load_config: LoadConfig) -> LoadConfig:
+     return fallback_load_config
+ 
+ 
++def _get_ascend_moe_registry() -> list[Any] | None:
++    # Model construction may import the adaptor for the first time. Inspect
++    # already-loaded modules without eagerly initializing the EPLB dependency.
++    module = sys.modules.get("vllm_ascend.eplb.adaptor.vllm_adaptor")
++    adaptor = getattr(module, "VllmEplbAdaptor", None)
++    layers = getattr(adaptor, "_registered_moe_layers", None)
++    return layers if isinstance(layers, list) else None
++
++
+ def _snapshot_process_global_model_state(vllm_config: VllmConfig) -> _RForkProcessGlobalModelState:
+     """Snapshot registries that model construction can mutate in the process."""
+     static_forward_context: tuple[dict[Any, Any], dict[Any, Any]] | None = None
+@@ -199,7 +210,9 @@ def _snapshot_process_global_model_state(vllm_config: VllmConfig) -> _RForkProce
+     except Exception as e:  # pragma: no cover - best-effort across vLLM versions
+         logger.debug("RFork fallback: skip snapshotting _ROPE_DICT: %s", e)
+ 
+-    return _RForkProcessGlobalModelState(static_forward_context, static_all_moe_layers, rope_cache)
++    ascend_moe_registry = _get_ascend_moe_registry()
++    ascend_moe_layers = list(ascend_moe_registry) if ascend_moe_registry is not None else None
++    return _RForkProcessGlobalModelState(static_forward_context, static_all_moe_layers, rope_cache, ascend_moe_layers)
+ 
+ 
+ def _reset_process_global_model_state(
+@@ -214,6 +227,16 @@ def _reset_process_global_model_state(
+     entries that were added by an earlier successful model load.
+     """
+     stale_module_ids = {id(module) for module in model.modules()} if model is not None else set()
++    # AscendMoERunner registers itself even when dynamic EPLB is disabled.
++    # Leaving those references alive retains expert weights across fallback.
++    # Restore in place because an existing adaptor can share this list; keep
++    # target-model registrations when a draft attempt is discarded.
++    ascend_moe_registry = _get_ascend_moe_registry()
++    if ascend_moe_registry is not None:
++        if snapshot is not None:
++            ascend_moe_registry[:] = snapshot.ascend_moe_layers or []
++        elif stale_module_ids:
++            ascend_moe_registry[:] = [layer for layer in ascend_moe_registry if id(layer) not in stale_module_ids]
+     removed_names: set[Any] = set()
+     compilation_config = getattr(vllm_config, "compilation_config", None)
+     if compilation_config is not None:
+@@ -315,7 +338,7 @@ def _is_dynamic_eplb_enabled(vllm_config: VllmConfig) -> bool:
+ def _rfork_skip_unquantized_moe_post_load_processing(model: Module):
+     """Suppress unquantized MoE post-load processing; dense layers still run theirs."""
+ 
+-    from vllm_ascend.ops.fused_moe.routed_experts import AscendUnquantizedFusedMoEMethod
++    from vllm_ascend.ops.fused_moe.fused_moe import AscendUnquantizedFusedMoEMethod
+ 
+     restored_methods: list[tuple[Any, object]] = []
+     for quant_method in _iter_ascend_moe_quant_methods(model):
+@@ -459,7 +482,6 @@ class RForkModelLoader(BaseModelLoader):
+         target_device = torch.device(load_device)
+ 
+         with set_default_torch_dtype(model_config.dtype):
+-            need_del = False
+             model_init_started = False
+             model: Module | None = None
+             session: RForkSession | None = None
+@@ -505,7 +527,6 @@ class RForkModelLoader(BaseModelLoader):
+                         model_config=model_config,
+                         prefix=prefix,
+                     )
+-                    need_del = True
+                 logger.info(
+                     "RFork %s model initialization took %.2f seconds",
+                     _rfork_model_kind(session),
+@@ -581,7 +602,9 @@ class RForkModelLoader(BaseModelLoader):
+                     _rfork_model_kind(session),
+                 )
+             except Exception as e:
+-                logger.warning("RFork transfer failed: %s, clean up and fall back to default loader", e)
++                # A queued/captured LogRecord must not retain the exception's
++                # traceback and the discarded model through its arguments.
++                logger.warning("RFork transfer failed: %s, clean up and fall back to default loader", str(e))
+ 
+             cleanup_result: bool | RForkFallbackCleanupResult = False
+             if session is not None:
+@@ -599,8 +622,10 @@ class RForkModelLoader(BaseModelLoader):
+                     "tensor owners remain retained. Refusing to allocate a second model while old weights are pinned."
+                 )
+ 
+-            if need_del and model is not None:
+-                del model
++            if model_init_started:
++                # A constructor can register layers and then raise before
++                # assigning model. Collect that partial model as well.
++                model = None
+                 gc.collect()
+                 torch.npu.empty_cache()
+                 for _ in range(3):
+-- 
+2.51.0.windows.1
+
