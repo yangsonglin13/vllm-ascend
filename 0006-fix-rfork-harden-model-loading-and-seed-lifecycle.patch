@@ -1,0 +1,2184 @@
+From a5da92e9dc5e8c78893d0630de964d2ee568f392 Mon Sep 17 00:00:00 2001
+From: yangsonglin13 <yangsonglin566@gmail.com>
+Date: Sat, 12 Sep 2026 17:17:12 +0800
+Subject: [PATCH 6/7] fix(rfork): harden model loading and seed lifecycle
+
+Restore Ascend MoE registrations and counters before fallback, prefer resolved checkpoint commits, and bypass RFork for static expert maps, sleep and online weight transfer. Guard later weight mutations and withdraw failed seed services without releasing live native registrations.
+
+Restore checkpoint-layout transfers from seed manifests with additional derived tensors, validating their metadata while retaining strict required-weight and processed-layout checks. Document raw-byte, stride/view, NZ and checkpoint-stage design contracts and historical validation in English and Chinese. Planner code is unchanged.
+
+Validation: 290 CPU-isolated tests passed, including real MLA post-load, real HTTP lifecycle and concurrent shutdown checks. Ruff, markdownlint, spelling, translation parsing and diff checks passed. Full vLLM worker and NPU/RDMA integration remain unverified.
+Signed-off-by: yangsonglin13 <yangsonglin566@gmail.com>
+(cherry picked from commit 4ae54db0f167ec921dd6275ecc3b4fb48d4051d5)
+---
+ .../user_guide/feature_guide/rfork.po         |  64 ++-
+ docs/source/user_guide/feature_guide/rfork.md |  33 +-
+ tests/ut/model_loader/rfork/__init__.py       |   0
+ tests/ut/model_loader/rfork/conftest.py       |  51 ++
+ .../model_loader/rfork/rfork_test_support.py  |  24 +
+ .../rfork/seed_server_test_utils.py           |  55 ++
+ .../model_loader/rfork/session_test_utils.py  |  29 ++
+ .../test_checkpoint_manifest_isolated.py      | 153 ++++++
+ .../rfork/test_fallback_moe_state_isolated.py | 158 ++++++
+ .../rfork/test_heartbeat_health_isolated.py   | 153 ++++++
+ .../rfork/test_identity_validation.py         |  44 ++
+ .../rfork/test_late_lease_isolated.py         |   3 +
+ .../model_loader/rfork/test_lease_release.py  |   4 +-
+ .../rfork/test_mutation_safety_isolated.py    | 123 +++++
+ .../ut/model_loader/rfork/test_ops_config.py  |  10 +-
+ tests/ut/worker/a2/test_worker_v1.py          |   2 +
+ vllm_ascend/model_loader/rfork/identity.py    |  16 +-
+ vllm_ascend/model_loader/rfork/manifest.py    |  33 +-
+ .../model_loader/rfork/rfork_loader.py        |  79 +--
+ vllm_ascend/model_loader/rfork/safety.py      |  41 ++
+ vllm_ascend/model_loader/rfork/session.py     | 483 ++++++++++--------
+ .../model_loader/rfork/transfer_backend.py    |  21 +-
+ vllm_ascend/worker/worker.py                  |   6 +
+ 23 files changed, 1318 insertions(+), 267 deletions(-)
+ create mode 100644 tests/ut/model_loader/rfork/__init__.py
+ create mode 100644 tests/ut/model_loader/rfork/conftest.py
+ create mode 100644 tests/ut/model_loader/rfork/rfork_test_support.py
+ create mode 100644 tests/ut/model_loader/rfork/seed_server_test_utils.py
+ create mode 100644 tests/ut/model_loader/rfork/session_test_utils.py
+ create mode 100644 tests/ut/model_loader/rfork/test_checkpoint_manifest_isolated.py
+ create mode 100644 tests/ut/model_loader/rfork/test_fallback_moe_state_isolated.py
+ create mode 100644 tests/ut/model_loader/rfork/test_heartbeat_health_isolated.py
+ create mode 100644 tests/ut/model_loader/rfork/test_mutation_safety_isolated.py
+ create mode 100644 vllm_ascend/model_loader/rfork/safety.py
+
+diff --git a/docs/source/locale/zh_CN/LC_MESSAGES/user_guide/feature_guide/rfork.po b/docs/source/locale/zh_CN/LC_MESSAGES/user_guide/feature_guide/rfork.po
+index aa540bb3e..f9b7c7db7 100644
+--- a/docs/source/locale/zh_CN/LC_MESSAGES/user_guide/feature_guide/rfork.po
++++ b/docs/source/locale/zh_CN/LC_MESSAGES/user_guide/feature_guide/rfork.po
+@@ -690,6 +690,9 @@ msgid ""
+ "- RFork currently requires all materialized model parameters and registered buffers to reside on NPU. Mixed CPU/NPU or CPU-offloaded model state is rejected and falls back to the default loader rather than performing a partial transfer.\n"
+ "- Keep the seed bind/advertise addresses reachable from the receiver workers. Transport encryption and access control remain the deployment's responsibility, so use HTTPS and network isolation for untrusted networks.\n"
+ "- RFork weight transfer does not support dynamic EPLB because expert weights and placement can change after the seed service starts. If `parallel_config.enable_eplb`, `eplb_config.dynamic_eplb`, or `eplb_config.expert_map_record_path` enables EPLB, RFork transfer is bypassed and the model is loaded through the default model loader.\n"
++"- Configuring a non-null `eplb_config.expert_map_path` also disables RFork, even when dynamic EPLB is off. Static expert placement is not covered by the compatibility fingerprint, so matching ranks and tensor shapes cannot establish compatibility. The main and draft models use the default loader directly, without creating RFork sessions, acquiring seed leases, registering transfer memory, or publishing seeds. No planner changes are required.\n"
++"- RFork is bypassed when `model_config.enable_sleep_mode` is enabled or `weight_transfer_config` is configured. Target and draft models use the default loader without publishing seeds, so sleep and online weight updates can proceed normally. Configure these options before loading; RFork does not support draining and re-registering weights around runtime mutations.\n"
++"- A worker that has already created an RFork session rejects `sleep`, `start_weight_update`, `update_weights`, `finish_weight_update`, and `reload_weights` before modifying memory. This includes draft sessions and sessions retaining resources after failed cleanup. To use these operations, restart with `--load-format auto` for both target and draft, or configure sleep mode/online weight transfer before loading.\n"
+ "- The example [`rfork_planner.py`](https://github.com/vllm-project/vllm-ascend/blob/main/examples/rfork/rfork_planner.py) is only a simple mock implementation. If you need stronger scheduling, capacity management, or production-grade availability behavior, implement your own planner based on the RFork seed protocol."
+ msgstr ""
+ "- RFork 需要 `YuanRong TransferEngine` 提供 `MemoryRegistration`、`ErrorCode.kNotReady`、`batch_register_memory_ex()` 和 `finalize()`。不包含这些 API 的软件包无法初始化传输后端；RFork 会回退到默认加载器，且不会启动 seed 服务。\n"
+@@ -697,6 +700,9 @@ msgstr ""
+ "- RFork 当前要求所有已实体化的模型参数和已注册缓冲区都位于 NPU。混合 CPU/NPU 或 CPU 卸载的模型状态会被拒绝并回退到默认加载器，避免执行不完整传输。\n"
+ "- 请确保接收 worker 可以访问种子的绑定和上报地址。传输加密与访问控制由部署环境负责，因此在不可信网络中应使用 HTTPS 和网络隔离。\n"
+ "- RFork 权重传输不支持动态 EPLB，因为种子服务启动后专家权重和放置位置可能发生变化。如果 `parallel_config.enable_eplb`、`eplb_config.dynamic_eplb` 或 `eplb_config.expert_map_record_path` 启用 EPLB，RFork 会跳过传输并使用默认模型加载器。\n"
++"- 配置非空值（非 null）的 `eplb_config.expert_map_path` 也会禁用 RFork，即使动态 EPLB 已关闭。兼容性指纹未覆盖静态专家放置，因此 rank 和张量形状一致不足以证明兼容。主模型和草稿模型直接使用默认加载器，不创建 RFork session、不申请 seed 租约、不注册传输内存，也不发布 seed。无需修改 planner。\n"
++"- 启用 `model_config.enable_sleep_mode` 或配置 `weight_transfer_config` 时会跳过 RFork。主模型和草稿模型使用默认加载器且不发布 seed，因此 sleep 和在线权重更新可正常执行。请在加载前配置这些选项；RFork 尚不支持在运行时修改权重前等待所有读取结束、修改后重新注册权重的流程。\n"
++"- 已创建 RFork session 的 worker 会在修改内存前拒绝 `sleep`、`start_weight_update`、`update_weights`、`finish_weight_update` 和 `reload_weights`。此限制也覆盖草稿模型 session，以及清理失败后仍保留资源的 session。若要使用这些操作，请为主模型和草稿模型均设置 `--load-format auto` 后重启，或在加载前配置 sleep 模式或在线权重传输。\n"
+ "- 示例 [`rfork_planner.py`](https://github.com/vllm-project/vllm-ascend/blob/main/examples/rfork/rfork_planner.py) 只是简单的模拟实现。如需更强的调度、容量管理或生产级可用性行为，请基于 RFork 种子协议实现自己的规划器。"
+ 
+ 
+@@ -715,8 +721,8 @@ msgstr "6. 传输成功后，RFork 会调度异步源端租约释放，完成剩
+ msgid "Model initialization and required layout preparation happen **before lease acquisition**, keeping the lease focused on registration, metadata exchange, and transfer. Session setup, initialization, layout, or post-load errors also use the fallback cleanup path. If the default loader itself fails, model loading fails."
+ msgstr "模型初始化和必要的布局准备发生在**申请租约之前**，使租约主要覆盖内存注册、元数据交换和权重传输。会话创建、初始化、布局处理或加载后处理发生错误时，也会进入回退清理路径。如果默认加载器本身失败，模型加载将失败。"
+ 
+-msgid "Source-lease release runs asynchronously with bounded retries. A pending release delays Seed publication without discarding the loaded model; publication can resume after release is acknowledged. Exhausted release retries or incomplete cleanup suppress publication. A Seed service startup or advertisement failure also **keeps the loaded model**, with no checkpoint reload. When dynamic EPLB disables RFork, the loader bypasses this flow and uses the default loader directly."
+-msgstr "源端租约通过异步方式释放，并设置有限的重试次数。释放尚未完成时会延迟发布 Seed，但不会丢弃已加载模型；确认释放后可以继续发布。重试次数耗尽或清理未完成时，不会发布 Seed。Seed 服务启动或上报失败时也会**保留已加载模型**，无需重新读取检查点。动态 EPLB 导致 RFork 被禁用时，加载器会跳过此流程，直接使用默认加载器。"
++msgid "Source-lease release runs asynchronously with bounded retries. A pending release delays Seed publication without discarding the loaded model; publication can resume after release is acknowledged. Exhausted release retries or incomplete cleanup suppress publication. A Seed service startup or advertisement failure also **keeps the loaded model**, with no checkpoint reload. When dynamic EPLB or a configured static expert map disables RFork, the loader bypasses this flow and uses the default loader directly."
++msgstr "源端租约通过异步方式释放，并设置有限的重试次数。释放尚未完成时会延迟发布 Seed，但不会丢弃已加载模型；确认释放后可以继续发布。重试次数耗尽或清理未完成时，不会发布 Seed。Seed 服务启动或上报失败时也会**保留已加载模型**，无需重新读取检查点。动态 EPLB 或配置的静态专家映射导致 RFork 被禁用时，加载器会跳过此流程，直接使用默认加载器。"
+ 
+ msgid "Release logs include a hashed lease identifier, attempt count, elapsed acquisition-to-release time, HTTP status and a bounded response excerpt with control characters removed and the lease ID redacted. These allow diagnosis without printing the raw USER_ID credential. Per-request timeouts are connect/read inactivity limits, not a strict total wall-clock deadline."
+ msgstr "释放日志包含哈希后的租约标识、尝试次数、从获取到释放的耗时、HTTP 状态，以及长度受限的响应摘要；摘要会去除控制字符并隐藏租约 ID。这些信息可用于诊断，同时避免输出原始 USER_ID 凭据。每次请求的超时限制针对连接或读取阶段的无活动时间，并非严格的总耗时上限。"
+@@ -726,3 +732,57 @@ msgstr "例如，使用 60 秒的租约 TTL 启动 Planner："
+ 
+ msgid "Increasing the lease TTL does not change the seed heartbeat TTL (`--heartbeat-ttl-sec`, default 60 seconds). The planner process reads these settings at startup; changing a client-side environment variable does not reconfigure a running planner."
+ msgstr "增大租约 TTL 不会改变 seed 心跳 TTL（`--heartbeat-ttl-sec`，默认 60 秒）。Planner 进程在启动时读取这些配置；修改客户端环境变量不会重新配置已运行的 Planner。"
++
++msgid "Loading summaries are INFO on TP rank 0 of each group and DEBUG on other ranks. Their elapsed time covers that worker's loader call, including any failed RFork attempt, local fallback, and synchronous seed-service startup; it is not the maximum across ranks or time until the engine is ready, and does not wait for deferred seed promotion to finish. Set `VLLM_LOGGING_LEVEL=DEBUG` before startup to inspect per-rank initialization, layout, registration, metadata, read, lease release, and seed publication details. Normal deferred seed publication is DEBUG; failures remain WARNING/ERROR on every rank."
++msgstr "加载汇总在每组 TP rank 0 使用 INFO，其他 rank 使用 DEBUG。汇总耗时覆盖该 worker 的加载器调用，包括失败的 RFork 尝试、本地回退和同步 seed 服务启动；它不是跨 rank 最大耗时，也不是引擎就绪耗时，且不会等待延迟 seed 发布完成。启动前设置 `VLLM_LOGGING_LEVEL=DEBUG` 可查看各 rank 的初始化、布局处理、注册、元数据获取、读取、租约释放和 seed 发布细节。正常延迟发布 seed 使用 DEBUG，各 rank 的失败仍保留 WARNING/ERROR。"
++
++msgid "Fallback restores the Ascend MoE layer registry and layer counter, as well as the compilation registries and rotary cache, to their pre-attempt state. This releases discarded expert weights before checkpoint loading, including after partial model construction, while preserving an already loaded target model when a draft attempt fails."
++msgstr "回退会将 Ascend MoE 层注册表和层计数器，以及编译注册表和旋转位置编码缓存，恢复到本次尝试之前的状态。这确保在读取检查点之前释放已丢弃的专家权重，也覆盖模型构造中途失败的情况；草稿模型加载失败时，已加载的 target 模型会被保留。"
++
++msgid "Revision matching prefers the resolved checkpoint commit hash over a requested branch or tag such as `main`. Different commits therefore produce different fingerprints even when the requested revision is unchanged. If no commit hash is available, RFork uses the configured revision identifier; deployments using local checkpoints must supply an immutable model identity or deployment-strategy name when weights change. RFork does not hash local checkpoint contents."
++msgstr "版本匹配优先使用解析出的检查点 commit hash，而不是 `main` 等请求的分支或标签。因此，即使请求的 revision 未变，不同提交也会生成不同的指纹。如果没有可用的 commit hash，RFork 使用配置的版本标识；使用本地检查点的部署在权重变更时，必须提供对应的不可变模型标识或部署策略名。RFork 不计算本地检查点内容的哈希。"
++
++msgid "- Configuring a non-null `eplb_config.expert_map_path` also disables RFork, even when dynamic EPLB is off. Static expert placement is not covered by the compatibility fingerprint, so matching ranks and tensor shapes cannot establish compatibility. The main and draft models use the default loader directly, without creating RFork sessions, acquiring seed leases, registering transfer memory, or publishing seeds. No planner changes are required."
++msgstr "- 配置非空值（非 null）的 `eplb_config.expert_map_path` 也会禁用 RFork，即使动态 EPLB 已关闭。兼容性指纹未覆盖静态专家放置，因此 rank 和张量形状一致不足以证明兼容。主模型和草稿模型直接使用默认加载器，不创建 RFork session、不申请 seed 租约、不注册传输内存，也不发布 seed。无需修改 planner。"
++
++msgid "The session checks that its seed HTTP server thread is alive before each heartbeat and after each advertisement request. If the thread exits, RFork stops heartbeats and attempts to remove the advertisement; the loaded model can continue inference. Detection occurs on the next heartbeat, whose default interval is 30 seconds. Registered memory remains retained until normal cleanup because advertisement removal does not prove that existing native reads have finished. If removal fails, shutdown can retry and planner heartbeat expiry can reclaim the advertisement. This check detects thread exit, not a live but unresponsive HTTP server."
++msgstr "Session 在每次心跳前和每次发布请求后检查 seed HTTP 服务线程是否存活。线程退出时，RFork 停止心跳并尝试撤销发布，已加载模型可继续推理。退出会在下一次心跳时被发现，默认心跳间隔为 30 秒。已注册内存保留到正常清理流程，因为撤销发布不能证明已有原生读取已经结束。撤销失败时，shutdown 可以重试，planner 的心跳过期机制也可回收发布记录。此检查检测线程退出，不能检测线程仍存活但 HTTP 服务无响应的情况。"
++
++msgid "- RFork is bypassed when `model_config.enable_sleep_mode` is enabled or `weight_transfer_config` is configured. Target and draft models use the default loader without publishing seeds, so sleep and online weight updates can proceed normally. Configure these options before loading; RFork does not support draining and re-registering weights around runtime mutations."
++msgstr "- 启用 `model_config.enable_sleep_mode` 或配置 `weight_transfer_config` 时会跳过 RFork。主模型和草稿模型使用默认加载器且不发布 seed，因此 sleep 和在线权重更新可正常执行。请在加载前配置这些选项；RFork 尚不支持在运行时修改权重前等待所有读取结束、修改后重新注册权重的流程。"
++
++msgid "- A worker that has already created an RFork session rejects `sleep`, `start_weight_update`, `update_weights`, `finish_weight_update`, and `reload_weights` before modifying memory. This includes draft sessions and sessions retaining resources after failed cleanup. To use these operations, restart with `--load-format auto` for both target and draft, or configure sleep mode/online weight transfer before loading."
++msgstr "- 已创建 RFork session 的 worker 会在修改内存前拒绝 `sleep`、`start_weight_update`、`update_weights`、`finish_weight_update` 和 `reload_weights`。此限制也覆盖草稿模型 session，以及清理失败后仍保留资源的 session。若要使用这些操作，请为主模型和草稿模型均设置 `--load-format auto` 后重启，或在加载前配置 sleep 模式或在线权重传输。"
++
++msgid "### Tensor Layout Design"
++msgstr "### 张量布局设计"
++
++msgid "### Validation"
++msgstr "### 验证"
++
++msgid "Raw-byte transfer of the prepared tensor layout is intentional. RFork supports dense transposes and permutations without forcing every tensor to become contiguous. It can also adjust a receiver tensor to the seed shape with an in-place storage-preserving view when the element count matches. This preserves the historical quantized-model transfer design, which builds the inference layout before copying weights instead of repeating packing or transposition after transfer. Both instances must interpret the transferred bytes with the same effective layout; shape equality alone does not establish stride compatibility, and the manifest currently does not compare remote strides."
++msgstr "对准备好的张量布局直接进行原始字节传输是有意设计。RFork 支持稠密转置和维度排列，不强制将所有张量转为连续布局。元素数量一致时，也可通过保留底层存储的 view 将接收端张量调整为 seed 的形状。这延续了量化模型的既有传输设计：复制权重前先构造推理布局，避免传输后重复打包或转置。两端必须按相同的有效布局解释传输字节；仅形状一致不能证明 stride 兼容，当前 manifest 不比较远端 stride。"
++
++msgid "NZ transfer is also intentional: RFork copies prepared NPU tensors using `numel() * element_size()` bytes per tensor, rather than serializing checkpoint tensors or blindly copying entire allocator blocks. This relies on the target model's layout and alignment making that byte range sufficient for its physical representation. It is not a guarantee for arbitrary NZ tensors with padding. Validate physical layout, transfer coverage and inference accuracy on the intended NPU/model combination; CPU layout tests cannot establish NZ padding correctness."
++msgstr "NZ 传输同样是有意设计：RFork 对准备好的 NPU 张量按每个张量 `numel() * element_size()` 字节复制，不序列化检查点张量，也不直接复制整个分配器内存块。这依赖目标模型的布局和对齐保证该字节范围足以覆盖其物理表示，并不保证任意带 padding 的 NZ 张量均适用。应在目标 NPU 和模型组合上验证物理布局、传输覆盖范围和推理精度；CPU 布局测试不能证明 NZ padding 的正确性。"
++
++msgid "Checkpoint-layout transfer requires every non-shared local tensor to be present in the seed manifest, but allows the seed to contain additional tensors generated by post-load processing. Their metadata is validated and their bytes are not read. The receiver rebuilds required derived tensors during its normal post-load step; for example, unquantized MLA rebuilds `W_UV` and `W_UK_T` from the transferred `kv_b_proj.weight`. Processed-layout transfers still require matching final tensor inventories, apart from target-shared draft tensors. If the seed has disposed a checkpoint tensor still required by the receiver, RFork continues to fall back rather than performing an incomplete transfer."
++msgstr "Checkpoint-layout 传输要求 seed manifest 包含所有未与 target 共享的本地张量，但允许 seed 多出由加载后处理生成的张量。这些额外张量的元数据仍会校验，但不会读取其字节。接收端在正常加载后处理阶段重建所需派生张量，例如未量化 MLA 根据传输的 `kv_b_proj.weight` 重建 `W_UV` 和 `W_UK_T`。Processed-layout 传输仍要求最终张量清单一致，仅允许排除与 target 共享的草稿张量。如果 seed 已释放接收端仍需要的 checkpoint 张量，RFork 仍会回退，避免不完整传输。"
++
++msgid "### Historical Rationale and Validation"
++msgstr "### 历史设计依据与验证"
++
++msgid "RFork is a transfer path between compatible model instances, not a general-purpose tensor serializer. Its design preserves the model's established loading stages: prepare the receiver's inference layout before copying processed weights, or transfer the tensors required by the checkpoint path and then run the remaining post-load hooks. The transfer contract therefore depends on both the tensor representation and the loading stage."
++msgstr "RFork 是兼容模型实例之间的传输路径，并非通用张量序列化器。其设计保留了模型既有的加载阶段：复制处理后的权重前，先准备接收端的推理布局；或先传输 checkpoint 路径所需的张量，再执行剩余加载后处理。因此，传输约定同时取决于张量表示和加载阶段。"
++
++msgid "Allowing a seed superset in the checkpoint path is an intentional stage-dependent contract. The seed has completed loading, while the receiver has not yet created all derived tensors; requiring identical inventories at this point would reject a valid source. The local inventory determines the bytes that must be transferred. Every required local entry must match the seed's dtype, element count and element size, while the existing shape/view rules still apply. Seed-only entries never supply substitute data for a missing local weight. In the processed-layout path, both sides have already prepared their final tensors, so the stricter inventory check remains appropriate."
++msgstr "允许 checkpoint 路径的 seed 清单为接收端清单的超集，是有意设计的阶段相关约定。Seed 已完成加载，而接收端尚未创建全部派生张量；此时要求清单完全相同，会拒绝有效数据源。本地清单决定必须传输的字节。每个必需本地条目的 dtype、元素数量和元素大小都必须与 seed 匹配，同时继续遵循既有 shape/view 规则。仅 seed 存在的条目不能替代缺失的本地权重。Processed-layout 路径中，两端均已准备好最终张量，因此仍适用更严格的清单检查。"
++
++msgid "For example, an unquantized MLA seed may expose `kv_b_proj.weight`, `impl.W_UV`, `impl.W_UK_T` and `impl.mlapo_W_UK_T`. A checkpoint receiver initially needs only `kv_b_proj.weight`; after copying it, the MLA post-load hook constructs the other tensors. Transferring those derived tensors as well is unnecessary for this path. In a processed-layout transfer, the receiver prepares the derived tensors first and receives them directly, avoiding a second layout conversion after transfer."
++msgstr "例如，未量化 MLA seed 可暴露 `kv_b_proj.weight`、`impl.W_UV`、`impl.W_UK_T` 和 `impl.mlapo_W_UK_T`。Checkpoint 接收端最初只需要 `kv_b_proj.weight`；复制后，MLA 加载后处理会构造其他张量，因此此路径无需同时传输这些派生张量。Processed-layout 传输则先由接收端准备派生张量，再直接接收其内容，避免传输后再次转换布局。"
++
++msgid "The quantized transfer change in [PR #10128](https://github.com/vllm-project/vllm-ascend/pull/10128) (June 22, 2026) explicitly introduced prepared-layout copying, seed-shape views, and runtime tensor collection for transposed/NZ/packed weights and derived scales. Its commit record reports manual Ascend A2 validation, including GLM-5-W4A8 and DeepSeek-V4-Flash-W8A8-MTP, with successful transfer logs and a normal chat completion. [PR #12995](https://github.com/vllm-project/vllm-ascend/pull/12995) (August 6, 2026) then separated checkpoint and processed inventories, synchronized layout preparation, and avoided repeated unquantized MoE post-load conversion while preserving the remaining hooks."
++msgstr "量化传输变更 [PR #10128](https://github.com/vllm-project/vllm-ascend/pull/10128)（2026 年 6 月 22 日）明确引入了处理后布局复制、按 seed shape 调整 view，以及针对转置/NZ/打包权重和派生 scale 的运行时张量收集。该提交记录报告了 Ascend A2 手工验证，包括 GLM-5-W4A8 和 DeepSeek-V4-Flash-W8A8-MTP，并记录了成功传输日志及正常聊天响应。之后的 [PR #12995](https://github.com/vllm-project/vllm-ascend/pull/12995)（2026 年 8 月 6 日）分离了 checkpoint 和 processed 清单、同步布局准备，并避免重复执行未量化 MoE 的加载后转换，同时保留其余处理钩子。"
++
++msgid "These results support the design for the tested model, configuration, code and hardware combinations. They do not establish that every equal-shape tensor has compatible strides, or that every NZ padding layout fits the logical byte count. The later strict seed/local inventory equality check conflicted with the checkpoint path's different loading stages; accepting a validated seed superset restores that behavior without changing the raw-byte or NZ design. The current CPU regression also executes the real MLA post-load hook with NPU operators replaced, verifies that only the base weight is read, and compares the rebuilt derived tensors with the seed; it complements rather than replaces NPU validation."
++msgstr "这些结果支持该设计在已测试的模型、配置、代码和硬件组合上成立，但不能证明所有同形状张量的 stride 均兼容，也不能证明所有 NZ padding 布局都落在逻辑字节数范围内。后来新增的 seed/本地清单严格相等检查，与 checkpoint 路径两端加载阶段不同的设计发生冲突；接受经过校验的 seed 清单超集恢复了这一行为，且不改变原始字节或 NZ 设计。当前 CPU 回归测试还在替换 NPU 算子的情况下执行真实 MLA 加载后处理，验证只读取基础权重，并将重建的派生张量与 seed 比较；它补充而非取代 NPU 验证。"
+diff --git a/docs/source/user_guide/feature_guide/rfork.md b/docs/source/user_guide/feature_guide/rfork.md
+index 58fa8d814..f9a146094 100644
+--- a/docs/source/user_guide/feature_guide/rfork.md
++++ b/docs/source/user_guide/feature_guide/rfork.md
+@@ -101,7 +101,9 @@ flowchart TD
+ 
+ Model initialization and required layout preparation happen **before lease acquisition**, keeping the lease focused on registration, metadata exchange, and transfer. Session setup, initialization, layout, or post-load errors also use the fallback cleanup path. If the default loader itself fails, model loading fails.
+ 
+-Source-lease release runs asynchronously with bounded retries. A pending release delays Seed publication without discarding the loaded model; publication can resume after release is acknowledged. Exhausted release retries or incomplete cleanup suppress publication. A Seed service startup or advertisement failure also **keeps the loaded model**, with no checkpoint reload. When dynamic EPLB disables RFork, the loader bypasses this flow and uses the default loader directly.
++Source-lease release runs asynchronously with bounded retries. A pending release delays Seed publication without discarding the loaded model; publication can resume after release is acknowledged. Exhausted release retries or incomplete cleanup suppress publication. A Seed service startup or advertisement failure also **keeps the loaded model**, with no checkpoint reload. When dynamic EPLB or a configured static expert map disables RFork, the loader bypasses this flow and uses the default loader directly.
++
++Fallback restores the Ascend MoE layer registry and layer counter, as well as the compilation registries and rotary cache, to their pre-attempt state. This releases discarded expert weights before checkpoint loading, including after partial model construction, while preserving an already loaded target model when a draft attempt fails.
+ 
+ TransferEngine metadata is exchanged through the seed HTTP service, while tensor contents are transferred through TransferEngine. Each worker owns its own TransferEngine session and listening port, so corresponding parallel ranks transfer their local weight shards independently.
+ 
+@@ -117,6 +119,8 @@ After a vLLM Ascend instance finishes loading its model, each RFork worker prepa
+ 
+ The seed remains a normal serving instance. RFork does not ask it to reread the checkpoint or run a model-weight broadcast. Transfers can still consume inter-node and NPU-memory bandwidth, so production deployments should control concurrent readers and observe inference latency.
+ 
++The session checks that its seed HTTP server thread is alive before each heartbeat and after each advertisement request. If the thread exits, RFork stops heartbeats and attempts to remove the advertisement; the loaded model can continue inference. Detection occurs on the next heartbeat, whose default interval is 30 seconds. Registered memory remains retained until normal cleanup because advertisement removal does not prove that existing native reads have finished. If removal fails, shutdown can retry and planner heartbeat expiry can reclaim the advertisement. This check detects thread exit, not a live but unresponsive HTTP server.
++
+ ### Destination-Side Loading
+ 
+ The destination performs the following steps for each worker rank:
+@@ -249,6 +253,8 @@ layout mode, and hardware layout policy. This prevents an old or differently
+ configured seed from being selected merely because its textual key happens to
+ match.
+ 
++Revision matching prefers the resolved checkpoint commit hash over a requested branch or tag such as `main`. Different commits therefore produce different fingerprints even when the requested revision is unchanged. If no commit hash is available, RFork uses the configured revision identifier; deployments using local checkpoints must supply an immutable model identity or deployment-strategy name when weights change. RFork does not hash local checkpoint contents.
++
+ Two instances must agree on model identity and parallel layout before the planner will treat them as interchangeable seeds. The seed key is an opaque SHA256 digest, so seed and receiver instances must run the same RFork protocol to derive the same key.
+ 
+ ### Planner Responsibilities
+@@ -285,6 +291,28 @@ For quantized models, RFork transfers tensors after Ascend weight post-processin
+ 
+ This path handles Ascend quantization changes such as weight transposition, NZ format conversion, packed weights, derived scale tensors, and MLA/SFA runtime tensors such as `W_UV` and `W_UK_T`. Empty tensors that were released during post-processing are not included in the transfer manifest.
+ 
++### Tensor Layout Design
++
++RFork is a transfer path between compatible model instances, not a general-purpose tensor serializer. Its design preserves the model's established loading stages: prepare the receiver's inference layout before copying processed weights, or transfer the tensors required by the checkpoint path and then run the remaining post-load hooks. The transfer contract therefore depends on both the tensor representation and the loading stage.
++
++Raw-byte transfer of the prepared tensor layout is intentional. RFork supports dense transposes and permutations without forcing every tensor to become contiguous. It can also adjust a receiver tensor to the seed shape with an in-place storage-preserving view when the element count matches. This preserves the historical quantized-model transfer design, which builds the inference layout before copying weights instead of repeating packing or transposition after transfer. Both instances must interpret the transferred bytes with the same effective layout; shape equality alone does not establish stride compatibility, and the manifest currently does not compare remote strides.
++
++NZ transfer is also intentional: RFork copies prepared NPU tensors using `numel() * element_size()` bytes per tensor, rather than serializing checkpoint tensors or blindly copying entire allocator blocks. This relies on the target model's layout and alignment making that byte range sufficient for its physical representation. It is not a guarantee for arbitrary NZ tensors with padding. Validate physical layout, transfer coverage and inference accuracy on the intended NPU/model combination; CPU layout tests cannot establish NZ padding correctness.
++
++Checkpoint-layout transfer requires every non-shared local tensor to be present in the seed manifest, but allows the seed to contain additional tensors generated by post-load processing. Their metadata is validated and their bytes are not read. The receiver rebuilds required derived tensors during its normal post-load step; for example, unquantized MLA rebuilds `W_UV` and `W_UK_T` from the transferred `kv_b_proj.weight`. Processed-layout transfers still require matching final tensor inventories, apart from target-shared draft tensors. If the seed has disposed a checkpoint tensor still required by the receiver, RFork continues to fall back rather than performing an incomplete transfer.
++
++Allowing a seed superset in the checkpoint path is an intentional stage-dependent contract. The seed has completed loading, while the receiver has not yet created all derived tensors; requiring identical inventories at this point would reject a valid source. The local inventory determines the bytes that must be transferred. Every required local entry must match the seed's dtype, element count and element size, while the existing shape/view rules still apply. Seed-only entries never supply substitute data for a missing local weight. In the processed-layout path, both sides have already prepared their final tensors, so the stricter inventory check remains appropriate.
++
++For example, an unquantized MLA seed may expose `kv_b_proj.weight`, `impl.W_UV`, `impl.W_UK_T` and `impl.mlapo_W_UK_T`. A checkpoint receiver initially needs only `kv_b_proj.weight`; after copying it, the MLA post-load hook constructs the other tensors. Transferring those derived tensors as well is unnecessary for this path. In a processed-layout transfer, the receiver prepares the derived tensors first and receives them directly, avoiding a second layout conversion after transfer.
++
++### Historical Rationale and Validation
++
++The quantized transfer change in [PR #10128](https://github.com/vllm-project/vllm-ascend/pull/10128) (June 22, 2026) explicitly introduced prepared-layout copying, seed-shape views, and runtime tensor collection for transposed/NZ/packed weights and derived scales. Its commit record reports manual Ascend A2 validation, including GLM-5-W4A8 and DeepSeek-V4-Flash-W8A8-MTP, with successful transfer logs and a normal chat completion. [PR #12995](https://github.com/vllm-project/vllm-ascend/pull/12995) (August 6, 2026) then separated checkpoint and processed inventories, synchronized layout preparation, and avoided repeated unquantized MoE post-load conversion while preserving the remaining hooks.
++
++These results support the design for the tested model, configuration, code and hardware combinations. They do not establish that every equal-shape tensor has compatible strides, or that every NZ padding layout fits the logical byte count. The later strict seed/local inventory equality check conflicted with the checkpoint path's different loading stages; accepting a validated seed superset restores that behavior without changing the raw-byte or NZ design. The current CPU regression also executes the real MLA post-load hook with NPU operators replaced, verifies that only the base weight is read, and compares the rebuilt derived tensors with the seed; it complements rather than replaces NPU validation.
++
++### Validation
++
+ When validating RFork for a quantized model:
+ 
+ - Apply the same vLLM Ascend code to both the seed instance and the receiver instance.
+@@ -382,4 +410,7 @@ vllm serve <model_path> \
+ - RFork currently requires all materialized model parameters and registered buffers to reside on NPU. Mixed CPU/NPU or CPU-offloaded model state is rejected and falls back to the default loader rather than performing a partial transfer.
+ - Keep the seed bind/advertise addresses reachable from the receiver workers. Transport encryption and access control remain the deployment's responsibility, so use HTTPS and network isolation for untrusted networks.
+ - RFork weight transfer does not support dynamic EPLB because expert weights and placement can change after the seed service starts. If `parallel_config.enable_eplb`, `eplb_config.dynamic_eplb`, or `eplb_config.expert_map_record_path` enables EPLB, RFork transfer is bypassed and the model is loaded through the default model loader.
++- Configuring a non-null `eplb_config.expert_map_path` also disables RFork, even when dynamic EPLB is off. Static expert placement is not covered by the compatibility fingerprint, so matching ranks and tensor shapes cannot establish compatibility. The main and draft models use the default loader directly, without creating RFork sessions, acquiring seed leases, registering transfer memory, or publishing seeds. No planner changes are required.
++- RFork is bypassed when `model_config.enable_sleep_mode` is enabled or `weight_transfer_config` is configured. Target and draft models use the default loader without publishing seeds, so sleep and online weight updates can proceed normally. Configure these options before loading; RFork does not support draining and re-registering weights around runtime mutations.
++- A worker that has already created an RFork session rejects `sleep`, `start_weight_update`, `update_weights`, `finish_weight_update`, and `reload_weights` before modifying memory. This includes draft sessions and sessions retaining resources after failed cleanup. To use these operations, restart with `--load-format auto` for both target and draft, or configure sleep mode/online weight transfer before loading.
+ - The example [`rfork_planner.py`](https://github.com/vllm-project/vllm-ascend/blob/main/examples/rfork/rfork_planner.py) is only a simple mock implementation. If you need stronger scheduling, capacity management, or production-grade availability behavior, implement your own planner based on the RFork seed protocol.
+diff --git a/tests/ut/model_loader/rfork/__init__.py b/tests/ut/model_loader/rfork/__init__.py
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/tests/ut/model_loader/rfork/conftest.py b/tests/ut/model_loader/rfork/conftest.py
+new file mode 100644
+index 000000000..bd96b736e
+--- /dev/null
++++ b/tests/ut/model_loader/rfork/conftest.py
+@@ -0,0 +1,51 @@
++# SPDX-License-Identifier: Apache-2.0
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
++
++import logging
++from dataclasses import dataclass
++from types import SimpleNamespace
++
++import pytest
++
++from .rfork_test_support import _load_module, _stub
++from .test_lease_release import runtime as runtime
++
++
++@pytest.fixture
++def tensor_runtime(monkeypatch):
++    _stub(monkeypatch, "vllm", __path__=[])
++    _stub(monkeypatch, "vllm.logger", logger=logging.getLogger("rfork-tensor-safety-test"))
++    _stub(monkeypatch, "vllm.utils", __path__=[])
++    _stub(
++        monkeypatch,
++        "vllm.utils.network_utils",
++        get_ip=lambda: "127.0.0.1",
++        get_open_port=lambda: 12345,
++        join_host_port=lambda host, port: f"{host}:{port}",
++    )
++    for module_name in (
++        "vllm_ascend",
++        "vllm_ascend.model_loader",
++        "vllm_ascend.model_loader.rfork",
++    ):
++        _stub(monkeypatch, module_name, __path__=[])
++
++    @dataclass(frozen=True)
++    class _SeedTransferInfo:
++        session_id: str
++        weights: dict
++        shapes: dict | None = None
++
++    _stub(monkeypatch, "vllm_ascend.model_loader.rfork.types", SeedTransferInfo=_SeedTransferInfo)
++    _load_module(monkeypatch, "vllm_ascend.model_loader.rfork.manifest", "manifest.py")
++    tensor_layout = _load_module(monkeypatch, "vllm_ascend.model_loader.rfork.tensor_layout", "tensor_layout.py")
++    transfer_backend = _load_module(
++        monkeypatch, "vllm_ascend.model_loader.rfork.transfer_backend", "transfer_backend.py"
++    )
++    monkeypatch.setattr(transfer_backend.RForkTransferBackend, "_initialize_transfer_engine", lambda self: None)
++    return SimpleNamespace(
++        tensor_layout=tensor_layout,
++        transfer_backend=transfer_backend,
++        RForkTransferBackend=transfer_backend.RForkTransferBackend,
++        SeedTransferInfo=_SeedTransferInfo,
++    )
+diff --git a/tests/ut/model_loader/rfork/rfork_test_support.py b/tests/ut/model_loader/rfork/rfork_test_support.py
+new file mode 100644
+index 000000000..9617976c3
+--- /dev/null
++++ b/tests/ut/model_loader/rfork/rfork_test_support.py
+@@ -0,0 +1,24 @@
++# SPDX-License-Identifier: Apache-2.0
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
++
++import importlib.util
++import sys
++from pathlib import Path
++from types import ModuleType
++
++RFORK_ROOT = Path(__file__).resolve().parents[4] / "vllm_ascend/model_loader/rfork"
++
++
++def _load_module(monkeypatch, module_name: str, file_name: str):
++    spec = importlib.util.spec_from_file_location(module_name, RFORK_ROOT / file_name)
++    module = importlib.util.module_from_spec(spec)
++    monkeypatch.setitem(sys.modules, module_name, module)
++    spec.loader.exec_module(module)
++    return module
++
++
++def _stub(monkeypatch, module_name: str, **attributes):
++    module = ModuleType(module_name)
++    module.__dict__.update(attributes)
++    monkeypatch.setitem(sys.modules, module_name, module)
++    return module
+diff --git a/tests/ut/model_loader/rfork/seed_server_test_utils.py b/tests/ut/model_loader/rfork/seed_server_test_utils.py
+new file mode 100644
+index 000000000..518a2ec31
+--- /dev/null
++++ b/tests/ut/model_loader/rfork/seed_server_test_utils.py
+@@ -0,0 +1,55 @@
++# SPDX-License-Identifier: Apache-2.0
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
++
++import importlib.util
++import sys
++from dataclasses import replace
++from pathlib import Path
++from types import SimpleNamespace
++from unittest.mock import Mock
++
++import pytest
++
++
++@pytest.fixture
++def live_session(runtime, monkeypatch):
++    """Real session, FastAPI/uvicorn listener and HTTP client; native NPU and planner injected."""
++    path = Path(__file__).resolve().parents[4] / "vllm_ascend/model_loader/rfork/seed_server.py"
++    name = "rfork_live_seed_server_test"
++    spec = importlib.util.spec_from_file_location(name, path)
++    module = importlib.util.module_from_spec(spec)
++    monkeypatch.setitem(sys.modules, name, module)
++    spec.loader.exec_module(module)
++    monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
++    monkeypatch.setattr(runtime.session, "start_rfork_server", module.start_rfork_server)
++    monkeypatch.setattr(runtime.session, "RForkSeedServerStartupError", module.RForkSeedServerStartupError)
++    cfg = replace(
++        runtime.config,
++        seed_bind_host="127.0.0.1",
++        seed_advertise_host="127.0.0.1",
++        seed_timeout_sec=3.0,
++        request_timeout_sec=1.0,
++    )
++    session = runtime.session.RForkSession(cfg, runtime.identity)
++    session.planner = Mock(seed_key="live-key")
++    session.planner.report_seed_once.return_value = True
++    session.planner.remove_seed.return_value = True
++    session.transfer_backend.transfer_session_id = "native-session"
++    session.transfer_backend.weight_manifest = {"weight": [1234, 4, 4, [4], "float32"]}
++    session.transfer_backend.weight_shapes = {"weight": (4,)}
++    handles = []
++    original = module.start_rfork_server
++
++    def start(*args, **kwargs):
++        handle = original(*args, **kwargs)
++        handles.append(handle)
++        return handle
++
++    monkeypatch.setattr(runtime.session, "start_rfork_server", start)
++    client = sys.modules["vllm_ascend.model_loader.rfork.seed_client"]
++    yield SimpleNamespace(session=session, handles=handles, client=client, runtime=runtime)
++    session.planner.remove_seed.side_effect = None
++    session.planner.remove_seed.return_value = True
++    session.shutdown()
++    for handle in handles:
++        assert handle.stop(), "live seed server leaked a thread"
+diff --git a/tests/ut/model_loader/rfork/session_test_utils.py b/tests/ut/model_loader/rfork/session_test_utils.py
+new file mode 100644
+index 000000000..c3f68a483
+--- /dev/null
++++ b/tests/ut/model_loader/rfork/session_test_utils.py
+@@ -0,0 +1,29 @@
++# SPDX-License-Identifier: Apache-2.0
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
++
++from unittest.mock import Mock
++
++
++def make_session(runtime):
++    session = runtime.session.RForkSession(runtime.config, runtime.identity)
++    session.planner = Mock(seed_key="model-key")
++    session.planner.acquire_seed.return_value = runtime.lease
++    session.planner.remove_seed.return_value = True
++    session.transfer_backend = Mock()
++    session.transfer_backend.register_memory_region.return_value = True
++    session.transfer_backend.read_weights_from_seed.return_value = True
++    session.transfer_backend.unregister_memory_region.return_value = True
++    session.transfer_backend.finalize_transfer_engine.return_value = True
++    assert session.acquire_seed()
++    return session
++
++
++def run_and_join(session):
++    # Schedule through the production release primitive without resetting
++    # transfer state; these tests also exercise release after failed transfers.
++    with session._lock:
++        assert session._release_seed_locked() is False
++        worker = session.lease_release_thread
++    assert worker is not None
++    worker.join(2)
++    assert not worker.is_alive()
+diff --git a/tests/ut/model_loader/rfork/test_checkpoint_manifest_isolated.py b/tests/ut/model_loader/rfork/test_checkpoint_manifest_isolated.py
+new file mode 100644
+index 000000000..c8b66179e
+--- /dev/null
++++ b/tests/ut/model_loader/rfork/test_checkpoint_manifest_isolated.py
+@@ -0,0 +1,153 @@
++# SPDX-License-Identifier: Apache-2.0
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
++
++import ast
++import ctypes
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++from .test_late_lease_isolated import loader_runtime as loader_runtime
++
++
++def seed_info(runtime, tensors, with_shapes):
++    weights = {
++        name: (tensor.data_ptr(), tensor.numel(), tensor.element_size(), tuple(tensor.shape), str(tensor.dtype))
++        for name, tensor in tensors
++    }
++    shapes = {name: tuple(tensor.shape) for name, tensor in tensors} if with_shapes else None
++    return runtime.SeedTransferInfo("seed", weights, shapes)
++
++
++def backend_for(runtime, tensors):
++    backend = runtime.RForkTransferBackend()
++    backend._registered_transferable_tensors = tensors
++    reads = []
++
++    def read(session_id, destinations, sources, lengths):
++        for destination, source, length in zip(destinations, sources, lengths, strict=True):
++            reads.append((source, length))
++            ctypes.memmove(destination, source, length)
++        return SimpleNamespace(is_error=lambda: False)
++
++    backend.transfer_engine = SimpleNamespace(batch_transfer_sync_read=read)
++    return backend, reads
++
++
++@pytest.mark.parametrize("with_shapes", [False, True])
++@pytest.mark.parametrize("processed_layout", [False, True])
++def test_only_checkpoint_transfer_accepts_seed_only_tensors(tensor_runtime, monkeypatch, with_shapes, processed_layout):
++    r = tensor_runtime
++    monkeypatch.setattr(r.tensor_layout, "is_tensor_on_transfer_device", lambda tensor: True)
++    model = torch.nn.Module()
++    model.weight = torch.nn.Parameter(torch.zeros(4))
++    source = torch.arange(4, dtype=torch.float32)
++    derived = source.square()
++    info = seed_info(r, [("weight", source), ("impl.derived", derived)], with_shapes)
++    backend, reads = backend_for(r, [("weight", model.weight)])
++    assert backend.read_weights_from_seed(model, info, processed_layout) is (not processed_layout)
++    if processed_layout:
++        assert reads == []
++        assert torch.equal(model.weight, torch.zeros(4))
++    else:
++        assert reads == [(source.data_ptr(), source.numel() * source.element_size())]
++        torch.testing.assert_close(model.weight, source)
++
++
++@pytest.mark.parametrize("invalid", ["missing_weight", "dtype", "size", "extra_shape", "extra_metadata", "shape_names"])
++def test_checkpoint_superset_keeps_validation_before_native_reads(tensor_runtime, monkeypatch, invalid):
++    r = tensor_runtime
++    monkeypatch.setattr(r.tensor_layout, "is_tensor_on_transfer_device", lambda tensor: True)
++    model = torch.nn.Module()
++    model.weight = torch.nn.Parameter(torch.zeros(4))
++    source = torch.arange(4, dtype=torch.float32)
++    derived = source.square()
++    info = seed_info(r, [("weight", source), ("impl.derived", derived)], True)
++    # Keep a real owner for every address in successful reads. All these cases
++    # must fail validation, without invoking the native read at all.
++    if invalid == "missing_weight":
++        del info.weights["weight"]
++        del info.shapes["weight"]
++    elif invalid == "dtype":
++        info.weights["weight"] = (*info.weights["weight"][:4], "int32")
++    elif invalid == "size":
++        info.weights["weight"] = (source.data_ptr(), 4, 2, (4,), "float32")
++    elif invalid == "extra_shape":
++        info.shapes["impl.derived"] = (2, 2)
++    elif invalid == "extra_metadata":
++        info.weights["impl.derived"] = (-1, 4, 4, (4,), "float32")
++    else:
++        del info.shapes["impl.derived"]
++    backend, reads = backend_for(r, [("weight", model.weight)])
++    assert not backend.read_weights_from_seed(model, info, False)
++    assert reads == []
++    torch.testing.assert_close(model.weight, torch.zeros(4))
++
++
++def mla_post_load():
++    # Execute the real MLA hook while replacing only external NPU operators.
++    path = Path(__file__).resolve().parents[4] / "vllm_ascend/attention/mla_v1.py"
++    tree = ast.parse(path.read_text(encoding="utf-8"))
++    hook = next(
++        node
++        for node in ast.walk(tree)
++        if isinstance(node, ast.FunctionDef) and node.name == "process_weights_after_loading"
++    )
++    linear_method = type("UnquantizedLinearMethod", (), {})
++    namespace = {
++        "torch": torch,
++        "torch_npu": SimpleNamespace(npu_format_cast=lambda tensor, fmt: tensor),
++        "ACL_FORMAT_FRACTAL_ND": 2,
++        "UnquantizedLinearMethod": linear_method,
++        "maybe_trans_nz": lambda tensor: tensor,
++    }
++    exec(compile(ast.Module(body=[hook], type_ignores=[]), str(path), "exec"), namespace)
++    return namespace["process_weights_after_loading"], linear_method
++
++
++def make_mla_model(linear_method, fill):
++    model = torch.nn.Module()
++    model.kv_b_proj = torch.nn.Module()
++    model.kv_b_proj.weight = torch.nn.Parameter(torch.arange(8, dtype=torch.float32).reshape(4, 2) * fill)
++    model.kv_b_proj.quant_method = linear_method()
++    model.impl = SimpleNamespace(
++        kv_b_proj=model.kv_b_proj,
++        kv_lora_rank=2,
++        num_heads=1,
++        qk_nope_head_dim=2,
++        v_head_dim=2,
++        enable_mlapo=False,
++        fa_quant_layer=False,
++    )
++    return model
++
++
++def test_real_loader_rebuilds_mla_derived_tensors_after_checkpoint_transfer(request, monkeypatch):
++    loader = request.getfixturevalue("loader_runtime")
++    r = request.getfixturevalue("tensor_runtime")
++    monkeypatch.setattr(r.tensor_layout, "is_tensor_on_transfer_device", lambda tensor: True)
++    hook, linear_method = mla_post_load()
++    source = make_mla_model(linear_method, 1)
++    destination = make_mla_model(linear_method, 0)
++    hook(source.impl, torch.float32)
++    info = seed_info(r, r.tensor_layout.collect_checkpoint_layout_tensors(source), True)
++    backend, reads = backend_for(r, r.tensor_layout.collect_checkpoint_layout_tensors(destination))
++    monkeypatch.setattr(loader.module, "initialize_model", lambda **kwargs: destination)
++    monkeypatch.setattr(
++        loader.module, "process_weights_after_loading", lambda model, *args: hook(model.impl, torch.float32)
++    )
++    loader.session.transfer_from_seed.side_effect = (
++        lambda model, processed, exclude_blocks=None: backend.read_weights_from_seed(model, info, processed)
++    )
++    assert loader.loader.load_model(loader.vc, loader.config) is destination
++    assert "fallback" not in loader.events
++    loader.session.prepare_for_fallback.assert_not_called()
++    assert reads == [(source.kv_b_proj.weight.data_ptr(), 8 * 4)]
++    torch.testing.assert_close(destination.kv_b_proj.weight, source.kv_b_proj.weight)
++    torch.testing.assert_close(destination.impl.W_UV, source.impl.W_UV)
++    torch.testing.assert_close(destination.impl.W_UK_T, source.impl.W_UK_T)
++    # v0.26.0rc1 builds W_UV/W_UK_T; the later MLA hook also adds mlapo_W_UK_T.
++    assert not hasattr(source.impl, "mlapo_W_UK_T")
++    assert not hasattr(destination.impl, "mlapo_W_UK_T")
+diff --git a/tests/ut/model_loader/rfork/test_fallback_moe_state_isolated.py b/tests/ut/model_loader/rfork/test_fallback_moe_state_isolated.py
+new file mode 100644
+index 000000000..ff8f683f3
+--- /dev/null
++++ b/tests/ut/model_loader/rfork/test_fallback_moe_state_isolated.py
+@@ -0,0 +1,158 @@
++# SPDX-License-Identifier: Apache-2.0
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
++
++import importlib.util
++import sys
++import weakref
++from pathlib import Path
++from types import ModuleType
++from unittest.mock import Mock
++
++import pytest
++import torch
++
++from .test_late_lease_isolated import loader_runtime as loader_runtime
++
++
++@pytest.fixture
++def moe_runtime(request, monkeypatch):
++    """Use the real Ascend registry with a minimal layer constructor on CPU."""
++    r = request.getfixturevalue("loader_runtime")
++    root = Path(__file__).resolve().parents[4]
++    for name in ("vllm_ascend.quantization.quant_type", "vllm_ascend.eplb.adaptor.vllm_adaptor"):
++        spec = importlib.util.spec_from_file_location(name, root.joinpath(*name.split(".")).with_suffix(".py"))
++        module = importlib.util.module_from_spec(spec)
++        monkeypatch.setitem(sys.modules, name, module)
++        spec.loader.exec_module(module)
++    adaptor_module = sys.modules["vllm_ascend.eplb.adaptor.vllm_adaptor"]
++    adaptor = adaptor_module.VllmEplbAdaptor
++
++    class RoutedExperts(torch.nn.Module):
++        moe_counter = -1
++
++        def __init__(self):
++            super().__init__()
++            RoutedExperts.moe_counter += 1
++            self.weight = torch.nn.Parameter(torch.ones(4))
++            adaptor.register_layer(self)
++
++    routed_module = ModuleType("vllm_ascend.ops.fused_moe.fused_moe")
++    routed_module.AscendMoERunner = RoutedExperts
++    monkeypatch.setitem(sys.modules, routed_module.__name__, routed_module)
++    r.adaptor = adaptor
++    r.adaptor_module = adaptor_module
++    r.routed_module = routed_module
++    r.layer_cls = RoutedExperts
++    return r
++
++
++@pytest.mark.parametrize("runtime_loaded", [False, True])
++@pytest.mark.parametrize("failure", ["seed_miss", "initialize", "layout", "transfer"])
++def test_moe_layers_and_weights_released_before_fallback(moe_runtime, monkeypatch, runtime_loaded, failure, caplog):
++    r = moe_runtime
++    existing = r.layer_cls() if runtime_loaded else None
++    baseline_counter = r.layer_cls.moe_counter
++    baseline_layers = list(r.adaptor._registered_moe_layers)
++    registry = r.adaptor._registered_moe_layers
++    references = []
++    if not runtime_loaded:
++        monkeypatch.delitem(sys.modules, r.adaptor_module.__name__)
++        monkeypatch.delitem(sys.modules, r.routed_module.__name__)
++
++    def initialize(**kwargs):
++        monkeypatch.setitem(sys.modules, r.adaptor_module.__name__, r.adaptor_module)
++        monkeypatch.setitem(sys.modules, r.routed_module.__name__, r.routed_module)
++        model = torch.nn.Module()
++        layer = r.layer_cls()
++        model.add_module("experts", layer)
++        if existing is not None:
++            model.add_module("shared_target", existing)
++        # Exercise partial construction and cyclic references as well as the
++        # registry's strong references. No mock call history owns these tensors.
++        layer.cycle = [layer]
++        references.extend([weakref.ref(model), weakref.ref(layer), weakref.ref(layer.weight)])
++        if failure == "initialize":
++            raise RuntimeError("partial MoE initialization failed")
++        return model
++
++    def process(model, *args):
++        if failure == "layout":
++            raise RuntimeError("MoE layout failed")
++
++    def transfer(model, *args):
++        if failure == "transfer":
++            raise RuntimeError("MoE transfer failed")
++        return True
++
++    def fallback(**kwargs):
++        assert references and all(reference() is None for reference in references)
++        assert r.adaptor._registered_moe_layers is registry
++        assert registry == baseline_layers
++        assert r.layer_cls.moe_counter == baseline_counter
++        return r.fallback
++
++    monkeypatch.setattr(r.module, "initialize_model", initialize)
++    monkeypatch.setattr(r.module, "process_weights_after_loading", process)
++    monkeypatch.setattr(r.loader, "_requires_processed_layout_transfer", lambda config: True)
++    r.session.register_destination = lambda *args: True
++    r.session.acquire_seed = lambda: failure != "seed_miss"
++    r.session.transfer_from_seed = transfer
++    r.session.start_seed_service = lambda *args: True
++    monkeypatch.setattr(sys.modules["vllm.model_executor.model_loader"], "get_model", fallback)
++    assert r.loader.load_model(r.vc, r.config) is r.fallback
++    if failure != "seed_miss":
++        assert "RFork transfer failed" in caplog.text
++
++
++def test_moe_rollback_restores_replaced_registry_in_place(moe_runtime):
++    r = moe_runtime
++    target = r.layer_cls()
++    registry = r.adaptor._registered_moe_layers
++    snapshot = r.module._snapshot_process_global_model_state(r.vc)
++    discarded = r.layer_cls()
++    r.adaptor._registered_moe_layers = [discarded]
++    r.module._reset_process_global_model_state(r.vc, snapshot=snapshot)
++    assert r.adaptor._registered_moe_layers is registry
++    assert registry == [target]
++    assert r.layer_cls.moe_counter == 0
++
++
++def test_successful_load_keeps_new_moe_registrations(moe_runtime, monkeypatch):
++    r = moe_runtime
++
++    def initialize(**kwargs):
++        model = r.layer_cls()
++        return model
++
++    monkeypatch.setattr(r.module, "initialize_model", initialize)
++    model = r.loader.load_model(r.vc, r.config)
++    assert r.adaptor._registered_moe_layers == [model]
++    assert r.layer_cls.moe_counter == 0
++    r.session.prepare_for_fallback.assert_not_called()
++
++
++@pytest.mark.parametrize("draft", [False, True])
++def test_static_expert_map_bypasses_all_rfork_resources(request, monkeypatch, draft):
++    r = request.getfixturevalue("loader_runtime")
++    r.config.runner_type = "draft" if draft else "generate"
++    ascend_config = r.module.get_ascend_config()
++    ascend_config.eplb_config.expert_map_path = "placement.json"
++    monkeypatch.setattr(r.module, "get_ascend_config", lambda: ascend_config)
++    initialize = Mock()
++    ensure_session = Mock()
++    monkeypatch.setattr(r.module, "initialize_model", initialize)
++    monkeypatch.setattr(r.loader, "_ensure_rfork_session", ensure_session)
++    fallback = Mock(return_value=r.fallback)
++    monkeypatch.setattr(sys.modules["vllm.model_executor.model_loader"], "get_model", fallback)
++    assert r.loader.load_model(r.vc, r.config, prefix="draft_prefix") is r.fallback
++    initialize.assert_not_called()
++    ensure_session.assert_not_called()
++    assert r.session.mock_calls == []
++    fallback.assert_called_once()
++    kwargs = fallback.call_args.kwargs
++    assert kwargs["prefix"] == "draft_prefix"
++    assert kwargs["model_config"] is r.config
++    assert kwargs["vllm_config"] is r.vc
++    assert kwargs["load_config"].load_format == "auto"
++    assert kwargs["load_config"].model_loader_extra_config == {}
++    assert r.loader.load_config.load_format == "rfork"
+diff --git a/tests/ut/model_loader/rfork/test_heartbeat_health_isolated.py b/tests/ut/model_loader/rfork/test_heartbeat_health_isolated.py
+new file mode 100644
+index 000000000..1072eefe4
+--- /dev/null
++++ b/tests/ut/model_loader/rfork/test_heartbeat_health_isolated.py
+@@ -0,0 +1,153 @@
++# SPDX-License-Identifier: Apache-2.0
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
++
++import threading
++from dataclasses import replace
++from types import SimpleNamespace
++from unittest.mock import Mock
++
++import pytest
++
++from .seed_server_test_utils import live_session as live_session
++
++
++def make_serving_session(runtime):
++    session = runtime.session.RForkSession(replace(runtime.config, heartbeat_interval_sec=17), runtime.identity)
++    handle = SimpleNamespace(port=1234, is_alive=True, stop=Mock(return_value=True))
++    session.seed_server = handle
++    session.state = runtime.types.RForkLifecycleState.SERVING
++    session.planner = Mock(seed_key="key")
++    session.planner.report_seed_once.return_value = True
++    session.planner.remove_seed.return_value = True
++    session.transfer_backend.finalize_transfer_engine.return_value = True
++    return session, handle
++
++
++def test_healthy_heartbeat_waits_and_reports_at_configured_interval(runtime):
++    session, handle = make_serving_session(runtime)
++    stop = Mock()
++    stop.wait.side_effect = [False, False, True]
++    session._run_seed_heartbeat(handle, stop)
++    assert [call.args for call in stop.wait.call_args_list] == [(17,), (17,), (17,)]
++    assert session.planner.report_seed_once.call_count == 2
++    session.planner.remove_seed.assert_not_called()
++    assert session.state is runtime.types.RForkLifecycleState.SERVING
++
++
++@pytest.mark.parametrize("phase", ["before_report", "during_report", "report_exception"])
++@pytest.mark.parametrize("removal", ["ok", "failed", "exception"])
++def test_service_failure_withdraws_without_releasing_native_memory(runtime, phase, removal):
++    session, handle = make_serving_session(runtime)
++    stop = Mock()
++    stop.wait.return_value = False
++    stop.is_set.return_value = False
++    if phase == "before_report":
++        handle.is_alive = False
++    else:
++
++        def report(*args, **kwargs):
++            if phase == "report_exception":
++                raise RuntimeError("heartbeat worker failed")
++            handle.is_alive = False
++            return True
++
++        session.planner.report_seed_once.side_effect = report
++    if removal == "failed":
++        session.planner.remove_seed.return_value = False
++    elif removal == "exception":
++        session.planner.remove_seed.side_effect = RuntimeError("planner unavailable")
++    session._run_seed_heartbeat(handle, stop)
++    assert session.planner.report_seed_once.call_count == (0 if phase == "before_report" else 1)
++    session.planner.remove_seed.assert_called_once()
++    stop.set.assert_called_once()
++    assert session.state is runtime.types.RForkLifecycleState.CLEANUP_REQUIRED
++    assert session.seed_server is handle
++    session.transfer_backend.unregister_memory_region.assert_not_called()
++    session.transfer_backend.finalize_transfer_engine.assert_not_called()
++    handle.stop.assert_not_called()
++
++
++def test_heartbeat_shutdown_does_not_deadlock_during_removal(runtime):
++    session, handle = make_serving_session(runtime)
++    handle.is_alive = False
++    session.config = replace(session.config, heartbeat_interval_sec=0.001)
++    removal_entered, release_removal = threading.Event(), threading.Event()
++
++    def remove():
++        removal_entered.set()
++        assert release_removal.wait(3)
++        return True
++
++    session.planner.remove_seed.side_effect = remove
++    heartbeat = threading.Thread(target=session._run_seed_heartbeat, args=(handle, session.heartbeat_stop_event))
++    session.heartbeat_thread = heartbeat
++    join_entered = threading.Event()
++    original_join = heartbeat.join
++
++    def join(timeout=None):
++        join_entered.set()
++        original_join(timeout)
++
++    heartbeat.join = join
++    results = []
++    shutdown = threading.Thread(target=lambda: results.append(session.shutdown()))
++    try:
++        heartbeat.start()
++        assert removal_entered.wait(2)
++        # HTTP removal must not hold the state lock needed by lease callbacks.
++        assert session._lock.acquire(timeout=0.5)
++        session._lock.release()
++        shutdown.start()
++        assert join_entered.wait(2)
++    finally:
++        release_removal.set()
++        heartbeat.join(3)
++        if shutdown.ident is not None:
++            shutdown.join(3)
++    assert not heartbeat.is_alive() and not shutdown.is_alive()
++    assert results == [True]
++    assert session.state is runtime.types.RForkLifecycleState.FINALIZED
++
++
++@pytest.mark.parametrize("phase", ["before_report", "during_report"])
++def test_startup_detects_service_exit_and_cleans_up(runtime, monkeypatch, phase):
++    session, handle = make_serving_session(runtime)
++    session.state = runtime.types.RForkLifecycleState.READY
++    session.seed_server = None
++    monkeypatch.setattr(session, "_seed_transfer_info", Mock())
++    monkeypatch.setattr(runtime.session, "start_rfork_server", lambda *args, **kwargs: handle)
++    if phase == "before_report":
++        handle.is_alive = False
++    else:
++
++        def report(*args, **kwargs):
++            handle.is_alive = False
++            return True
++
++        session.planner.report_seed_once.side_effect = report
++    assert session.start_seed_service(object(), True) is runtime.types.RForkSeedServiceStartResult.FAILED
++    assert session.heartbeat_thread is None
++    assert session.seed_server is None
++    handle.stop.assert_called_once()
++    session.transfer_backend.unregister_memory_region.assert_called_once()
++    assert session.planner.report_seed_once.call_count == (0 if phase == "before_report" else 1)
++
++
++def test_live_server_exit_stops_advertising_and_shutdown_releases_resources(request):
++    r = request.getfixturevalue("live_session")
++    session = r.session
++    session.config = replace(session.config, heartbeat_interval_sec=0.02)
++    assert session.start_seed_service(object(), True)
++    handle, heartbeat = session.seed_server, session.heartbeat_thread
++    assert handle.stop()
++    heartbeat.join(3)
++    assert not heartbeat.is_alive()
++    assert session.heartbeat_stop_event.is_set()
++    assert session.state is r.runtime.types.RForkLifecycleState.CLEANUP_REQUIRED
++    session.planner.remove_seed.assert_called_once()
++    session.transfer_backend.unregister_memory_region.assert_not_called()
++    session.transfer_backend.finalize_transfer_engine.assert_not_called()
++    reports = session.planner.report_seed_once.call_count
++    assert session.shutdown()
++    assert session.planner.report_seed_once.call_count == reports
++    session.transfer_backend.finalize_transfer_engine.assert_called_once()
+diff --git a/tests/ut/model_loader/rfork/test_identity_validation.py b/tests/ut/model_loader/rfork/test_identity_validation.py
+index 3b29bd135..09db33a68 100644
+--- a/tests/ut/model_loader/rfork/test_identity_validation.py
++++ b/tests/ut/model_loader/rfork/test_identity_validation.py
+@@ -166,6 +166,50 @@ def test_fingerprint_quantization_config_changes(identity_module):
+     assert build(_vllm_config(), base_config, **kwargs) != build(_vllm_config(), changed_config, **kwargs)
+ 
+ 
++@pytest.mark.parametrize("config_field", ["hf_config", "hf_text_config"])
++@pytest.mark.parametrize("commit_field", ["_commit_hash", "commit_hash"])
++def test_resolved_commits_isolate_moving_revision_seeds(identity_module, config_field, commit_field):
++    first = _model_config(revision="main")
++    second = _model_config(revision="main")
++    for config, commit in ((first, "a" * 40), (second, "b" * 40)):
++        if config_field == "hf_text_config":
++            config.hf_text_config = SimpleNamespace()
++            config.hf_config.revision = "main"
++        setattr(getattr(config, config_field), commit_field, commit)
++    kwargs = {"model_url": "model", "model_deploy_strategy_name": "strategy"}
++    build = identity_module.build_compatibility_fingerprint
++    first_fingerprint = build(_vllm_config(), first, **kwargs)
++    second_fingerprint = build(_vllm_config(), second, **kwargs)
++    assert first_fingerprint != second_fingerprint
++    assert identity_module.build_seed_key(0, "model", "strategy", first_fingerprint) != (
++        identity_module.build_seed_key(0, "model", "strategy", second_fingerprint)
++    )
++
++
++def test_revision_aliases_share_the_same_resolved_commit(identity_module):
++    first = _model_config(revision="main")
++    second = _model_config(revision="release")
++    first.hf_config._commit_hash = second.hf_config._commit_hash = "a" * 40
++    kwargs = {"model_url": "model", "model_deploy_strategy_name": "strategy"}
++    build = identity_module.build_compatibility_fingerprint
++    assert build(_vllm_config(), first, **kwargs) == build(_vllm_config(), second, **kwargs)
++
++
++def test_unresolved_revision_keeps_explicit_version_fallback(identity_module):
++    config = _model_config(revision="local-version")
++    config.hf_config._commit_hash = ""
++    config.hf_config.commit_hash = None
++    assert identity_module._get_model_revision(config) == "local-version"
++    config.revision = None
++    config.model_revision = "model-version"
++    assert identity_module._get_model_revision(config) == "model-version"
++    config.model_revision = None
++    config.hf_config.revision = "config-version"
++    assert identity_module._get_model_revision(config) == "config-version"
++    config.hf_config.revision = None
++    assert identity_module._get_model_revision(config) is None
++
++
+ def test_recursive_fingerprint_values_fail_with_actionable_error(identity_module):
+     recursive_dict = {}
+     recursive_dict["self"] = recursive_dict
+diff --git a/tests/ut/model_loader/rfork/test_late_lease_isolated.py b/tests/ut/model_loader/rfork/test_late_lease_isolated.py
+index 8d5721959..04840a7a4 100644
+--- a/tests/ut/model_loader/rfork/test_late_lease_isolated.py
++++ b/tests/ut/model_loader/rfork/test_late_lease_isolated.py
+@@ -14,6 +14,8 @@ import torch
+ 
+ from tests.ut.model_loader.rfork.test_lease_release import runtime as runtime
+ 
++from .rfork_test_support import _load_module
++
+ 
+ @pytest.mark.parametrize("failure", ["seed_miss", "initialize", "layout", "transfer"])
+ @pytest.mark.parametrize("preexisting_registry", [False, True])
+@@ -141,6 +143,7 @@ def loader_runtime(request, monkeypatch):
+     identity_module = importlib.util.module_from_spec(identity_spec)
+     monkeypatch.setitem(sys.modules, identity_name, identity_module)
+     identity_spec.loader.exec_module(identity_module)
++    _load_module(monkeypatch, "vllm_ascend.model_loader.rfork.safety", "safety.py")
+     path = Path(__file__).resolve().parents[4] / "vllm_ascend/model_loader/rfork/rfork_loader.py"
+     name = "vllm_ascend.model_loader.rfork.rfork_loader"
+     spec = importlib.util.spec_from_file_location(name, path)
+diff --git a/tests/ut/model_loader/rfork/test_lease_release.py b/tests/ut/model_loader/rfork/test_lease_release.py
+index 698bae376..139b98a65 100644
+--- a/tests/ut/model_loader/rfork/test_lease_release.py
++++ b/tests/ut/model_loader/rfork/test_lease_release.py
+@@ -213,7 +213,7 @@ def test_retry_eventually_acknowledged_promotes_prepared_model_once(runtime, mon
+         runtime.types.LeaseReleaseResult.RELEASED,
+     ]
+     promote = Mock(return_value=True)
+-    monkeypatch.setattr(session, "_start_seed_service_locked", promote)
++    monkeypatch.setattr(session, "_start_seed_service", promote)
+     with session._lock:
+         assert session.start_seed_service(model, True) is runtime.types.RForkSeedServiceStartResult.DEFERRED
+         worker = session.lease_release_thread
+@@ -261,7 +261,7 @@ def test_deferred_fallback_memory_preparation_stays_on_calling_thread(runtime, m
+         promoted.append(threading.get_ident())
+         return True
+ 
+-    monkeypatch.setattr(session, "_start_seed_service_locked", publish)
++    monkeypatch.setattr(session, "_start_seed_service", publish)
+     with session._lock:
+         assert session.start_seed_service(model, True) is runtime.types.RForkSeedServiceStartResult.DEFERRED
+         worker = session.lease_release_thread
+diff --git a/tests/ut/model_loader/rfork/test_mutation_safety_isolated.py b/tests/ut/model_loader/rfork/test_mutation_safety_isolated.py
+new file mode 100644
+index 000000000..7cbcae12d
+--- /dev/null
++++ b/tests/ut/model_loader/rfork/test_mutation_safety_isolated.py
+@@ -0,0 +1,123 @@
++# SPDX-License-Identifier: Apache-2.0
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
++
++import ast
++import sys
++from pathlib import Path
++from types import SimpleNamespace
++from unittest.mock import Mock
++
++import pytest
++import torch
++
++from .rfork_test_support import _load_module
++from .test_late_lease_isolated import loader_runtime as loader_runtime
++
++
++@pytest.fixture
++def safety(monkeypatch):
++    return _load_module(monkeypatch, "rfork_mutation_safety_test", "safety.py")
++
++
++@pytest.mark.parametrize("draft", [False, True])
++@pytest.mark.parametrize("mode", ["sleep", "target_sleep", "weight_transfer"])
++def test_mutable_model_bypasses_seed_and_registration(request, monkeypatch, mode, draft):
++    r = request.getfixturevalue("loader_runtime")
++    r.config.runner_type = "draft" if draft else "generate"
++    if mode == "sleep":
++        r.config.enable_sleep_mode = True
++    elif mode == "target_sleep":
++        r.vc.model_config = SimpleNamespace(enable_sleep_mode=True)
++    else:
++        r.vc.weight_transfer_config = SimpleNamespace()
++    ensure = Mock()
++    initialize = Mock()
++    monkeypatch.setattr(r.loader, "_ensure_rfork_session", ensure)
++    monkeypatch.setattr(r.module, "initialize_model", initialize)
++    fallback = Mock(return_value=r.fallback)
++    monkeypatch.setattr(sys.modules["vllm.model_executor.model_loader"], "get_model", fallback)
++    assert r.loader.load_model(r.vc, r.config) is r.fallback
++    ensure.assert_not_called()
++    initialize.assert_not_called()
++    assert not r.session.mock_calls
++    assert fallback.call_args.kwargs["load_config"].load_format == "auto"
++    assert r.loader.load_config.load_format == "rfork"
++
++
++@pytest.mark.parametrize("config_slot", ["target", "draft"])
++@pytest.mark.parametrize("session_slot", ["rfork_session", "rfork_draft_session"])
++def test_mutation_rejects_even_cleanup_retained_sessions(safety, config_slot, session_slot):
++    config = SimpleNamespace(load_config=SimpleNamespace(), speculative_config=SimpleNamespace())
++    load_config = config.load_config
++    if config_slot == "draft":
++        load_config = SimpleNamespace()
++        config.speculative_config.draft_load_config = load_config
++    setattr(load_config, session_slot, SimpleNamespace(state="CLEANUP_REQUIRED"))
++    with pytest.raises(RuntimeError, match="Restart with --load-format auto"):
++        safety.ensure_no_rfork_session(config, "reload_weights")
++
++
++def test_mutation_allowed_when_rfork_was_bypassed(safety):
++    config = SimpleNamespace(load_config=SimpleNamespace(load_format="rfork"))
++    safety.ensure_no_rfork_session(config, "sleep")
++    safety.ensure_no_rfork_session(SimpleNamespace(), "reload_weights")
++
++
++@pytest.fixture
++def worker_methods(safety):
++    # Execute the actual worker method bodies with runtime imports excluded;
++    # assertions below check that guards run before NPU/engine side effects.
++    path = Path(__file__).resolve().parents[4] / "vllm_ascend/worker/worker.py"
++    tree = ast.parse(path.read_text(encoding="utf-8"))
++    worker = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "NPUWorker")
++    names = {"sleep", "start_weight_update", "update_weights", "finish_weight_update", "reload_weights"}
++    methods = [node for node in worker.body if isinstance(node, ast.FunctionDef) and node.name in names]
++    namespace = {"ensure_no_rfork_session": safety.ensure_no_rfork_session, "torch": torch}
++    exec(compile(ast.Module(body=methods, type_ignores=[]), str(path), "exec"), namespace)
++    return namespace
++
++
++@pytest.mark.parametrize(
++    "operation", ["sleep", "start_weight_update", "update_weights", "finish_weight_update", "reload_weights"]
++)
++def test_worker_rejects_mutation_before_any_side_effect(worker_methods, operation):
++    worker = SimpleNamespace(vllm_config=SimpleNamespace(load_config=SimpleNamespace(rfork_session=object())))
++    args = ({},) if operation == "update_weights" else ()
++    with pytest.raises(RuntimeError, match=f"{operation} is unavailable"):
++        worker_methods[operation](worker, *args)
++
++
++def test_worker_reload_without_session_preserves_arguments(worker_methods):
++    reload = Mock()
++    worker = SimpleNamespace(vllm_config=SimpleNamespace(), model_runner=SimpleNamespace(reload_weights=reload))
++    worker_methods["reload_weights"](worker, "weights", revision="version")
++    reload.assert_called_once_with("weights", revision="version")
++
++
++@pytest.mark.parametrize("operation", ["start_weight_update", "update_weights", "finish_weight_update"])
++def test_worker_weight_updates_without_session_reach_engine(worker_methods, monkeypatch, operation):
++    engine = Mock()
++    worker = SimpleNamespace(
++        vllm_config=SimpleNamespace(weight_transfer_config=object()),
++        weight_transfer_engine=engine,
++        _weight_update_active=operation != "start_weight_update",
++        _check_weight_transfer_engine=lambda: None,
++        _check_nz_disabled=lambda: None,
++        _is_checkpoint_format=False,
++        model_runner=SimpleNamespace(model=Mock()),
++        device="cpu",
++    )
++    monkeypatch.setattr(torch, "npu", SimpleNamespace(synchronize=Mock()), raising=False)
++    args = (
++        ({"weights": "chunk"},)
++        if operation == "update_weights"
++        else (False,)
++        if operation == "start_weight_update"
++        else ()
++    )
++    worker_methods[operation](worker, *args)
++    if operation == "update_weights":
++        engine.parse_update_info.assert_called_once_with(*args)
++        engine.receive_weights.assert_called_once()
++        torch.npu.synchronize.assert_called_once()
++    assert worker._weight_update_active is (operation != "finish_weight_update")
+diff --git a/tests/ut/model_loader/rfork/test_ops_config.py b/tests/ut/model_loader/rfork/test_ops_config.py
+index 4e8a4da0c..7064d4ff7 100644
+--- a/tests/ut/model_loader/rfork/test_ops_config.py
++++ b/tests/ut/model_loader/rfork/test_ops_config.py
+@@ -130,14 +130,14 @@ def test_session_passes_heartbeat_config_to_thread(ops_runtime, monkeypatch):
+     session.transfer_backend = Mock()
+     session.state = ops_runtime.types.RForkLifecycleState.READY
+     monkeypatch.setattr(session, "_seed_transfer_info", Mock())
+-    monkeypatch.setattr(ops_runtime.session, "start_rfork_server", Mock(return_value=SimpleNamespace(port=1234)))
++    handle = SimpleNamespace(port=1234, is_alive=True)
++    monkeypatch.setattr(ops_runtime.session, "start_rfork_server", Mock(return_value=handle))
+     thread = Mock()
+     monkeypatch.setattr(ops_runtime.session.threading, "Thread", thread)
+     assert session.start_seed_service(object(), True)
+-    kwargs = thread.call_args.kwargs["kwargs"]
+-    assert kwargs["sleep_interval"] == 17
+-    assert kwargs["initial_delay"] is True
+-    assert kwargs["stop_event"] is session.heartbeat_stop_event
++    assert thread.call_args.kwargs["target"] == session._run_seed_heartbeat
++    assert thread.call_args.kwargs["args"] == (handle, session.heartbeat_stop_event)
++    assert session.config.heartbeat_interval_sec == 17
+     thread.return_value.start.assert_called_once()
+ 
+ 
+diff --git a/tests/ut/worker/a2/test_worker_v1.py b/tests/ut/worker/a2/test_worker_v1.py
+index e8e598e0a..018177748 100644
+--- a/tests/ut/worker/a2/test_worker_v1.py
++++ b/tests/ut/worker/a2/test_worker_v1.py
+@@ -1573,6 +1573,7 @@ class TestNPUWorker(TestBase):
+         with patch.object(NPUWorker, "__init__", lambda x, **kwargs: None):
+             worker = NPUWorker()
+             worker.model_runner = MagicMock()
++            worker.vllm_config = SimpleNamespace(load_config=None, speculative_config=None)
+ 
+             worker.reload_weights(weights_path="/tmp/weights", is_checkpoint_format=True)
+ 
+@@ -1588,6 +1589,7 @@ class TestNPUWorkerWeightUpdate(TestBase):
+         with patch.object(NPUWorker, "__init__", lambda x, **kwargs: None):
+             worker = NPUWorker()
+         worker.weight_transfer_engine = engine
++        worker.vllm_config = SimpleNamespace(load_config=None, speculative_config=None)
+         worker._weight_update_active = False
+         worker._is_checkpoint_format = True
+         worker.device = torch.device("cpu")
+diff --git a/vllm_ascend/model_loader/rfork/identity.py b/vllm_ascend/model_loader/rfork/identity.py
+index 294c7f73b..1fb281902 100644
+--- a/vllm_ascend/model_loader/rfork/identity.py
++++ b/vllm_ascend/model_loader/rfork/identity.py
+@@ -143,6 +143,15 @@ def _get_hf_config_descriptor(model_config: ModelConfig) -> list[dict[str, Any]]
+ 
+ 
+ def _get_model_revision(model_config: ModelConfig) -> Any:
++    # A requested branch/tag can move while keeping its name. Prefer the
++    # resolved checkpoint commit, including text configs nested in multimodal
++    # models, before falling back to the caller's revision identifier.
++    for attr in ("hf_config", "hf_text_config"):
++        hf_config = getattr(model_config, attr, None)
++        for revision_attr in ("_commit_hash", "commit_hash"):
++            revision = getattr(hf_config, revision_attr, None)
++            if isinstance(revision, str) and revision:
++                return revision
+     revision = getattr(model_config, "revision", None)
+     if revision is None:
+         revision = getattr(model_config, "model_revision", None)
+@@ -150,10 +159,9 @@ def _get_model_revision(model_config: ModelConfig) -> Any:
+         return _canonicalize_fingerprint_value(revision)
+     for attr in ("hf_config", "hf_text_config"):
+         hf_config = getattr(model_config, attr, None)
+-        for revision_attr in ("_commit_hash", "commit_hash", "revision"):
+-            revision = getattr(hf_config, revision_attr, None)
+-            if revision is not None:
+-                return _canonicalize_fingerprint_value(revision)
++        revision = getattr(hf_config, "revision", None)
++        if revision is not None:
++            return _canonicalize_fingerprint_value(revision)
+     return None
+ 
+ 
+diff --git a/vllm_ascend/model_loader/rfork/manifest.py b/vllm_ascend/model_loader/rfork/manifest.py
+index 3ae2d46c4..f80679ad5 100644
+--- a/vllm_ascend/model_loader/rfork/manifest.py
++++ b/vllm_ascend/model_loader/rfork/manifest.py
+@@ -166,6 +166,8 @@ def validate_weight_manifest(
+     transferable_tensors: list[tuple[str, torch.Tensor]],
+     skipped_shared_names: set[str],
+     manifest_metadata: Any | None = None,
++    *,
++    ignored_remote_names: set[str] | None = None,
+ ) -> dict[str, tuple[int, int, int, tuple[int, ...], str]] | None:
+     """Validate seed metadata against local tensors before any layout change or read."""
+     remote_name_set = set(seed_info.weights)
+@@ -176,6 +178,7 @@ def validate_weight_manifest(
+             return None
+ 
+     parsed_remote: dict[str, tuple[int, int, int, tuple[int, ...], str]] = {}
++    all_parsed_remote = {}
+     remote_total_bytes = 0
+     for name, weight_info in seed_info.weights.items():
+         if name in skipped_shared_names:
+@@ -201,6 +204,11 @@ def validate_weight_manifest(
+         if numel_from_shape(seed_shape) != seed_len:
+             logger.error("RFork shape metadata does not match numel for %s", name)
+             return None
++        all_parsed_remote[name] = (seed_ptr, seed_len, seed_size, seed_shape, seed_dtype)
++        # Checkpoint receivers regenerate seed-only derived state after loading.
++        # Validate its metadata but exclude its bytes from the transfer contract.
++        if ignored_remote_names and name in ignored_remote_names:
++            continue
+         parsed_remote[name] = (seed_ptr, seed_len, seed_size, seed_shape, seed_dtype)
+         remote_total_bytes += seed_len * seed_size
+ 
+@@ -256,37 +264,32 @@ def validate_weight_manifest(
+             logger.error("RFork manifest metadata is malformed.")
+             return None
+         count_value = _get_manifest_value(manifest_metadata, "tensor_count", "num_tensors", "count")
+-        if count_value is not None and _parse_manifest_scalar(count_value) != len(local_by_name):
++        if count_value is not None and _parse_manifest_scalar(count_value) != len(all_parsed_remote):
+             logger.error("RFork manifest tensor count mismatch: %s", count_value)
+             return None
+         bytes_value = _get_manifest_value(manifest_metadata, "total_bytes", "byte_count", "bytes")
+-        if bytes_value is not None and _parse_manifest_scalar(bytes_value) != local_total_bytes:
++        if bytes_value is not None and _parse_manifest_scalar(bytes_value) != sum(
++            entry[1] * entry[2] for entry in all_parsed_remote.values()
++        ):
+             logger.error("RFork manifest byte count mismatch: %s", bytes_value)
+             return None
+ 
+         metadata_entries = _extract_manifest_entries(manifest_metadata)
+         if metadata_entries is not None:
+-            if set(metadata_entries) != set(local_by_name):
++            if set(metadata_entries) != set(all_parsed_remote):
+                 logger.error("RFork optional manifest names differ from local manifest.")
+                 return None
+             for name, metadata in metadata_entries.items():
+                 if not isinstance(metadata, Mapping):
+                     logger.error("RFork optional manifest entry for %s is malformed", name)
+                     return None
+-                tensor = local_by_name[name]
+-                remote_entry = parsed_remote[name]
++                remote_entry = all_parsed_remote[name]
+                 expected_numel = _get_manifest_value(metadata, "numel", "count", "seed_len")
+-                if expected_numel is not None and (
+-                    _parse_manifest_scalar(expected_numel) != tensor.numel()
+-                    or _parse_manifest_scalar(expected_numel) != remote_entry[1]
+-                ):
++                if expected_numel is not None and (_parse_manifest_scalar(expected_numel) != remote_entry[1]):
+                     logger.error("RFork optional manifest numel mismatch for %s", name)
+                     return None
+                 expected_size = _get_manifest_value(metadata, "element_size", "itemsize", "seed_size")
+-                if expected_size is not None and (
+-                    _parse_manifest_scalar(expected_size) != tensor.element_size()
+-                    or _parse_manifest_scalar(expected_size) != remote_entry[2]
+-                ):
++                if expected_size is not None and (_parse_manifest_scalar(expected_size) != remote_entry[2]):
+                     logger.error("RFork optional manifest element size mismatch for %s", name)
+                     return None
+                 expected_shape = metadata.get("shape")
+@@ -294,7 +297,7 @@ def validate_weight_manifest(
+                     expected_shape = normalize_weight_shape(expected_shape)
+                     if (
+                         expected_shape is None
+-                        or numel_from_shape(expected_shape) != tensor.numel()
++                        or numel_from_shape(expected_shape) != remote_entry[1]
+                         or expected_shape != remote_entry[3]
+                     ):
+                         logger.error("RFork optional manifest shape mismatch for %s", name)
+@@ -302,7 +305,7 @@ def validate_weight_manifest(
+                 expected_dtype = metadata.get("dtype")
+                 if expected_dtype is not None:
+                     expected_dtype = normalize_dtype_name(expected_dtype)
+-                    if expected_dtype != normalize_dtype_name(tensor.dtype) or expected_dtype != remote_entry[4]:
++                    if expected_dtype != remote_entry[4]:
+                         logger.error("RFork optional manifest dtype mismatch for %s", name)
+                         return None
+ 
+diff --git a/vllm_ascend/model_loader/rfork/rfork_loader.py b/vllm_ascend/model_loader/rfork/rfork_loader.py
+index 1ebea67a0..0ba531354 100644
+--- a/vllm_ascend/model_loader/rfork/rfork_loader.py
++++ b/vllm_ascend/model_loader/rfork/rfork_loader.py
+@@ -43,6 +43,7 @@ from vllm_ascend.ascend_config import get_ascend_config
+ from vllm_ascend.model_loader.rfork.compat import get_current_hardware_profile
+ from vllm_ascend.model_loader.rfork.config import RForkConfig
+ from vllm_ascend.model_loader.rfork.identity import build_compatibility_fingerprint
++from vllm_ascend.model_loader.rfork.safety import mutable_weights_bypass_reason
+ from vllm_ascend.model_loader.rfork.session import RForkSession
+ from vllm_ascend.model_loader.rfork.types import (
+     RForkFallbackCleanupResult,
+@@ -56,6 +57,8 @@ class _RForkSeedUnavailable(RuntimeError):
+ 
+ 
+ FALLBACK_CLEANUP_MAX_ATTEMPTS = 2
++FALLBACK_MEMORY_RECLAIM_PASSES = 4
++INITIAL_ASCEND_MOE_COUNTER = -1
+ 
+ 
+ @dataclass
+@@ -65,7 +68,8 @@ class _RForkProcessGlobalModelState:
+     static_forward_context: tuple[dict[Any, Any], dict[Any, Any]] | None
+     static_all_moe_layers: tuple[list[Any], list[Any]] | None
+     rope_cache: dict[Any, Any] | None
+-    ascend_moe_layers: list[Any] | None = None
++    ascend_moe_layers: tuple[list[Any], list[Any]] | None = None
++    ascend_moe_counter: int = INITIAL_ASCEND_MOE_COUNTER
+ 
+ 
+ def _is_rfork_summary_rank(session: RForkSession) -> bool:
+@@ -176,15 +180,6 @@ def _make_fallback_load_config(load_config: LoadConfig) -> LoadConfig:
+     return fallback_load_config
+ 
+ 
+-def _get_ascend_moe_registry() -> list[Any] | None:
+-    # Model construction may import the adaptor for the first time. Inspect
+-    # already-loaded modules without eagerly initializing the EPLB dependency.
+-    module = sys.modules.get("vllm_ascend.eplb.adaptor.vllm_adaptor")
+-    adaptor = getattr(module, "VllmEplbAdaptor", None)
+-    layers = getattr(adaptor, "_registered_moe_layers", None)
+-    return layers if isinstance(layers, list) else None
+-
+-
+ def _snapshot_process_global_model_state(vllm_config: VllmConfig) -> _RForkProcessGlobalModelState:
+     """Snapshot registries that model construction can mutate in the process."""
+     static_forward_context: tuple[dict[Any, Any], dict[Any, Any]] | None = None
+@@ -210,9 +205,17 @@ def _snapshot_process_global_model_state(vllm_config: VllmConfig) -> _RForkProce
+     except Exception as e:  # pragma: no cover - best-effort across vLLM versions
+         logger.debug("RFork fallback: skip snapshotting _ROPE_DICT: %s", e)
+ 
+-    ascend_moe_registry = _get_ascend_moe_registry()
+-    ascend_moe_layers = list(ascend_moe_registry) if ascend_moe_registry is not None else None
+-    return _RForkProcessGlobalModelState(static_forward_context, static_all_moe_layers, rope_cache, ascend_moe_layers)
++    # Inspect loaded modules without importing MoE for dense models. If model
++    # construction imports them for the first time, rollback restores the empty
++    # registry and initial counter instead.
++    adaptor = getattr(sys.modules.get("vllm_ascend.eplb.adaptor.vllm_adaptor"), "VllmEplbAdaptor", None)
++    registry = getattr(adaptor, "_registered_moe_layers", None)
++    ascend_moe_layers = (registry, list(registry)) if isinstance(registry, list) else None
++    routed_experts = getattr(sys.modules.get("vllm_ascend.ops.fused_moe.fused_moe"), "AscendMoERunner", None)
++    ascend_moe_counter = getattr(routed_experts, "moe_counter", INITIAL_ASCEND_MOE_COUNTER)
++    return _RForkProcessGlobalModelState(
++        static_forward_context, static_all_moe_layers, rope_cache, ascend_moe_layers, ascend_moe_counter
++    )
+ 
+ 
+ def _reset_process_global_model_state(
+@@ -227,16 +230,23 @@ def _reset_process_global_model_state(
+     entries that were added by an earlier successful model load.
+     """
+     stale_module_ids = {id(module) for module in model.modules()} if model is not None else set()
+-    # AscendMoERunner registers itself even when dynamic EPLB is disabled.
+-    # Leaving those references alive retains expert weights across fallback.
+-    # Restore in place because an existing adaptor can share this list; keep
+-    # target-model registrations when a draft attempt is discarded.
+-    ascend_moe_registry = _get_ascend_moe_registry()
+-    if ascend_moe_registry is not None:
+-        if snapshot is not None:
+-            ascend_moe_registry[:] = snapshot.ascend_moe_layers or []
+-        elif stale_module_ids:
+-            ascend_moe_registry[:] = [layer for layer in ascend_moe_registry if id(layer) not in stale_module_ids]
++    adaptor = getattr(sys.modules.get("vllm_ascend.eplb.adaptor.vllm_adaptor"), "VllmEplbAdaptor", None)
++    registry = getattr(adaptor, "_registered_moe_layers", None)
++    if snapshot is not None and snapshot.ascend_moe_layers is not None:
++        baseline_registry, baseline_layers = snapshot.ascend_moe_layers
++        baseline_registry[:] = baseline_layers
++        if adaptor is not None and registry is not baseline_registry:
++            adaptor._registered_moe_layers = baseline_registry
++    elif isinstance(registry, list):
++        if snapshot is not None or not stale_module_ids:
++            registry.clear()
++        else:
++            registry[:] = [layer for layer in registry if id(layer) not in stale_module_ids]
++    if snapshot is not None:
++        routed_experts = getattr(sys.modules.get("vllm_ascend.ops.fused_moe.fused_moe"), "AscendMoERunner", None)
++        if routed_experts is not None:
++            routed_experts.moe_counter = snapshot.ascend_moe_counter
++
+     removed_names: set[Any] = set()
+     compilation_config = getattr(vllm_config, "compilation_config", None)
+     if compilation_config is not None:
+@@ -488,9 +498,12 @@ class RForkModelLoader(BaseModelLoader):
+             model_state_snapshot: _RForkProcessGlobalModelState | None = None
+             exclude_blocks: list[tuple[int, int]] = []
+             processed_layout_transfer = self._requires_processed_layout_transfer(model_config)
+-            bypass_reason = None
+-            if _is_dynamic_eplb_enabled(vllm_config):
+-                bypass_reason = "dynamic EPLB"
++            bypass_reason = mutable_weights_bypass_reason(vllm_config, model_config)
++            if bypass_reason is None:
++                if getattr(get_ascend_config().eplb_config, "expert_map_path", None) is not None:
++                    bypass_reason = "static expert placement (expert_map_path)"
++                elif _is_dynamic_eplb_enabled(vllm_config):
++                    bypass_reason = "dynamic EPLB"
+ 
+             if bypass_reason is not None:
+                 logger.warning(
+@@ -527,7 +540,7 @@ class RForkModelLoader(BaseModelLoader):
+                         model_config=model_config,
+                         prefix=prefix,
+                     )
+-                logger.info(
++                logger.debug(
+                     "RFork %s model initialization took %.2f seconds",
+                     _rfork_model_kind(session),
+                     time.perf_counter() - model_init_start_time,
+@@ -602,8 +615,8 @@ class RForkModelLoader(BaseModelLoader):
+                     _rfork_model_kind(session),
+                 )
+             except Exception as e:
+-                # A queued/captured LogRecord must not retain the exception's
+-                # traceback and the discarded model through its arguments.
++                # Log records may outlive fallback (e.g. buffered handlers).
++                # Do not let the exception traceback retain the discarded model.
+                 logger.warning("RFork transfer failed: %s, clean up and fall back to default loader", str(e))
+ 
+             cleanup_result: bool | RForkFallbackCleanupResult = False
+@@ -623,12 +636,10 @@ class RForkModelLoader(BaseModelLoader):
+                 )
+ 
+             if model_init_started:
+-                # A constructor can register layers and then raise before
+-                # assigning model. Collect that partial model as well.
++                # Partial constructors can leave reference cycles even when no
++                # model was returned. Reclaim them before allocating fallback.
+                 model = None
+-                gc.collect()
+-                torch.npu.empty_cache()
+-                for _ in range(3):
++                for _ in range(FALLBACK_MEMORY_RECLAIM_PASSES):
+                     gc.collect()
+                     torch.npu.empty_cache()
+ 
+diff --git a/vllm_ascend/model_loader/rfork/safety.py b/vllm_ascend/model_loader/rfork/safety.py
+new file mode 100644
+index 000000000..5a852f63f
+--- /dev/null
++++ b/vllm_ascend/model_loader/rfork/safety.py
+@@ -0,0 +1,41 @@
++# SPDX-License-Identifier: Apache-2.0
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
++
++"""Compatibility guards for operations that replace live model memory."""
++
++from typing import Any
++
++
++def mutable_weights_bypass_reason(vllm_config: Any, model_config: Any) -> str | None:
++    if any(
++        bool(getattr(config, "enable_sleep_mode", False))
++        for config in (model_config, getattr(vllm_config, "model_config", None))
++    ):
++        return "sleep mode"
++    if getattr(vllm_config, "weight_transfer_config", None) is not None:
++        return "online weight transfer (weight_transfer_config)"
++    return None
++
++
++def ensure_no_rfork_session(vllm_config: Any, operation: str) -> None:
++    """Reject unconfigured mutations too, including a separately loaded draft.
++
++    A session may retain registrations even after failed cleanup or shutdown.
++    Until mutation has a drain/re-registration protocol, require a fresh worker
++    loaded without RFork instead of treating stopped advertisement as safe.
++    """
++    speculative_config = getattr(vllm_config, "speculative_config", None)
++    load_configs = (
++        getattr(vllm_config, "load_config", None),
++        getattr(speculative_config, "draft_load_config", None),
++    )
++    if any(
++        getattr(config, attr, None) is not None
++        for config in load_configs
++        for attr in ("rfork_session", "rfork_draft_session")
++    ):
++        raise RuntimeError(
++            f"{operation} is unavailable for a worker with an RFork session. "
++            "Restart with --load-format auto for both target and draft models, "
++            "or configure sleep mode/weight_transfer_config before loading."
++        )
+diff --git a/vllm_ascend/model_loader/rfork/session.py b/vllm_ascend/model_loader/rfork/session.py
+index 84b601529..d23309476 100644
+--- a/vllm_ascend/model_loader/rfork/session.py
++++ b/vllm_ascend/model_loader/rfork/session.py
+@@ -11,7 +11,7 @@ from typing import Any
+ from vllm.logger import logger
+ 
+ from vllm_ascend.model_loader.rfork.config import RForkConfig
+-from vllm_ascend.model_loader.rfork.planner_client import RForkPlannerClient, lease_log_id
++from vllm_ascend.model_loader.rfork.planner_client import HEARTBEAT_LOG_EVERY_N, RForkPlannerClient, lease_log_id
+ from vllm_ascend.model_loader.rfork.seed_client import build_seed_url, fetch_seed_transfer_info
+ from vllm_ascend.model_loader.rfork.seed_server import (
+     RForkSeedServerHandle,
+@@ -59,6 +59,9 @@ class RForkSession:
+         self._lease_acquired_at: float | None = None
+         self._deferred_seed_start: tuple[Any, bool, list[tuple[int, int]] | None] | None = None
+         self._lock = threading.RLock()
++        # Acquire this before _lock when coordinating seed service operations.
++        # Lease responses only need _lock, so removal HTTP cannot delay them.
++        self._seed_lifecycle_lock = threading.RLock()
+         atexit.register(self.shutdown)
+ 
+     def acquire_seed(self) -> bool:
+@@ -170,14 +173,18 @@ class RForkSession:
+     def _retry_seed_lease_release(self) -> None:
+         try:
+             while not self.lease_release_stop_event.is_set():
++                # Wait only between attempts, never before the initial release.
++                if self._lease_release_attempts and self.lease_release_stop_event.wait(
++                    self.config.lease_release_retry_interval_sec
++                ):
++                    return
+                 with self._lock:
+                     if self.state is RForkLifecycleState.FINALIZED or self.seed_lease is None:
+                         return
+                     lease = self.seed_lease
+                     self._lease_release_attempts += 1
+-                    attempt = self._lease_release_attempts
+-                    acquired_at = self._lease_acquired_at
+-                # Only this worker sends releases. No network I/O under the session lock.
++                # Keep the lease-release HTTP request outside the session lock;
++                # reacquire it before applying the result to session state.
+                 try:
+                     result = self.planner.release_seed_once(lease)
+                 except Exception:
+@@ -186,37 +193,48 @@ class RForkSession:
+                 with self._lock:
+                     if self.seed_lease is not lease:
+                         return
+-                    logger.info(
+-                        "RFork lease release outcome: lease=%s attempt=%d/%d result=%s held_elapsed=%.3fs",
+-                        lease_log_id(lease),
+-                        attempt,
+-                        self.config.lease_release_max_attempts,
+-                        result.name,
+-                        time.monotonic() - acquired_at if acquired_at is not None else 0.0,
+-                    )
+-                    if result is LeaseReleaseResult.RELEASED:
+-                        self.seed_lease = None
+-                        self._lease_acquired_at = None
+-                        if self.state is RForkLifecycleState.LEASED:
+-                            self.state = RForkLifecycleState.INITIALIZED
+-                        self._promote_deferred_seed_locked()
+-                        return
+-                    if result is LeaseReleaseResult.REJECTED or attempt >= self.config.lease_release_max_attempts:
+-                        self._lease_release_exhausted = True
+-                        self._deferred_seed_start = None
+-                        logger.error(
+-                            "RFork lease release stopped: lease=%s attempts=%d; lease remains unresolved, "
+-                            "worker will not advertise a seed. Model loading/inference may continue.",
+-                            lease_log_id(lease),
+-                            attempt,
+-                        )
+-                        return
+-                self.lease_release_stop_event.wait(self.config.lease_release_retry_interval_sec)
++                    finished = self._record_lease_release_locked(lease, result)
++                if finished:
++                    self._promote_deferred_seed()
++                    return
++
+         finally:
+             with self._lock:
+                 if self.lease_release_thread is threading.current_thread():
+                     self.lease_release_thread = None
+ 
++    def _record_lease_release_locked(self, lease: SeedLease, result: LeaseReleaseResult) -> bool:
++        """Apply one release response; True stops retries."""
++        acquired_at = self._lease_acquired_at
++        logger.debug(
++            "RFork lease release outcome: lease=%s attempt=%d/%d result=%s held_elapsed=%.3fs",
++            lease_log_id(lease),
++            self._lease_release_attempts,
++            self.config.lease_release_max_attempts,
++            result.name,
++            time.monotonic() - acquired_at if acquired_at is not None else 0.0,
++        )
++        if result is LeaseReleaseResult.RELEASED:
++            self.seed_lease = None
++            self._lease_acquired_at = None
++            if self.state is RForkLifecycleState.LEASED:
++                self.state = RForkLifecycleState.INITIALIZED
++            return True
++        if (
++            result is LeaseReleaseResult.REJECTED
++            or self._lease_release_attempts >= self.config.lease_release_max_attempts
++        ):
++            self._lease_release_exhausted = True
++            self._deferred_seed_start = None
++            logger.error(
++                "RFork lease release stopped: lease=%s attempts=%d; lease remains unresolved, "
++                "worker will not advertise a seed. Model loading/inference may continue.",
++                lease_log_id(lease),
++                self._lease_release_attempts,
++            )
++            return True
++        return False
++
+     def _release_seed_locked(self) -> bool:
+         """Schedule release without waiting; True only after an acknowledged release."""
+         if self.seed_lease is None:
+@@ -224,33 +242,32 @@ class RForkSession:
+         self._ensure_lease_release_retry_locked()
+         return False
+ 
+-    def _promote_deferred_seed_locked(self) -> None:
+-        if (
+-            self._deferred_seed_start is None
+-            or self.seed_lease is not None
+-            or self.state is RForkLifecycleState.FINALIZED
+-            or self.lease_release_stop_event.is_set()
+-        ):
+-            return
+-        model, processed_layout, exclude_blocks = self._deferred_seed_start
+-        self._deferred_seed_start = None
+-        try:
+-            promoted = self._start_seed_service_locked(model, processed_layout, exclude_blocks)
+-        except Exception:
+-            logger.exception(
+-                "RFork deferred seed promotion raised after the source lease was released; "
+-                "the model remains available for inference."
+-            )
+-            return
+-        if not promoted:
+-            logger.warning(
+-                "RFork deferred seed promotion failed after the source lease was released; "
+-                "the model remains available for inference."
+-            )
+-
+-    def release_seed(self) -> bool:
+-        with self._lock:
+-            return self._release_seed_locked()
++    def _promote_deferred_seed(self) -> None:
++        with self._seed_lifecycle_lock:
++            with self._lock:
++                if (
++                    self._deferred_seed_start is None
++                    or self.seed_lease is not None
++                    or self.state is RForkLifecycleState.FINALIZED
++                    or self.lease_release_stop_event.is_set()
++                ):
++                    return
++                model, processed_layout, exclude_blocks = self._deferred_seed_start
++                self._deferred_seed_start = None
++            try:
++                promoted = self._start_seed_service(model, processed_layout, exclude_blocks)
++            except Exception:
++                logger.exception(
++                    "RFork deferred seed promotion raised after the source lease was released; "
++                    "the model remains available for inference."
++                )
++                promoted = False
++            if not promoted:
++                self._cleanup_failed_seed_start()
++                logger.warning(
++                    "RFork deferred seed promotion failed after the source lease was released; "
++                    "the model remains available for inference."
++                )
+ 
+     def _reset_transfer_locked(self) -> bool:
+         if self.seed_server is not None:
+@@ -268,22 +285,22 @@ class RForkSession:
+             logger.warning("RFork memory remains registered; retaining transfer state for retry.")
+             return False
+         if self.state is not RForkLifecycleState.FINALIZED:
+-            self.state = RForkLifecycleState.LEASED if self.seed_lease is not None else RForkLifecycleState.INITIALIZED
++            self.state = RForkLifecycleState.INITIALIZED
+         return True
+ 
+     def prepare_for_fallback(self) -> RForkFallbackCleanupResult:
+         """Return to an initialized, reusable session without finalizing TransferEngine."""
+-        with self._lock:
+-            if self.state is RForkLifecycleState.FINALIZED:
+-                logger.error("RFork cannot prepare a finalized session for fallback.")
+-                return RForkFallbackCleanupResult(False, False, False)
+-            self._deferred_seed_start = None
+-            service_ok = self._stop_seed_service_locked()
+-            release_ok = self._release_seed_locked()
+-            reset_ok = self._reset_transfer_locked() if service_ok else False
+-            if not release_ok:
+-                self._ensure_lease_release_retry_locked()
+-            return RForkFallbackCleanupResult(service_ok, release_ok, reset_ok)
++        with self._seed_lifecycle_lock:
++            with self._lock:
++                if self.state is RForkLifecycleState.FINALIZED:
++                    logger.error("RFork cannot prepare a finalized session for fallback.")
++                    return RForkFallbackCleanupResult(False, False, False)
++                self._deferred_seed_start = None
++            service_ok = self._stop_seed_service()
++            with self._lock:
++                release_ok = self._release_seed_locked()
++                reset_ok = self._reset_transfer_locked() if service_ok else False
++                return RForkFallbackCleanupResult(service_ok, release_ok, reset_ok)
+ 
+     def _seed_transfer_info(self) -> SeedTransferInfo:
+         session_id = self.transfer_backend.transfer_session_id
+@@ -299,186 +316,248 @@ class RForkSession:
+         processed_layout: bool,
+         exclude_blocks: list[tuple[int, int]] | None = None,
+     ) -> RForkSeedServiceStartResult:
+-        with self._lock:
+-            if self.lease_release_stop_event.is_set():
+-                return RForkSeedServiceStartResult.FAILED
+-            if self.state is RForkLifecycleState.SERVING:
+-                return RForkSeedServiceStartResult.STARTED
+-            if self.seed_lease is not None and self._lease_release_exhausted:
+-                return RForkSeedServiceStartResult.FAILED
+-            if self.state not in (
+-                RForkLifecycleState.INITIALIZED,
+-                RForkLifecycleState.LEASED,
+-                RForkLifecycleState.TRANSFERRED,
+-                RForkLifecycleState.READY,
+-            ):
+-                logger.error("RFork seed service requires a complete model; state=%s", self.state.name)
+-                return RForkSeedServiceStartResult.FAILED
+-            if self.state is not RForkLifecycleState.READY:
+-                # The caller has finished post-load processing and eval. Refresh
+-                # checkpoint-layout registration because processing may replace
+-                # storage. Processed-layout transfers already use final buffers.
+-                if self.state is not RForkLifecycleState.TRANSFERRED or not processed_layout:
+-                    self.state = RForkLifecycleState.CLEANUP_REQUIRED
+-                    try:
+-                        registered = self.transfer_backend.register_memory_region(
+-                            model, processed_layout, exclude_blocks
+-                        )
+-                    except Exception:
+-                        logger.exception(
+-                            "RFork seed memory registration raised; cleaning up before continuing inference."
+-                        )
+-                        registered = False
+-                    if not registered:
+-                        self._reset_transfer_locked()
+-                        return RForkSeedServiceStartResult.FAILED
+-                self.state = RForkLifecycleState.READY
+-            if self.seed_lease is not None:
+-                if self._lease_release_exhausted or self.lease_release_stop_event.is_set():
++        with self._seed_lifecycle_lock:
++            with self._lock:
++                if self.lease_release_stop_event.is_set():
+                     return RForkSeedServiceStartResult.FAILED
+-                self._deferred_seed_start = (model, processed_layout, exclude_blocks)
+-                self._ensure_lease_release_retry_locked()
+-                logger.warning(
+-                    "RFork seed promotion is deferred until the source seed lease is released; "
+-                    "the transferred model remains available for inference."
+-                )
+-                return RForkSeedServiceStartResult.DEFERRED
+-            started = self._start_seed_service_locked(model, processed_layout, exclude_blocks)
++                if self.state is RForkLifecycleState.SERVING:
++                    return RForkSeedServiceStartResult.STARTED
++                if self.seed_lease is not None and self._lease_release_exhausted:
++                    return RForkSeedServiceStartResult.FAILED
++                if self.state not in (
++                    RForkLifecycleState.INITIALIZED,
++                    RForkLifecycleState.LEASED,
++                    RForkLifecycleState.TRANSFERRED,
++                    RForkLifecycleState.READY,
++                ):
++                    logger.error("RFork seed service requires a complete model; state=%s", self.state.name)
++                    return RForkSeedServiceStartResult.FAILED
++                if self.state is not RForkLifecycleState.READY:
++                    # The caller has finished post-load processing and eval. Refresh
++                    # checkpoint-layout registration because processing may replace
++                    # storage. Processed-layout transfers already use final buffers.
++                    if self.state is not RForkLifecycleState.TRANSFERRED or not processed_layout:
++                        self.state = RForkLifecycleState.CLEANUP_REQUIRED
++                        try:
++                            registered = self.transfer_backend.register_memory_region(
++                                model, processed_layout, exclude_blocks
++                            )
++                        except Exception:
++                            logger.exception(
++                                "RFork seed memory registration raised; cleaning up before continuing inference."
++                            )
++                            registered = False
++                        if not registered:
++                            self._reset_transfer_locked()
++                            return RForkSeedServiceStartResult.FAILED
++                    self.state = RForkLifecycleState.READY
++                if self.seed_lease is not None:
++                    if self._lease_release_exhausted or self.lease_release_stop_event.is_set():
++                        return RForkSeedServiceStartResult.FAILED
++                    self._deferred_seed_start = (model, processed_layout, exclude_blocks)
++                    self._ensure_lease_release_retry_locked()
++                    logger.debug(
++                        "RFork seed promotion is deferred until the source seed lease is released; "
++                        "the transferred model remains available for inference."
++                    )
++                    return RForkSeedServiceStartResult.DEFERRED
++            started = self._start_seed_service(model, processed_layout, exclude_blocks)
++            if not started:
++                self._cleanup_failed_seed_start()
+             return RForkSeedServiceStartResult.STARTED if started else RForkSeedServiceStartResult.FAILED
+ 
+-    def _start_seed_service_locked(
++    def _start_seed_service(
+         self,
+         model,
+         processed_layout: bool,
+         exclude_blocks: list[tuple[int, int]] | None = None,
+     ) -> bool:
+-        if self.state is RForkLifecycleState.SERVING:
+-            return True
+-        if self.state is not RForkLifecycleState.READY:
+-            logger.error("RFork seed service cannot start from state=%s", self.state.name)
+-            return False
+-        if self.seed_lease is not None:
+-            logger.error("RFork seed service cannot start while a source seed lease is outstanding.")
+-            return False
++        # Caller owns _seed_lifecycle_lock. Keep health checks and planner HTTP
++        # outside _lock; the transitional state prevents transfer/registration.
++        with self._lock:
++            if self.state is RForkLifecycleState.SERVING:
++                return True
++            if self.state is not RForkLifecycleState.READY:
++                logger.error("RFork seed service cannot start from state=%s", self.state.name)
++                return False
++            if self.seed_lease is not None or self.lease_release_stop_event.is_set():
++                logger.error("RFork seed service cannot start with an unresolved lease or during shutdown.")
++                return False
++            self.state = RForkLifecycleState.CLEANUP_REQUIRED
+         try:
++            info = self._seed_transfer_info()
+             handle = start_rfork_server(
+                 self.planner.seed_key,
+-                self._seed_transfer_info(),
++                info,
+                 health_timeout_sec=self.config.seed_timeout_sec,
+                 bind_host=self.config.seed_bind_host,
+             )
+-            self.seed_server = handle
+-            if not self.planner.report_seed_once(
+-                handle.port,
+-                seed_ip=self.config.seed_advertise_host,
+-            ):
++            with self._lock:
++                self.seed_server = handle
++                if self.lease_release_stop_event.is_set():
++                    raise RuntimeError("shutdown requested during seed server startup")
++            if not handle.is_alive:
++                raise RuntimeError("seed HTTP server exited before advertisement")
++            if not self.planner.report_seed_once(handle.port, seed_ip=self.config.seed_advertise_host):
+                 raise RuntimeError("planner rejected the initial seed advertisement")
+ 
+-            self.heartbeat_stop_event = threading.Event()
+-            self.heartbeat_thread = threading.Thread(
+-                target=self.planner.run_seed_heartbeat,
+-                args=(handle.port,),
+-                kwargs={
+-                    "sleep_interval": self.config.heartbeat_interval_sec,
+-                    "stop_event": self.heartbeat_stop_event,
+-                    "seed_ip": self.config.seed_advertise_host,
+-                    "initial_delay": True,
+-                },
+-                daemon=True,
+-                name="RForkHeartbeat",
+-            )
+-            self.heartbeat_thread.start()
+-            self.state = RForkLifecycleState.SERVING
+-            logger.info(
++            with self._lock:
++                if self.lease_release_stop_event.is_set():
++                    raise RuntimeError("shutdown requested during seed advertisement")
++                if not handle.is_alive:
++                    raise RuntimeError("seed HTTP server exited during advertisement")
++                self.heartbeat_stop_event = threading.Event()
++                self.heartbeat_thread = threading.Thread(
++                    target=self._run_seed_heartbeat,
++                    args=(handle, self.heartbeat_stop_event),
++                    daemon=True,
++                    name="RForkHeartbeat",
++                )
++                try:
++                    self.heartbeat_thread.start()
++                except RuntimeError:
++                    self.heartbeat_thread = None
++                    raise
++                self.state = RForkLifecycleState.SERVING
++            logger.debug(
+                 "RFork seed service started for global_rank=%s, port=%s",
+                 self.identity.global_rank,
+                 handle.port,
+             )
+             return True
+         except Exception as exc:
+-            if isinstance(exc, RForkSeedServerStartupError):
+-                self.seed_server = exc.handle
++            with self._lock:
++                if isinstance(exc, RForkSeedServerStartupError):
++                    self.seed_server = exc.handle
++                self.state = RForkLifecycleState.CLEANUP_REQUIRED
+             logger.warning("RFork seed service startup failed for global_rank=%s: %s", self.identity.global_rank, exc)
+-            service_ok = self._stop_seed_service_locked()
++            return False
++
++    def _run_seed_heartbeat(self, handle: RForkSeedServerHandle, stop_event: threading.Event) -> None:
++        # Do not acquire _seed_lifecycle_lock: shutdown owns it while joining
++        # this thread. Native memory cleanup stays on the shutdown/loading thread.
++        heartbeat_index = 0
++        while not stop_event.wait(self.config.heartbeat_interval_sec):
++            if not handle.is_alive:
++                break
++            heartbeat_index += 1
++            try:
++                reported = self.planner.report_seed_once(handle.port, seed_ip=self.config.seed_advertise_host)
++            except Exception:
++                logger.exception("RFork heartbeat raised; withdrawing the seed.")
++                break
++            # The server may have exited while add_seed was in flight. Revoke
++            # that advertisement before ending this thread, even if it succeeded.
++            if not handle.is_alive:
++                break
++            if not reported:
++                logger.warning("RFork heartbeat failed for seed_key=%s", self.planner.seed_key)
++            elif heartbeat_index % HEARTBEAT_LOG_EVERY_N == 0:
++                logger.debug("RFork heartbeat accepted for seed_key=%s", self.planner.seed_key)
++        else:
++            return
++
++        with self._lock:
++            if stop_event.is_set() or self.seed_server is not handle:
++                return
++            stop_event.set()
++            self.state = RForkLifecycleState.CLEANUP_REQUIRED
++        logger.error("RFork seed heartbeat stopped after a service failure; inference can continue.")
++        try:
++            removed = self.planner.remove_seed()
++        except Exception:
++            logger.exception("RFork failed to withdraw the seed after a service failure.")
++            removed = False
++        if not removed:
++            logger.warning("RFork seed removal remains pending; heartbeats stopped, retaining registered memory.")
++        # Retain the handle and registrations until normal cleanup. Removing
++        # an advertisement alone does not prove existing native reads finished.
++
++    def _cleanup_failed_seed_start(self) -> None:
++        # The caller owns _seed_lifecycle_lock, but must not hold _lock here.
++        service_ok = self._stop_seed_service()
++        with self._lock:
+             if service_ok:
+                 self._reset_transfer_locked()
+             else:
+                 self.state = RForkLifecycleState.CLEANUP_REQUIRED
+                 logger.warning("RFork seed cleanup is incomplete; registered memory remains pinned.")
+-            return False
+ 
+-    def _stop_seed_service_locked(self) -> bool:
+-        self.heartbeat_stop_event.set()
+-        heartbeat = self.heartbeat_thread
+-        heartbeat_ok = True
++    def _stop_seed_service(self) -> bool:
++        """Caller serializes seed lifecycle; join and removal run outside the state lock."""
++        with self._lock:
++            self.state = RForkLifecycleState.CLEANUP_REQUIRED
++            self.heartbeat_stop_event.set()
++            heartbeat = self.heartbeat_thread
++            server = self.seed_server
+         if heartbeat is not None and heartbeat is not threading.current_thread():
+-            # Requests applies the timeout separately to connection and read.
+-            # Allow both phases plus thread-exit overhead before removing the seed.
+-            # This is a bounded wait, not a hard HTTP deadline; retain resources
+-            # for retry if the request still outlives it (e.g. a trickling response).
+-            connect_timeout_sec = read_timeout_sec = float(self.config.request_timeout_sec)
++            # Stop every in-flight add_seed before removing the advertisement.
++            # Requests bounds inactivity rather than total HTTP duration.
+             join_timeout_sec = max(
+                 float(self.config.seed_timeout_sec),
+-                connect_timeout_sec + read_timeout_sec + HEARTBEAT_STOP_GRACE_SEC,
++                2 * float(self.config.request_timeout_sec) + HEARTBEAT_STOP_GRACE_SEC,
+             )
+             heartbeat.join(timeout=join_timeout_sec)
+-            heartbeat_ok = not heartbeat.is_alive()
+-            if not heartbeat_ok:
++            if heartbeat.is_alive():
+                 logger.warning("RFork heartbeat thread did not stop in time.")
++                return False
+ 
+-        if not heartbeat_ok:
+-            self.state = RForkLifecycleState.CLEANUP_REQUIRED
+-            return False
+-
+-        if not self.planner.remove_seed():
+-            self.state = RForkLifecycleState.CLEANUP_REQUIRED
++        try:
++            removed = self.planner.remove_seed()
++        except Exception as exc:
++            logger.warning("RFork planner seed removal raised: %s", exc)
++            removed = False
++        if not removed:
+             logger.warning("RFork planner seed removal failed; keeping the local seed service available for retry.")
+             return False
+-        server_ok = True
+-        if self.seed_server is not None:
++        if server is not None:
+             try:
+-                server_ok = self.seed_server.stop()
++                if not server.stop():
++                    return False
+             except Exception as exc:
+                 logger.warning("RFork seed server shutdown failed: %s", exc)
+-                server_ok = False
+-
+-        stopped = heartbeat_ok and server_ok
+-        if stopped:
++                return False
++        with self._lock:
+             self.heartbeat_thread = None
+             self.seed_server = None
+-            if self.state is RForkLifecycleState.SERVING:
+-                self.state = RForkLifecycleState.READY
+-        else:
+-            self.state = RForkLifecycleState.CLEANUP_REQUIRED
+-        return stopped
+-
+-    def stop_seed_service(self) -> bool:
+-        with self._lock:
+-            self._deferred_seed_start = None
+-            return self._stop_seed_service_locked()
++        return True
+ 
+     def shutdown(self) -> bool:
+         # Do not start or wait for release HTTP during shutdown. Requests has no
+         # hard end-to-end deadline; an existing attempt may still acknowledge,
+         # otherwise the planner's expiry/reclamation policy must recover the lease.
+         self.lease_release_stop_event.set()
++        with self._seed_lifecycle_lock:
++            with self._lock:
++                if self.state is RForkLifecycleState.FINALIZED:
++                    return True
++                self._deferred_seed_start = None
++            service_ok = self._stop_seed_service()
++            with self._lock:
++                release_ok = self.seed_lease is None
++                finalize_ok = self.transfer_backend.finalize_transfer_engine() if service_ok and release_ok else False
++                if finalize_ok:
++                    self.state = RForkLifecycleState.FINALIZED
++                elif not service_ok:
++                    logger.warning(
++                        "RFork shutdown retained registered memory because seed service cleanup is incomplete."
++                    )
++                elif not release_ok:
++                    logger.warning(
++                        "RFork shutdown retained TransferEngine state because the source lease is unresolved. "
++                        "No new release retries will be started; an in-flight request may still acknowledge. "
++                        "Otherwise lease recovery depends on the planner's expiry/reclamation policy."
++                    )
++                else:
++                    logger.warning(
++                        "RFork shutdown retained TransferEngine state because finalization did not complete."
++                    )
++                return service_ok and release_ok and finalize_ok
++
++    def release_seed(self) -> bool:
+         with self._lock:
+-            if self.state is RForkLifecycleState.FINALIZED:
+-                return True
+-            self._deferred_seed_start = None
+-            service_ok = self._stop_seed_service_locked()
+-            release_ok = self.seed_lease is None
+-            finalize_ok = self.transfer_backend.finalize_transfer_engine() if service_ok and release_ok else False
+-            if finalize_ok:
+-                self.state = RForkLifecycleState.FINALIZED
+-            elif not service_ok:
+-                logger.warning("RFork shutdown retained registered memory because seed service cleanup is incomplete.")
+-            elif not release_ok:
+-                logger.warning(
+-                    "RFork shutdown retained TransferEngine state because the source lease is unresolved. "
+-                    "No new release retries will be started; an in-flight request may still acknowledge. "
+-                    "Otherwise lease recovery depends on the planner's expiry/reclamation policy."
+-                )
+-            else:
+-                logger.warning("RFork shutdown retained TransferEngine state because finalization did not complete.")
+-            return service_ok and release_ok and finalize_ok
++            return self._release_seed_locked()
++
++    def stop_seed_service(self) -> bool:
++        with self._seed_lifecycle_lock:
++            return self._stop_seed_service()
+diff --git a/vllm_ascend/model_loader/rfork/transfer_backend.py b/vllm_ascend/model_loader/rfork/transfer_backend.py
+index eec1e91f7..5fb8b8ffe 100644
+--- a/vllm_ascend/model_loader/rfork/transfer_backend.py
++++ b/vllm_ascend/model_loader/rfork/transfer_backend.py
+@@ -677,6 +677,7 @@ class RForkTransferBackend:
+         local_only = local_name_set - remote_name_set
+         remote_only = remote_name_set - local_name_set
+         skipped_shared_names: set[str] = set()
++        ignored_remote_names: set[str] = set()
+         if local_only:
+             for name, tensor in transferable_tensors:
+                 if name in local_only and _is_tensor_in_blocks(tensor, excluded_blocks):
+@@ -698,19 +699,35 @@ class RForkTransferBackend:
+                 tensor = full_model_tensors.get(name)
+                 if tensor is not None and _is_tensor_in_blocks(tensor, excluded_blocks):
+                     skipped_shared_names.add(name)
+-            if remote_only - skipped_shared_names:
++            unmatched_remote_names = remote_only - skipped_shared_names
++            if unmatched_remote_names and processed_layout:
+                 logger.error(
+                     "RFork manifest names differ: local_only=%s, remote_only=%s",
+                     sorted(local_only, key=str),
+                     sorted(remote_only - skipped_shared_names, key=str),
+                 )
+                 return False
++            # A checkpoint receiver has not run post-load processing yet. The
++            # seed can have additional derived tensors (e.g. MLA W_UV/W_UK_T)
++            # that the receiver will rebuild from the required local weights.
++            # Processed-layout transfers still require matching final inventories.
++            ignored_remote_names = unmatched_remote_names
+ 
+         parsed_remote = validate_weight_manifest(
+-            seed_info, transferable_tensors, skipped_shared_names, manifest_metadata
++            seed_info,
++            transferable_tensors,
++            skipped_shared_names,
++            manifest_metadata,
++            ignored_remote_names=ignored_remote_names,
+         )
+         if parsed_remote is None:
+             return False
++        if ignored_remote_names:
++            logger.debug(
++                "RFork checkpoint transfer skips %d seed-only tensors regenerated during post-load processing: %s",
++                len(ignored_remote_names),
++                sorted(ignored_remote_names)[:10],
++            )
+ 
+         reshape_events: list[tuple[str, tuple[int, ...], tuple[int, ...]]] = []
+         for name, tensor in transferable_tensors:
+diff --git a/vllm_ascend/worker/worker.py b/vllm_ascend/worker/worker.py
+index a63d273cb..e3b054b68 100644
+--- a/vllm_ascend/worker/worker.py
++++ b/vllm_ascend/worker/worker.py
+@@ -71,6 +71,7 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_man
+     get_host_device_memory_usage_ratio,
+ )
+ from vllm_ascend.distributed.parallel_state import init_ascend_model_parallel
++from vllm_ascend.model_loader.rfork.safety import ensure_no_rfork_session
+ from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
+ from vllm_ascend.profiler.torch_npu_profiler import TorchNPUProfilerWrapper
+ from vllm_ascend.utils import (
+@@ -220,6 +221,7 @@ class NPUWorker(WorkerBase):
+                     return
+ 
+     def sleep(self, level: int = 1) -> None:
++        ensure_no_rfork_session(self.vllm_config, "sleep")
+         free_bytes_before_sleep = torch.npu.mem_get_info()[0]
+         # Save the buffers before level 2 sleep
+         if level == 2:
+@@ -292,6 +294,7 @@ class NPUWorker(WorkerBase):
+ 
+     def start_weight_update(self, is_checkpoint_format: bool = True) -> None:
+         """Begin a new weight update; prepares the model for layerwise reload."""
++        ensure_no_rfork_session(self.vllm_config, "start_weight_update")
+         self._check_weight_transfer_engine()
+ 
+         if self._weight_update_active:
+@@ -313,6 +316,7 @@ class NPUWorker(WorkerBase):
+ 
+     def update_weights(self, update_info: dict) -> None:
+         """Receive a chunk of weights from the trainer and load them in place."""
++        ensure_no_rfork_session(self.vllm_config, "update_weights")
+         self._check_weight_transfer_engine()
+         assert self.weight_transfer_engine is not None
+ 
+@@ -348,6 +352,7 @@ class NPUWorker(WorkerBase):
+ 
+     def finish_weight_update(self) -> None:
+         """Finish the current weight update; runs layerwise postprocessing."""
++        ensure_no_rfork_session(self.vllm_config, "finish_weight_update")
+         self._check_weight_transfer_engine()
+ 
+         if not self._weight_update_active:
+@@ -1113,6 +1118,7 @@ class NPUWorker(WorkerBase):
+         self.model_runner.update_config(overrides)
+ 
+     def reload_weights(self, *args, **kwargs) -> None:
++        ensure_no_rfork_session(self.vllm_config, "reload_weights")
+         self.model_runner.reload_weights(*args, **kwargs)
+ 
+     def check_health(self) -> None:
+-- 
+2.51.0.windows.1
+
