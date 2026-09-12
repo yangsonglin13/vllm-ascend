@@ -6,6 +6,7 @@
 """Collect live model tensors and adapt their layout for RFork transfer."""
 
 import inspect
+import logging
 from collections.abc import Iterator
 from typing import Any
 
@@ -14,6 +15,64 @@ from torch import nn
 from vllm.logger import logger
 
 from vllm_ascend.model_loader.rfork.manifest import numel_from_shape
+
+
+def log_tensor_layout(
+    name: str,
+    tensor: torch.Tensor,
+    *,
+    stage: str,
+    session_id: str | None,
+    processed_layout: bool,
+    peer_session_id: str | None = None,
+) -> None:
+    """Log metadata only, without reading weights or converting their layout."""
+    if not logger.isEnabledFor(logging.INFO):
+        return
+    metadata: dict[str, Any] = {}
+    errors: dict[str, str] = {}
+
+    def capture(field, read):
+        try:
+            metadata[field] = read()
+        except Exception as exc:
+            metadata[field] = "unavailable"
+            errors[field] = type(exc).__name__
+
+    capture("device", lambda: str(tensor.device))
+    capture("dtype", lambda: str(tensor.dtype))
+    capture("shape", lambda: tuple(tensor.shape))
+    capture("stride", lambda: tuple(tensor.stride()))
+    capture("data_ptr", tensor.data_ptr)
+    capture("storage_offset", tensor.storage_offset)
+    capture("logical_bytes", lambda: tensor.numel() * tensor.element_size())
+    capture("storage_bytes", lambda: tensor.untyped_storage().nbytes())
+    capture("storage_ptr", lambda: tensor.untyped_storage().data_ptr())
+    if tensor.device.type == "npu":
+        try:
+            # Lazy import keeps CPU-only inspection/tests independent of the
+            # worker's NPU runtime. These APIs inspect the storage descriptor.
+            import torch_npu
+        except Exception as exc:
+            metadata.update(npu_format="unavailable", npu_storage_numel="unavailable")
+            errors["torch_npu"] = type(exc).__name__
+        else:
+            capture("npu_format", lambda: int(torch_npu.get_npu_format(tensor)))
+            # Descriptor elements are not necessarily tensor-dtype elements
+            # after packed dtype views; do not multiply by element_size().
+            capture("npu_storage_numel", lambda: int(torch_npu.get_storage_size(tensor)))
+    else:
+        metadata.update(npu_format="not_applicable", npu_storage_numel="not_applicable")
+    logger.info(
+        "RFork tensor layout: stage=%s session=%s peer_session=%s layout=%s name=%s metadata=%s errors=%s",
+        stage,
+        session_id,
+        peer_session_id,
+        "processed" if processed_layout else "checkpoint",
+        name,
+        metadata,
+        errors,
+    )
 
 
 def reshape_tensor_to_seed_shape(

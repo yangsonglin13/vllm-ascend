@@ -72,14 +72,20 @@ class _RForkProcessGlobalModelState:
     ascend_moe_counter: int = INITIAL_ASCEND_MOE_COUNTER
 
 
-def _is_rfork_summary_rank(session: RForkSession) -> bool:
-    identity = getattr(session, "identity", None)
-    return getattr(identity, "tp_rank", 0) == 0
-
-
 def _rfork_model_kind(session: RForkSession) -> str:
     identity = getattr(session, "identity", None)
     return "draft" if getattr(identity, "is_draft_model", False) else "main"
+
+
+def _log_rfork_load_summary(session: RForkSession, source: str, started_at: float) -> None:
+    # Includes synchronous seed startup attempted before this summary. The loader
+    # does not wait for deferred promotion; engine warmup happens after it returns.
+    logger.info(
+        "RFork %s model loading completed: source=%s, elapsed=%.2fs",
+        _rfork_model_kind(session),
+        source,
+        time.perf_counter() - started_at,
+    )
 
 
 def _start_rfork_seed_service(
@@ -438,7 +444,7 @@ class RForkModelLoader(BaseModelLoader):
                     compatibility_fingerprint,
                 )
             else:
-                logger.debug(
+                logger.info(
                     "RFork session initialized: model_kind=%s, tp_rank=%s, global_rank=%s, "
                     "pp_rank=%s, ep_rank=%s, session_attr=%s, fingerprint=%s",
                     "draft" if is_draft_model else "main",
@@ -486,6 +492,7 @@ class RForkModelLoader(BaseModelLoader):
         model_config: ModelConfig,
         prefix: str = "",
     ) -> Module | None:
+        load_started_at = time.perf_counter()
         device_config = vllm_config.device_config
         load_config = self.load_config
         load_device = device_config.device if load_config.device is None else load_config.device
@@ -525,6 +532,7 @@ class RForkModelLoader(BaseModelLoader):
                     logger.exception("RFork disabled for %s, but default loader failed.", bypass_reason)
                     raise
 
+            fallback_source = "fallback"
             try:
                 # Keep session and TransferEngine initialization inside fallback-protected RFork loading.
                 session = self._ensure_rfork_session(vllm_config, model_config)
@@ -540,7 +548,7 @@ class RForkModelLoader(BaseModelLoader):
                         model_config=model_config,
                         prefix=prefix,
                     )
-                logger.debug(
+                logger.info(
                     "RFork %s model initialization took %.2f seconds",
                     _rfork_model_kind(session),
                     time.perf_counter() - model_init_start_time,
@@ -553,12 +561,13 @@ class RForkModelLoader(BaseModelLoader):
                     # Reprocessing can mutate shared storage or rebind a shared
                     # Parameter's data, so skip every post-load hook here.
                     logger.info("RFork draft reuses all weights from the loaded target model.")
-                    return model.eval()
+                    model = model.eval()
+                    _log_rfork_load_summary(session, "shared_target", load_started_at)
+                    return model
 
                 if processed_layout_transfer:
                     layout_start_time = time.perf_counter()
-                    log_layout = logger.info if _is_rfork_summary_rank(session) else logger.debug
-                    log_layout(
+                    logger.info(
                         "RFork %s model uses post-load tensor layout transfer.",
                         _rfork_model_kind(session),
                     )
@@ -606,12 +615,14 @@ class RForkModelLoader(BaseModelLoader):
                     exclude_blocks,
                     load_source="transfer",
                 )
+                _log_rfork_load_summary(session, "transfer", load_started_at)
                 return model
-            except _RForkSeedUnavailable:
-                assert session is not None
-                log_seed_miss = logger.info if _is_rfork_summary_rank(session) else logger.debug
-                log_seed_miss(
-                    "RFork has no available %s seed; loading locally and registering this worker as a seed.",
+            except _RForkSeedUnavailable as exc:
+                if session is None:
+                    raise RuntimeError("RFork seed acquisition failed without an active session") from exc
+                fallback_source = "local"
+                logger.info(
+                    "RFork %s seed acquisition was unsuccessful; loading locally.",
                     _rfork_model_kind(session),
                 )
             except Exception as e:
@@ -670,4 +681,5 @@ class RForkModelLoader(BaseModelLoader):
                     exclude_blocks,
                     load_source="fallback",
                 )
+            _log_rfork_load_summary(session, fallback_source, load_started_at)
             return model

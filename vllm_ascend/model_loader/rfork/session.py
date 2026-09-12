@@ -206,7 +206,7 @@ class RForkSession:
     def _record_lease_release_locked(self, lease: SeedLease, result: LeaseReleaseResult) -> bool:
         """Apply one release response; True stops retries."""
         acquired_at = self._lease_acquired_at
-        logger.debug(
+        logger.info(
             "RFork lease release outcome: lease=%s attempt=%d/%d result=%s held_elapsed=%.3fs",
             lease_log_id(lease),
             self._lease_release_attempts,
@@ -356,7 +356,7 @@ class RForkSession:
                         return RForkSeedServiceStartResult.FAILED
                     self._deferred_seed_start = (model, processed_layout, exclude_blocks)
                     self._ensure_lease_release_retry_locked()
-                    logger.debug(
+                    logger.info(
                         "RFork seed promotion is deferred until the source seed lease is released; "
                         "the transferred model remains available for inference."
                     )
@@ -419,10 +419,11 @@ class RForkSession:
                     self.heartbeat_thread = None
                     raise
                 self.state = RForkLifecycleState.SERVING
-            logger.debug(
-                "RFork seed service started for global_rank=%s, port=%s",
+            logger.info(
+                "RFork seed service started for global_rank=%s, port=%s, session=%s",
                 self.identity.global_rank,
                 handle.port,
+                getattr(info, "session_id", None),
             )
             return True
         except Exception as exc:

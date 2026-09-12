@@ -2,6 +2,7 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 
 import importlib.util
+import logging
 import sys
 import weakref
 from contextlib import nullcontext
@@ -265,6 +266,43 @@ def test_real_loader_acquires_only_after_preparation(loader_runtime, monkeypatch
         else ["initialize", "acquire", "transfer", "layout", "publish"]
     )
     assert r.events == expected
+
+
+@pytest.mark.parametrize("tp_rank", [0, 3])
+@pytest.mark.parametrize("source", ["transfer", "local", "fallback", "shared_target"])
+def test_loader_logs_one_completion_with_actual_source(loader_runtime, monkeypatch, caplog, tp_rank, source):
+    r = loader_runtime
+    r.session.identity = SimpleNamespace(tp_rank=tp_rank, is_draft_model=source == "shared_target")
+    if source == "local":
+        r.session.acquire_seed.side_effect = lambda: False
+    elif source == "fallback":
+        r.session.transfer_from_seed.side_effect = lambda *args: False
+    elif source == "shared_target":
+        r.config.runner_type = "draft"
+        monkeypatch.setattr(r.loader, "_get_target_registered_blocks", lambda *args: [(100, 64)])
+        r.session.can_reuse_shared_weights.return_value = True
+    caplog.set_level(logging.DEBUG, logger="rfork-release-test")
+    expected = r.fallback if source in ("local", "fallback") else r.model
+    assert r.loader.load_model(r.vc, r.config) is expected
+    summaries = [record for record in caplog.records if "model loading completed:" in record.getMessage()]
+    assert len(summaries) == 1
+    assert summaries[0].levelno == logging.INFO
+    assert f"source={source}, elapsed=" in summaries[0].getMessage()
+    assert ("draft" if source == "shared_target" else "main") in summaries[0].getMessage()
+
+
+def test_failed_fallback_does_not_log_completion(loader_runtime, monkeypatch, caplog):
+    r = loader_runtime
+    r.session.acquire_seed.side_effect = lambda: False
+    monkeypatch.setattr(
+        sys.modules["vllm.model_executor.model_loader"],
+        "get_model",
+        Mock(side_effect=RuntimeError("local loading failed")),
+    )
+    caplog.set_level(logging.DEBUG, logger="rfork-release-test")
+    with pytest.raises(RuntimeError, match="local loading failed"):
+        r.loader.load_model(r.vc, r.config)
+    assert "model loading completed:" not in caplog.text
 
 
 @pytest.mark.parametrize("failure", ["seed_miss", "initialize", "layout", "transfer"])

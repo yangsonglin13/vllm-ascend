@@ -26,6 +26,7 @@ from vllm_ascend.model_loader.rfork.tensor_layout import (
     collect_transferable_tensors,
     find_non_npu_state_tensors,
     is_transferable_tensor,
+    log_tensor_layout,
     reshape_tensor_to_seed_shape,
 )
 from vllm_ascend.model_loader.rfork.types import SeedTransferInfo
@@ -336,6 +337,13 @@ class RForkTransferBackend:
                 logger.error("RFork found an invalid transferable tensor entry: %r", name)
                 return False
             transferable_storages.append(_tensor_storage_owner(weight))
+            log_tensor_layout(
+                name,
+                weight,
+                stage="registration",
+                session_id=getattr(self, "transfer_session_id", None),
+                processed_layout=processed_layout,
+            )
             weight_ptr = weight.data_ptr()
             weight_numel = weight.numel()
             weight_size = weight.element_size()
@@ -681,7 +689,7 @@ class RForkTransferBackend:
         if local_only:
             for name, tensor in transferable_tensors:
                 if name in local_only and _is_tensor_in_blocks(tensor, excluded_blocks):
-                    logger.debug(
+                    logger.info(
                         "Skip RFork weight %s shared with the target model: not present in the seed manifest.",
                         name,
                     )
@@ -723,7 +731,7 @@ class RForkTransferBackend:
         if parsed_remote is None:
             return False
         if ignored_remote_names:
-            logger.debug(
+            logger.info(
                 "RFork checkpoint transfer skips %d seed-only tensors regenerated during post-load processing: %s",
                 len(ignored_remote_names),
                 sorted(ignored_remote_names)[:10],
@@ -761,12 +769,20 @@ class RForkTransferBackend:
             seed_ptr_list.append(parsed_remote[name][0])
             client_ptr_list.append(tensor.data_ptr())
             client_len_list.append(tensor.numel() * tensor.element_size())
+            log_tensor_layout(
+                name,
+                tensor,
+                stage="receiver_before_read",
+                session_id=getattr(self, "transfer_session_id", None),
+                peer_session_id=seed_info.session_id,
+                processed_layout=processed_layout,
+            )
 
         chunks = list(iter_transfer_chunks(weight_names, seed_ptr_list, client_ptr_list, client_len_list))
         total_bytes = sum(client_len_list)
         total_gib = total_bytes / (1024**3)
         transfer_start = time.perf_counter()
-        logger.debug(
+        logger.info(
             "transfer weights starts, weights: %d, chunks: %d, total bytes: %.2f GiB",
             len(client_len_list),
             len(chunks),

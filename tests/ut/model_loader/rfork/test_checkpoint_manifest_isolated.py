@@ -36,6 +36,36 @@ def backend_for(runtime, tensors):
     return backend, reads
 
 
+@pytest.mark.parametrize("invalid", [None, "count", "bytes", "missing", "dtype", "shape", "numel", "element_size"])
+def test_checkpoint_superset_validates_legacy_optional_manifest(tensor_runtime, monkeypatch, invalid):
+    r = tensor_runtime
+    monkeypatch.setattr(r.tensor_layout, "is_tensor_on_transfer_device", lambda tensor: True)
+    model = torch.nn.Module()
+    model.weight = torch.nn.Parameter(torch.zeros(4))
+    source = torch.arange(4, dtype=torch.float32)
+    derived = source.square()
+    tensors = [("weight", source), ("derived", derived)]
+    info = seed_info(r, tensors, True)
+    metadata = {
+        "tensor_count": 2,
+        "total_bytes": 32,
+        "weights": {name: {"numel": 4, "element_size": 4, "shape": [4], "dtype": "float32"} for name, _ in tensors},
+    }
+    if invalid == "count":
+        metadata["tensor_count"] = 1
+    elif invalid == "bytes":
+        metadata["total_bytes"] = 16
+    elif invalid == "missing":
+        del metadata["weights"]["derived"]
+    elif invalid is not None:
+        metadata["weights"]["derived"][invalid] = {"dtype": "int32", "shape": [2, 2], "numel": 2, "element_size": 2}[
+            invalid
+        ]
+    backend, reads = backend_for(r, [("weight", model.weight)])
+    assert backend.read_weights_from_seed(model, info, False, metadata) is (invalid is None)
+    assert reads == ([(source.data_ptr(), 16)] if invalid is None else [])
+
+
 @pytest.mark.parametrize("with_shapes", [False, True])
 @pytest.mark.parametrize("processed_layout", [False, True])
 def test_only_checkpoint_transfer_accepts_seed_only_tensors(tensor_runtime, monkeypatch, with_shapes, processed_layout):
