@@ -73,11 +73,6 @@ class _RForkProcessGlobalModelState:
     ascend_moe_counter: int = INITIAL_ASCEND_MOE_COUNTER
 
 
-def _is_rfork_summary_rank(session: RForkSession) -> bool:
-    identity = getattr(session, "identity", None)
-    return getattr(identity, "tp_rank", 0) == 0
-
-
 def _rfork_model_kind(session: RForkSession) -> str:
     identity = getattr(session, "identity", None)
     return "draft" if getattr(identity, "is_draft_model", False) else "main"
@@ -86,8 +81,7 @@ def _rfork_model_kind(session: RForkSession) -> str:
 def _log_rfork_load_summary(session: RForkSession, source: str, started_at: float) -> None:
     # Includes synchronous seed startup attempted before this summary. The loader
     # does not wait for deferred promotion; engine warmup happens after it returns.
-    log_summary = logger.info if _is_rfork_summary_rank(session) else logger.debug
-    log_summary(
+    logger.info(
         "RFork %s model loading completed: source=%s, elapsed=%.2fs",
         _rfork_model_kind(session),
         source,
@@ -467,7 +461,7 @@ class RForkModelLoader(BaseModelLoader):
                     compatibility_fingerprint,
                 )
             else:
-                logger.debug(
+                logger.info(
                     "RFork session initialized: model_kind=%s, tp_rank=%s, global_rank=%s, "
                     "pp_rank=%s, ep_rank=%s, session_attr=%s, fingerprint=%s",
                     "draft" if is_draft_model else "main",
@@ -573,7 +567,7 @@ class RForkModelLoader(BaseModelLoader):
                         model_config=model_config,
                         prefix=prefix,
                     )
-                logger.debug(
+                logger.info(
                     "RFork %s model initialization took %.2f seconds",
                     _rfork_model_kind(session),
                     time.perf_counter() - model_init_start_time,
@@ -591,7 +585,7 @@ class RForkModelLoader(BaseModelLoader):
 
                 if processed_layout_transfer:
                     layout_start_time = time.perf_counter()
-                    logger.debug(
+                    logger.info(
                         "RFork %s model uses post-load tensor layout transfer.",
                         _rfork_model_kind(session),
                     )
@@ -599,7 +593,7 @@ class RForkModelLoader(BaseModelLoader):
                         process_weights_after_loading(model, model_config, target_device)
                     # Complete async NPU layout conversion before exposing buffers.
                     torch.npu.synchronize()
-                    logger.debug(
+                    logger.info(
                         "RFork %s model layout processing took %.2f seconds",
                         _rfork_model_kind(session),
                         time.perf_counter() - layout_start_time,
@@ -613,7 +607,7 @@ class RForkModelLoader(BaseModelLoader):
                 try:
                     acquired_seed = session.acquire_seed()
                 finally:
-                    logger.debug(
+                    logger.info(
                         "RFork %s seed acquisition took %.2f seconds",
                         _rfork_model_kind(session),
                         time.perf_counter() - acquire_seed_start_time,
@@ -623,7 +617,7 @@ class RForkModelLoader(BaseModelLoader):
 
                 if not session.transfer_from_seed(model, processed_layout_transfer):
                     raise RuntimeError("transfer failed.")
-                logger.debug(
+                logger.info(
                     "RFork %s model registration and transfer took %.2f seconds",
                     _rfork_model_kind(session),
                     time.perf_counter() - weight_load_start_time,
@@ -650,8 +644,7 @@ class RForkModelLoader(BaseModelLoader):
                 if session is None:
                     raise RuntimeError("RFork seed acquisition failed without an active session") from exc
                 fallback_source = "local"
-                log_seed_miss = logger.info if _is_rfork_summary_rank(session) else logger.debug
-                log_seed_miss(
+                logger.info(
                     "RFork %s seed acquisition was unsuccessful; loading locally.",
                     _rfork_model_kind(session),
                 )

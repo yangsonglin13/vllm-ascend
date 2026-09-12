@@ -223,7 +223,7 @@ def test_loader_logs_one_completion_with_actual_source(loader_runtime, monkeypat
     assert r.loader.load_model(r.vc, r.config) is expected
     summaries = [record for record in caplog.records if "model loading completed:" in record.getMessage()]
     assert len(summaries) == 1
-    assert summaries[0].levelno == (logging.INFO if tp_rank == 0 else logging.DEBUG)
+    assert summaries[0].levelno == logging.INFO
     assert f"source={source}, elapsed=" in summaries[0].getMessage()
     assert ("draft" if source == "shared_target" else "main") in summaries[0].getMessage()
 
