@@ -371,6 +371,7 @@ class TestNPUWorker(TestBase):
         worker.model_runner = MagicMock()
         worker.model_runner.model.named_buffers.return_value = []
         worker.sleep_wakeup_manager = MagicMock()
+        worker.vllm_config = SimpleNamespace(load_config=None, speculative_config=None)
 
         worker.sleep()
 
@@ -1871,6 +1872,7 @@ class TestNPUWorker(TestBase):
         with patch.object(NPUWorker, "__init__", lambda x, **kwargs: None):
             worker = NPUWorker()
             worker.model_runner = MagicMock()
+            worker.vllm_config = SimpleNamespace(load_config=None, speculative_config=None)
 
             worker.reload_weights(weights_path="/tmp/weights", is_checkpoint_format=True)
 
@@ -1886,6 +1888,7 @@ class TestNPUWorkerWeightUpdate(TestBase):
         with patch.object(NPUWorker, "__init__", lambda x, **kwargs: None):
             worker = NPUWorker()
         worker.weight_transfer_engine = engine
+        worker.vllm_config = SimpleNamespace(load_config=None, speculative_config=None)
         worker._weight_update_active = False
         worker.device = torch.device("cpu")
         worker.model_runner = MagicMock()

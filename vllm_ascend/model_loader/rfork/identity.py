@@ -143,6 +143,15 @@ def _get_hf_config_descriptor(model_config: ModelConfig) -> list[dict[str, Any]]
 
 
 def _get_model_revision(model_config: ModelConfig) -> Any:
+    # A requested branch/tag can move while keeping its name. Prefer the
+    # resolved checkpoint commit, including text configs nested in multimodal
+    # models, before falling back to the caller's revision identifier.
+    for attr in ("hf_config", "hf_text_config"):
+        hf_config = getattr(model_config, attr, None)
+        for revision_attr in ("_commit_hash", "commit_hash"):
+            revision = getattr(hf_config, revision_attr, None)
+            if isinstance(revision, str) and revision:
+                return revision
     revision = getattr(model_config, "revision", None)
     if revision is None:
         revision = getattr(model_config, "model_revision", None)
@@ -150,10 +159,9 @@ def _get_model_revision(model_config: ModelConfig) -> Any:
         return _canonicalize_fingerprint_value(revision)
     for attr in ("hf_config", "hf_text_config"):
         hf_config = getattr(model_config, attr, None)
-        for revision_attr in ("_commit_hash", "commit_hash", "revision"):
-            revision = getattr(hf_config, revision_attr, None)
-            if revision is not None:
-                return _canonicalize_fingerprint_value(revision)
+        revision = getattr(hf_config, "revision", None)
+        if revision is not None:
+            return _canonicalize_fingerprint_value(revision)
     return None
 
 

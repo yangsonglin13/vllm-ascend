@@ -11,7 +11,7 @@ from typing import Any
 from vllm.logger import logger
 
 from vllm_ascend.model_loader.rfork.config import RForkConfig
-from vllm_ascend.model_loader.rfork.planner_client import RForkPlannerClient, lease_log_id
+from vllm_ascend.model_loader.rfork.planner_client import HEARTBEAT_LOG_EVERY_N, RForkPlannerClient, lease_log_id
 from vllm_ascend.model_loader.rfork.seed_client import build_seed_url, fetch_seed_transfer_info
 from vllm_ascend.model_loader.rfork.seed_server import (
     RForkSeedServerHandle,
@@ -415,22 +415,20 @@ class RForkSession:
                 self.seed_server = handle
                 if self.lease_release_stop_event.is_set():
                     raise RuntimeError("shutdown requested during seed server startup")
+            if not handle.is_alive:
+                raise RuntimeError("seed HTTP server exited before advertisement")
             if not self.planner.report_seed_once(handle.port, seed_ip=self.config.seed_advertise_host):
                 raise RuntimeError("planner rejected the initial seed advertisement")
 
             with self._lock:
                 if self.lease_release_stop_event.is_set():
                     raise RuntimeError("shutdown requested during seed advertisement")
+                if not handle.is_alive:
+                    raise RuntimeError("seed HTTP server exited during advertisement")
                 self.heartbeat_stop_event = threading.Event()
                 self.heartbeat_thread = threading.Thread(
-                    target=self.planner.run_seed_heartbeat,
-                    args=(handle.port,),
-                    kwargs={
-                        "sleep_interval": self.config.heartbeat_interval_sec,
-                        "stop_event": self.heartbeat_stop_event,
-                        "seed_ip": self.config.seed_advertise_host,
-                        "initial_delay": True,
-                    },
+                    target=self._run_seed_heartbeat,
+                    args=(handle, self.heartbeat_stop_event),
                     daemon=True,
                     name="RForkHeartbeat",
                 )
@@ -453,6 +451,46 @@ class RForkSession:
                 self.state = RForkLifecycleState.CLEANUP_REQUIRED
             logger.warning("RFork seed service startup failed for global_rank=%s: %s", self.identity.global_rank, exc)
             return False
+
+    def _run_seed_heartbeat(self, handle: RForkSeedServerHandle, stop_event: threading.Event) -> None:
+        # Do not acquire _seed_lifecycle_lock: shutdown owns it while joining
+        # this thread. Native memory cleanup stays on the shutdown/loading thread.
+        heartbeat_index = 0
+        while not stop_event.wait(self.config.heartbeat_interval_sec):
+            if not handle.is_alive:
+                break
+            heartbeat_index += 1
+            try:
+                reported = self.planner.report_seed_once(handle.port, seed_ip=self.config.seed_advertise_host)
+            except Exception:
+                logger.exception("RFork heartbeat raised; withdrawing the seed.")
+                break
+            # The server may have exited while add_seed was in flight. Revoke
+            # that advertisement before ending this thread, even if it succeeded.
+            if not handle.is_alive:
+                break
+            if not reported:
+                logger.warning("RFork heartbeat failed for seed_key=%s", self.planner.seed_key)
+            elif heartbeat_index % HEARTBEAT_LOG_EVERY_N == 0:
+                logger.debug("RFork heartbeat accepted for seed_key=%s", self.planner.seed_key)
+        else:
+            return
+
+        with self._lock:
+            if stop_event.is_set() or self.seed_server is not handle:
+                return
+            stop_event.set()
+            self.state = RForkLifecycleState.CLEANUP_REQUIRED
+        logger.error("RFork seed heartbeat stopped after a service failure; inference can continue.")
+        try:
+            removed = self.planner.remove_seed()
+        except Exception:
+            logger.exception("RFork failed to withdraw the seed after a service failure.")
+            removed = False
+        if not removed:
+            logger.warning("RFork seed removal remains pending; heartbeats stopped, retaining registered memory.")
+        # Retain the handle and registrations until normal cleanup. Removing
+        # an advertisement alone does not prove existing native reads finished.
 
     def _cleanup_failed_seed_start(self) -> None:
         # The caller owns _seed_lifecycle_lock, but must not hold _lock here.

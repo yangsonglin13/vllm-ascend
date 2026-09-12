@@ -13,6 +13,8 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from .rfork_test_support import _load_module
+
 
 @pytest.fixture
 def loader_runtime(request, monkeypatch):
@@ -56,6 +58,7 @@ def loader_runtime(request, monkeypatch):
     monkeypatch.setattr(
         sys.modules["vllm_ascend.model_loader.rfork.identity"], "build_compatibility_fingerprint", Mock(), raising=False
     )
+    _load_module(monkeypatch, "vllm_ascend.model_loader.rfork.safety", "safety.py")
     path = Path(__file__).resolve().parents[4] / "vllm_ascend/model_loader/rfork/rfork_loader.py"
     name = "vllm_ascend.model_loader.rfork.rfork_loader"
     spec = importlib.util.spec_from_file_location(name, path)

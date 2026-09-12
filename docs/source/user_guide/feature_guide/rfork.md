@@ -99,7 +99,9 @@ flowchart TD
 
 RFork intentionally performs model initialization, layout preparation, synchronization, and local memory registration before requesting a seed lease. This accepts the setup cost of a no-seed first instance and avoids speculative get/put requests and a second lease race. The single formal lease request follows registration and covers metadata exchange and transfer. A missing seed or a race with another receiver uses the fallback cleanup path, which unregisters the prepared memory and restores the loading state before the default loader runs. Session setup, initialization, layout, registration, or post-load errors use the same cleanup path. If the default loader itself fails, model loading fails.
 
-Source-lease release runs asynchronously with bounded retries. A pending release delays Seed publication without discarding the loaded model; publication can resume after release is acknowledged. Exhausted release retries or incomplete cleanup suppress publication. A Seed service startup or advertisement failure also **keeps the loaded model**, with no checkpoint reload. When dynamic EPLB disables RFork, the loader bypasses this flow and uses the default loader directly.
+Source-lease release runs asynchronously with bounded retries. A pending release delays Seed publication without discarding the loaded model; publication can resume after release is acknowledged. Exhausted release retries or incomplete cleanup suppress publication. A Seed service startup or advertisement failure also **keeps the loaded model**, with no checkpoint reload. When dynamic EPLB or a configured static expert map disables RFork, the loader bypasses this flow and uses the default loader directly.
+
+Fallback restores the Ascend MoE layer registry and layer counter, as well as the compilation registries and rotary cache, to their pre-attempt state. This releases discarded expert weights before checkpoint loading, including after partial model construction, while preserving an already loaded target model when a draft attempt fails.
 
 After a processed-layout transfer, RFork refreshes FlatQuant's existing host clipping scalar from the received tensor without repeating layout conversion. Tensor views with storage gaps or overlapping elements are rejected before registration or transfer, causing local fallback and suppressing Seed publication for those layouts; dense transposes remain supported. Seed advertisements are tracked before the HTTP request so cleanup can revoke a potentially accepted advertisement even when its response is lost.
 
@@ -116,6 +118,8 @@ After a vLLM Ascend instance finishes loading its model, each RFork worker prepa
 5. A heartbeat advertises the seed key, address, port, and rank to the planner.
 
 The seed remains a normal serving instance. RFork does not ask it to reread the checkpoint or run a model-weight broadcast. Transfers can still consume inter-node and NPU-memory bandwidth, so production deployments should control concurrent readers and observe inference latency.
+
+The session checks that its seed HTTP server thread is alive before each heartbeat and after each advertisement request. If the thread exits, RFork stops heartbeats and attempts to remove the advertisement; the loaded model can continue inference. Detection occurs on the next heartbeat, whose default interval is 30 seconds. Registered memory remains retained until normal cleanup because advertisement removal does not prove that existing native reads have finished. If removal fails, shutdown can retry and planner heartbeat expiry can reclaim the advertisement. This check detects thread exit, not a live but unresponsive HTTP server.
 
 ### Destination-Side Loading
 
@@ -256,6 +260,8 @@ layout mode, and hardware layout policy. This prevents an old or differently
 configured seed from being selected merely because its textual key happens to
 match.
 
+Revision matching prefers the resolved checkpoint commit hash over a requested branch or tag such as `main`. Different commits therefore produce different fingerprints even when the requested revision is unchanged. If no commit hash is available, RFork uses the configured revision identifier; deployments using local checkpoints must supply an immutable model identity or deployment-strategy name when weights change. RFork does not hash local checkpoint contents.
+
 Two instances must agree on model identity and parallel layout before the planner will treat them as interchangeable seeds. The seed key is an opaque SHA256 digest, so seed and receiver instances must run the same RFork protocol to derive the same key.
 
 ### Planner Responsibilities
@@ -291,6 +297,28 @@ The bundled planner demonstrates this workflow, but it is a functional example r
 For quantized models, RFork transfers tensors after Ascend weight post-processing instead of raw checkpoint parameters. The receiver first builds the same post-load tensor layout as the seed, then RFork copies the live NPU tensors used by inference.
 
 This path handles Ascend quantization changes such as weight transposition, NZ format conversion, packed weights, derived scale tensors, and MLA/SFA runtime tensors such as `W_UV` and `W_UK_T`. Empty tensors that were released during post-processing are not included in the transfer manifest.
+
+### Tensor Layout Design
+
+RFork is a transfer path between compatible model instances, not a general-purpose tensor serializer. Its design preserves the model's established loading stages: prepare the receiver's inference layout before copying processed weights, or transfer the tensors required by the checkpoint path and then run the remaining post-load hooks. The transfer contract therefore depends on both the tensor representation and the loading stage.
+
+Raw-byte transfer of the prepared tensor layout is intentional. RFork supports dense transposes and permutations without forcing every tensor to become contiguous. It can also adjust a receiver tensor to the seed shape with an in-place storage-preserving view when the element count matches. This preserves the historical quantized-model transfer design, which builds the inference layout before copying weights instead of repeating packing or transposition after transfer. Both instances must interpret the transferred bytes with the same effective layout; shape equality alone does not establish stride compatibility, and the manifest currently does not compare remote strides.
+
+NZ transfer is also intentional: RFork copies prepared NPU tensors using `numel() * element_size()` bytes per tensor, rather than serializing checkpoint tensors or blindly copying entire allocator blocks. This relies on the target model's layout and alignment making that byte range sufficient for its physical representation. It is not a guarantee for arbitrary NZ tensors with padding. Validate physical layout, transfer coverage and inference accuracy on the intended NPU/model combination; CPU layout tests cannot establish NZ padding correctness.
+
+Checkpoint-layout transfer requires every non-shared local tensor to be present in the seed manifest, but allows the seed to contain additional tensors generated by post-load processing. Their metadata is validated and their bytes are not read. The receiver rebuilds required derived tensors during its normal post-load step; for example, unquantized MLA rebuilds `W_UV` and `W_UK_T` from the transferred `kv_b_proj.weight`. Processed-layout transfers still require matching final tensor inventories, apart from target-shared draft tensors. If the seed has disposed a checkpoint tensor still required by the receiver, RFork continues to fall back rather than performing an incomplete transfer.
+
+Allowing a seed superset in the checkpoint path is an intentional stage-dependent contract. The seed has completed loading, while the receiver has not yet created all derived tensors; requiring identical inventories at this point would reject a valid source. The local inventory determines the bytes that must be transferred. Every required local entry must match the seed's dtype, element count and element size, while the existing shape/view rules still apply. Seed-only entries never supply substitute data for a missing local weight. In the processed-layout path, both sides have already prepared their final tensors, so the stricter inventory check remains appropriate.
+
+For example, an unquantized MLA seed may expose `kv_b_proj.weight`, `impl.W_UV`, `impl.W_UK_T` and `impl.mlapo_W_UK_T`. A checkpoint receiver initially needs only `kv_b_proj.weight`; after copying it, the MLA post-load hook constructs the other tensors. Transferring those derived tensors as well is unnecessary for this path. In a processed-layout transfer, the receiver prepares the derived tensors first and receives them directly, avoiding a second layout conversion after transfer.
+
+### Historical Rationale and Validation
+
+The quantized transfer change in [PR #10128](https://github.com/vllm-project/vllm-ascend/pull/10128) (June 22, 2026) explicitly introduced prepared-layout copying, seed-shape views, and runtime tensor collection for transposed/NZ/packed weights and derived scales. Its commit record reports manual Ascend A2 validation, including GLM-5-W4A8 and DeepSeek-V4-Flash-W8A8-MTP, with successful transfer logs and a normal chat completion. [PR #12995](https://github.com/vllm-project/vllm-ascend/pull/12995) (August 6, 2026) then separated checkpoint and processed inventories, synchronized layout preparation, and avoided repeated unquantized MoE post-load conversion while preserving the remaining hooks.
+
+These results support the design for the tested model, configuration, code and hardware combinations. They do not establish that every equal-shape tensor has compatible strides, or that every NZ padding layout fits the logical byte count. The later strict seed/local inventory equality check conflicted with the checkpoint path's different loading stages; accepting a validated seed superset restores that behavior without changing the raw-byte or NZ design. The current CPU regression also executes the real MLA post-load hook with NPU operators replaced, verifies that only the base weight is read, and compares the rebuilt derived tensors with the seed; it complements rather than replaces NPU validation.
+
+### Validation
 
 When validating RFork for a quantized model:
 
@@ -394,4 +422,7 @@ vllm serve <model_path> \
 - The seed HTTP server defaults to `0.0.0.0` and has no client authentication. `seed_key` is a model compatibility identifier, not a secret credential, and query parameters may appear in access or proxy logs. Bind `rfork_seed_bind_host` to a trusted local interface, restrict network access to authorized workers, and protect metadata logs. Changing the key to an HTTP header alone would not provide authentication.
 - On hosts with multiple network interfaces, configure `rfork_seed_bind_host` and `rfork_seed_advertise_host` explicitly. The advertised seed address serves HTTP metadata; the TransferEngine endpoint in `session_id` is selected separately through `get_ip()`. Changing the HTTP advertise address does not change the RDMA endpoint. The addresses need not match, but receivers must be able to reach both over the intended networks.
 - RFork weight transfer does not support dynamic EPLB because expert weights and placement can change after the seed service starts. If `parallel_config.enable_eplb`, `eplb_config.dynamic_eplb`, or `eplb_config.expert_map_record_path` enables EPLB, RFork transfer is bypassed and the model is loaded through the default model loader.
+- Configuring a non-null `eplb_config.expert_map_path` also disables RFork, even when dynamic EPLB is off. Static expert placement is not covered by the compatibility fingerprint, so matching ranks and tensor shapes cannot establish compatibility. The main and draft models use the default loader directly, without creating RFork sessions, acquiring seed leases, registering transfer memory, or publishing seeds. No planner changes are required.
+- RFork is bypassed when `model_config.enable_sleep_mode` is enabled or `weight_transfer_config` is configured. Target and draft models use the default loader without publishing seeds, so sleep and online weight updates can proceed normally. Configure these options before loading; RFork does not support draining and re-registering weights around runtime mutations.
+- A worker that has already created an RFork session rejects `sleep`, `start_weight_update`, `update_weights`, `finish_weight_update`, and `reload_weights` before modifying memory. This includes draft sessions and sessions retaining resources after failed cleanup. To use these operations, restart with `--load-format auto` for both target and draft, or configure sleep mode/online weight transfer before loading.
 - The example [`rfork_planner.py`](https://github.com/vllm-project/vllm-ascend/blob/main/examples/rfork/rfork_planner.py) is only a simple mock implementation. If you need stronger scheduling, capacity management, or production-grade availability behavior, implement your own planner based on the RFork seed protocol.
