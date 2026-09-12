@@ -213,7 +213,7 @@ def test_retry_eventually_acknowledged_promotes_prepared_model_once(runtime, mon
         runtime.types.LeaseReleaseResult.RELEASED,
     ]
     promote = Mock(return_value=True)
-    monkeypatch.setattr(session, "_start_seed_service_locked", promote)
+    monkeypatch.setattr(session, "_start_seed_service", promote)
     with session._lock:
         assert session.start_seed_service(model, True) is runtime.types.RForkSeedServiceStartResult.DEFERRED
         worker = session.lease_release_thread
@@ -261,7 +261,7 @@ def test_deferred_fallback_memory_preparation_stays_on_calling_thread(runtime, m
         promoted.append(threading.get_ident())
         return True
 
-    monkeypatch.setattr(session, "_start_seed_service_locked", publish)
+    monkeypatch.setattr(session, "_start_seed_service", publish)
     with session._lock:
         assert session.start_seed_service(model, True) is runtime.types.RForkSeedServiceStartResult.DEFERRED
         worker = session.lease_release_thread

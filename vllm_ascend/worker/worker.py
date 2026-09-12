@@ -71,6 +71,7 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_man
     get_host_device_memory_usage_ratio,
 )
 from vllm_ascend.distributed.parallel_state import init_ascend_model_parallel
+from vllm_ascend.model_loader.rfork.safety import ensure_no_rfork_session
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
 from vllm_ascend.profiler.torch_npu_profiler import TorchNPUProfilerWrapper
 from vllm_ascend.utils import (
@@ -220,6 +221,7 @@ class NPUWorker(WorkerBase):
                     return
 
     def sleep(self, level: int = 1) -> None:
+        ensure_no_rfork_session(self.vllm_config, "sleep")
         free_bytes_before_sleep = torch.npu.mem_get_info()[0]
         # Save the buffers before level 2 sleep
         if level == 2:
@@ -292,6 +294,7 @@ class NPUWorker(WorkerBase):
 
     def start_weight_update(self, is_checkpoint_format: bool = True) -> None:
         """Begin a new weight update; prepares the model for layerwise reload."""
+        ensure_no_rfork_session(self.vllm_config, "start_weight_update")
         self._check_weight_transfer_engine()
 
         if self._weight_update_active:
@@ -313,6 +316,7 @@ class NPUWorker(WorkerBase):
 
     def update_weights(self, update_info: dict) -> None:
         """Receive a chunk of weights from the trainer and load them in place."""
+        ensure_no_rfork_session(self.vllm_config, "update_weights")
         self._check_weight_transfer_engine()
         assert self.weight_transfer_engine is not None
 
@@ -348,6 +352,7 @@ class NPUWorker(WorkerBase):
 
     def finish_weight_update(self) -> None:
         """Finish the current weight update; runs layerwise postprocessing."""
+        ensure_no_rfork_session(self.vllm_config, "finish_weight_update")
         self._check_weight_transfer_engine()
 
         if not self._weight_update_active:
@@ -1113,6 +1118,7 @@ class NPUWorker(WorkerBase):
         self.model_runner.update_config(overrides)
 
     def reload_weights(self, *args, **kwargs) -> None:
+        ensure_no_rfork_session(self.vllm_config, "reload_weights")
         self.model_runner.reload_weights(*args, **kwargs)
 
     def check_health(self) -> None:

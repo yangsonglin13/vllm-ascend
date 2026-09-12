@@ -130,14 +130,14 @@ def test_session_passes_heartbeat_config_to_thread(ops_runtime, monkeypatch):
     session.transfer_backend = Mock()
     session.state = ops_runtime.types.RForkLifecycleState.READY
     monkeypatch.setattr(session, "_seed_transfer_info", Mock())
-    monkeypatch.setattr(ops_runtime.session, "start_rfork_server", Mock(return_value=SimpleNamespace(port=1234)))
+    handle = SimpleNamespace(port=1234, is_alive=True)
+    monkeypatch.setattr(ops_runtime.session, "start_rfork_server", Mock(return_value=handle))
     thread = Mock()
     monkeypatch.setattr(ops_runtime.session.threading, "Thread", thread)
     assert session.start_seed_service(object(), True)
-    kwargs = thread.call_args.kwargs["kwargs"]
-    assert kwargs["sleep_interval"] == 17
-    assert kwargs["initial_delay"] is True
-    assert kwargs["stop_event"] is session.heartbeat_stop_event
+    assert thread.call_args.kwargs["target"] == session._run_seed_heartbeat
+    assert thread.call_args.kwargs["args"] == (handle, session.heartbeat_stop_event)
+    assert session.config.heartbeat_interval_sec == 17
     thread.return_value.start.assert_called_once()
 
 

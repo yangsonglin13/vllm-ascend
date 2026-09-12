@@ -677,6 +677,7 @@ class RForkTransferBackend:
         local_only = local_name_set - remote_name_set
         remote_only = remote_name_set - local_name_set
         skipped_shared_names: set[str] = set()
+        ignored_remote_names: set[str] = set()
         if local_only:
             for name, tensor in transferable_tensors:
                 if name in local_only and _is_tensor_in_blocks(tensor, excluded_blocks):
@@ -698,19 +699,35 @@ class RForkTransferBackend:
                 tensor = full_model_tensors.get(name)
                 if tensor is not None and _is_tensor_in_blocks(tensor, excluded_blocks):
                     skipped_shared_names.add(name)
-            if remote_only - skipped_shared_names:
+            unmatched_remote_names = remote_only - skipped_shared_names
+            if unmatched_remote_names and processed_layout:
                 logger.error(
                     "RFork manifest names differ: local_only=%s, remote_only=%s",
                     sorted(local_only, key=str),
                     sorted(remote_only - skipped_shared_names, key=str),
                 )
                 return False
+            # A checkpoint receiver has not run post-load processing yet. The
+            # seed can have additional derived tensors (e.g. MLA W_UV/W_UK_T)
+            # that the receiver will rebuild from the required local weights.
+            # Processed-layout transfers still require matching final inventories.
+            ignored_remote_names = unmatched_remote_names
 
         parsed_remote = validate_weight_manifest(
-            seed_info, transferable_tensors, skipped_shared_names, manifest_metadata
+            seed_info,
+            transferable_tensors,
+            skipped_shared_names,
+            manifest_metadata,
+            ignored_remote_names=ignored_remote_names,
         )
         if parsed_remote is None:
             return False
+        if ignored_remote_names:
+            logger.debug(
+                "RFork checkpoint transfer skips %d seed-only tensors regenerated during post-load processing: %s",
+                len(ignored_remote_names),
+                sorted(ignored_remote_names)[:10],
+            )
 
         reshape_events: list[tuple[str, tuple[int, ...], tuple[int, ...]]] = []
         for name, tensor in transferable_tensors:

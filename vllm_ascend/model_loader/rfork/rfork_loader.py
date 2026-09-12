@@ -43,6 +43,7 @@ from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.model_loader.rfork.compat import get_current_hardware_profile
 from vllm_ascend.model_loader.rfork.config import RForkConfig
 from vllm_ascend.model_loader.rfork.identity import build_compatibility_fingerprint
+from vllm_ascend.model_loader.rfork.safety import mutable_weights_bypass_reason
 from vllm_ascend.model_loader.rfork.session import RForkSession
 from vllm_ascend.model_loader.rfork.types import (
     RForkFallbackCleanupResult,
@@ -56,6 +57,8 @@ class _RForkSeedUnavailable(RuntimeError):
 
 
 FALLBACK_CLEANUP_MAX_ATTEMPTS = 2
+FALLBACK_MEMORY_RECLAIM_PASSES = 4
+INITIAL_ASCEND_MOE_COUNTER = -1
 
 
 @dataclass
@@ -65,7 +68,8 @@ class _RForkProcessGlobalModelState:
     static_forward_context: tuple[dict[Any, Any], dict[Any, Any]] | None
     static_all_moe_layers: tuple[list[Any], list[Any]] | None
     rope_cache: dict[Any, Any] | None
-    ascend_moe_layers: list[Any] | None = None
+    ascend_moe_layers: tuple[list[Any], list[Any]] | None = None
+    ascend_moe_counter: int = INITIAL_ASCEND_MOE_COUNTER
 
 
 def _is_rfork_summary_rank(session: RForkSession) -> bool:
@@ -176,15 +180,6 @@ def _make_fallback_load_config(load_config: LoadConfig) -> LoadConfig:
     return fallback_load_config
 
 
-def _get_ascend_moe_registry() -> list[Any] | None:
-    # Model construction may import the adaptor for the first time. Inspect
-    # already-loaded modules without eagerly initializing the EPLB dependency.
-    module = sys.modules.get("vllm_ascend.eplb.adaptor.vllm_adaptor")
-    adaptor = getattr(module, "VllmEplbAdaptor", None)
-    layers = getattr(adaptor, "_registered_moe_layers", None)
-    return layers if isinstance(layers, list) else None
-
-
 def _snapshot_process_global_model_state(vllm_config: VllmConfig) -> _RForkProcessGlobalModelState:
     """Snapshot registries that model construction can mutate in the process."""
     static_forward_context: tuple[dict[Any, Any], dict[Any, Any]] | None = None
@@ -210,9 +205,17 @@ def _snapshot_process_global_model_state(vllm_config: VllmConfig) -> _RForkProce
     except Exception as e:  # pragma: no cover - best-effort across vLLM versions
         logger.debug("RFork fallback: skip snapshotting _ROPE_DICT: %s", e)
 
-    ascend_moe_registry = _get_ascend_moe_registry()
-    ascend_moe_layers = list(ascend_moe_registry) if ascend_moe_registry is not None else None
-    return _RForkProcessGlobalModelState(static_forward_context, static_all_moe_layers, rope_cache, ascend_moe_layers)
+    # Inspect loaded modules without importing MoE for dense models. If model
+    # construction imports them for the first time, rollback restores the empty
+    # registry and initial counter instead.
+    adaptor = getattr(sys.modules.get("vllm_ascend.eplb.adaptor.vllm_adaptor"), "VllmEplbAdaptor", None)
+    registry = getattr(adaptor, "_registered_moe_layers", None)
+    ascend_moe_layers = (registry, list(registry)) if isinstance(registry, list) else None
+    routed_experts = getattr(sys.modules.get("vllm_ascend.ops.fused_moe.fused_moe"), "AscendMoERunner", None)
+    ascend_moe_counter = getattr(routed_experts, "moe_counter", INITIAL_ASCEND_MOE_COUNTER)
+    return _RForkProcessGlobalModelState(
+        static_forward_context, static_all_moe_layers, rope_cache, ascend_moe_layers, ascend_moe_counter
+    )
 
 
 def _reset_process_global_model_state(
@@ -227,16 +230,23 @@ def _reset_process_global_model_state(
     entries that were added by an earlier successful model load.
     """
     stale_module_ids = {id(module) for module in model.modules()} if model is not None else set()
-    # AscendMoERunner registers itself even when dynamic EPLB is disabled.
-    # Leaving those references alive retains expert weights across fallback.
-    # Restore in place because an existing adaptor can share this list; keep
-    # target-model registrations when a draft attempt is discarded.
-    ascend_moe_registry = _get_ascend_moe_registry()
-    if ascend_moe_registry is not None:
-        if snapshot is not None:
-            ascend_moe_registry[:] = snapshot.ascend_moe_layers or []
-        elif stale_module_ids:
-            ascend_moe_registry[:] = [layer for layer in ascend_moe_registry if id(layer) not in stale_module_ids]
+    adaptor = getattr(sys.modules.get("vllm_ascend.eplb.adaptor.vllm_adaptor"), "VllmEplbAdaptor", None)
+    registry = getattr(adaptor, "_registered_moe_layers", None)
+    if snapshot is not None and snapshot.ascend_moe_layers is not None:
+        baseline_registry, baseline_layers = snapshot.ascend_moe_layers
+        baseline_registry[:] = baseline_layers
+        if adaptor is not None and registry is not baseline_registry:
+            adaptor._registered_moe_layers = baseline_registry
+    elif isinstance(registry, list):
+        if snapshot is not None or not stale_module_ids:
+            registry.clear()
+        else:
+            registry[:] = [layer for layer in registry if id(layer) not in stale_module_ids]
+    if snapshot is not None:
+        routed_experts = getattr(sys.modules.get("vllm_ascend.ops.fused_moe.fused_moe"), "AscendMoERunner", None)
+        if routed_experts is not None:
+            routed_experts.moe_counter = snapshot.ascend_moe_counter
+
     removed_names: set[Any] = set()
     compilation_config = getattr(vllm_config, "compilation_config", None)
     if compilation_config is not None:
@@ -488,9 +498,12 @@ class RForkModelLoader(BaseModelLoader):
             model_state_snapshot: _RForkProcessGlobalModelState | None = None
             exclude_blocks: list[tuple[int, int]] = []
             processed_layout_transfer = self._requires_processed_layout_transfer(model_config)
-            bypass_reason = None
-            if _is_dynamic_eplb_enabled(vllm_config):
-                bypass_reason = "dynamic EPLB"
+            bypass_reason = mutable_weights_bypass_reason(vllm_config, model_config)
+            if bypass_reason is None:
+                if getattr(get_ascend_config().eplb_config, "expert_map_path", None) is not None:
+                    bypass_reason = "static expert placement (expert_map_path)"
+                elif _is_dynamic_eplb_enabled(vllm_config):
+                    bypass_reason = "dynamic EPLB"
 
             if bypass_reason is not None:
                 logger.warning(
@@ -527,7 +540,7 @@ class RForkModelLoader(BaseModelLoader):
                         model_config=model_config,
                         prefix=prefix,
                     )
-                logger.info(
+                logger.debug(
                     "RFork %s model initialization took %.2f seconds",
                     _rfork_model_kind(session),
                     time.perf_counter() - model_init_start_time,
@@ -602,8 +615,8 @@ class RForkModelLoader(BaseModelLoader):
                     _rfork_model_kind(session),
                 )
             except Exception as e:
-                # A queued/captured LogRecord must not retain the exception's
-                # traceback and the discarded model through its arguments.
+                # Log records may outlive fallback (e.g. buffered handlers).
+                # Do not let the exception traceback retain the discarded model.
                 logger.warning("RFork transfer failed: %s, clean up and fall back to default loader", str(e))
 
             cleanup_result: bool | RForkFallbackCleanupResult = False
@@ -623,12 +636,10 @@ class RForkModelLoader(BaseModelLoader):
                 )
 
             if model_init_started:
-                # A constructor can register layers and then raise before
-                # assigning model. Collect that partial model as well.
+                # Partial constructors can leave reference cycles even when no
+                # model was returned. Reclaim them before allocating fallback.
                 model = None
-                gc.collect()
-                torch.npu.empty_cache()
-                for _ in range(3):
+                for _ in range(FALLBACK_MEMORY_RECLAIM_PASSES):
                     gc.collect()
                     torch.npu.empty_cache()
 

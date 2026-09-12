@@ -14,6 +14,8 @@ import torch
 
 from tests.ut.model_loader.rfork.test_lease_release import runtime as runtime
 
+from .rfork_test_support import _load_module
+
 
 @pytest.mark.parametrize("failure", ["seed_miss", "initialize", "layout", "transfer"])
 @pytest.mark.parametrize("preexisting_registry", [False, True])
@@ -141,6 +143,7 @@ def loader_runtime(request, monkeypatch):
     identity_module = importlib.util.module_from_spec(identity_spec)
     monkeypatch.setitem(sys.modules, identity_name, identity_module)
     identity_spec.loader.exec_module(identity_module)
+    _load_module(monkeypatch, "vllm_ascend.model_loader.rfork.safety", "safety.py")
     path = Path(__file__).resolve().parents[4] / "vllm_ascend/model_loader/rfork/rfork_loader.py"
     name = "vllm_ascend.model_loader.rfork.rfork_loader"
     spec = importlib.util.spec_from_file_location(name, path)

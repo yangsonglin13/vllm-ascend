@@ -166,6 +166,50 @@ def test_fingerprint_quantization_config_changes(identity_module):
     assert build(_vllm_config(), base_config, **kwargs) != build(_vllm_config(), changed_config, **kwargs)
 
 
+@pytest.mark.parametrize("config_field", ["hf_config", "hf_text_config"])
+@pytest.mark.parametrize("commit_field", ["_commit_hash", "commit_hash"])
+def test_resolved_commits_isolate_moving_revision_seeds(identity_module, config_field, commit_field):
+    first = _model_config(revision="main")
+    second = _model_config(revision="main")
+    for config, commit in ((first, "a" * 40), (second, "b" * 40)):
+        if config_field == "hf_text_config":
+            config.hf_text_config = SimpleNamespace()
+            config.hf_config.revision = "main"
+        setattr(getattr(config, config_field), commit_field, commit)
+    kwargs = {"model_url": "model", "model_deploy_strategy_name": "strategy"}
+    build = identity_module.build_compatibility_fingerprint
+    first_fingerprint = build(_vllm_config(), first, **kwargs)
+    second_fingerprint = build(_vllm_config(), second, **kwargs)
+    assert first_fingerprint != second_fingerprint
+    assert identity_module.build_seed_key(0, "model", "strategy", first_fingerprint) != (
+        identity_module.build_seed_key(0, "model", "strategy", second_fingerprint)
+    )
+
+
+def test_revision_aliases_share_the_same_resolved_commit(identity_module):
+    first = _model_config(revision="main")
+    second = _model_config(revision="release")
+    first.hf_config._commit_hash = second.hf_config._commit_hash = "a" * 40
+    kwargs = {"model_url": "model", "model_deploy_strategy_name": "strategy"}
+    build = identity_module.build_compatibility_fingerprint
+    assert build(_vllm_config(), first, **kwargs) == build(_vllm_config(), second, **kwargs)
+
+
+def test_unresolved_revision_keeps_explicit_version_fallback(identity_module):
+    config = _model_config(revision="local-version")
+    config.hf_config._commit_hash = ""
+    config.hf_config.commit_hash = None
+    assert identity_module._get_model_revision(config) == "local-version"
+    config.revision = None
+    config.model_revision = "model-version"
+    assert identity_module._get_model_revision(config) == "model-version"
+    config.model_revision = None
+    config.hf_config.revision = "config-version"
+    assert identity_module._get_model_revision(config) == "config-version"
+    config.hf_config.revision = None
+    assert identity_module._get_model_revision(config) is None
+
+
 def test_recursive_fingerprint_values_fail_with_actionable_error(identity_module):
     recursive_dict = {}
     recursive_dict["self"] = recursive_dict
