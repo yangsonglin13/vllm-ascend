@@ -52,6 +52,7 @@ def runtime(monkeypatch):
     config = load("config")
     load("manifest")
     load("seed_client")
+    load("load_state")
     client = load("planner_client")
     session = load("session")
     monkeypatch.setattr(session.atexit, "register", lambda callback: None)
@@ -86,7 +87,9 @@ def tensor_runtime(monkeypatch):
     class _SeedTransferInfo:
         session_id: str
         weights: dict
+        shared_names: tuple[str, ...] | None = None
         formats: dict | None = None
+        load_state: dict | None = None
 
     _stub(monkeypatch, "vllm_ascend.model_loader.rfork.types", SeedTransferInfo=_SeedTransferInfo)
     _load_module(monkeypatch, "vllm_ascend.model_loader.rfork.manifest", "manifest.py")

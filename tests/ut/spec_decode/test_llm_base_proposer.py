@@ -26,6 +26,7 @@ import pytest
 import torch
 from vllm.config import CUDAGraphMode
 
+from vllm_ascend.model_loader.rfork.load_state import finish_rfork_deferred_seed_start
 from vllm_ascend.spec_decode.llm_base_proposer import (
     AscendSpecDecodeBaseProposer,
     _draft_embed_accepts_mm,
@@ -117,6 +118,64 @@ class TestMultimodalImageTokenIndex:
         )
 
         assert image_token_index is None
+
+
+class TestRforkSeedSharedWeightBinding:
+    """Verify RFork binds seed-shared MTP heads to the local target."""
+
+    @staticmethod
+    def _make_proposer(session, draft):
+        proposer = AscendSpecDecodeBaseProposer.__new__(AscendSpecDecodeBaseProposer)
+        proposer.speculative_config = SimpleNamespace(draft_load_config=SimpleNamespace(rfork_draft_session=session))
+        proposer.method = "mtp"
+        proposer.model = draft
+        proposer.use_cuda_graph = False
+        proposer.vllm_config = SimpleNamespace(
+            model_config=SimpleNamespace(is_deepseek_mla=True),
+            compilation_config=SimpleNamespace(cudagraph_mode=CUDAGraphMode.NONE),
+        )
+        return proposer
+
+    def test_finish_binds_the_target_head_when_equality_would_fail(self):
+        target_head = SimpleNamespace(weight=torch.ones(4, 2))
+        draft_head = SimpleNamespace(weight=torch.randn(4, 2))
+        mtp_layer = SimpleNamespace(shared_head=SimpleNamespace(head=draft_head))
+        draft = SimpleNamespace(
+            model=SimpleNamespace(layers={"78": mtp_layer}),
+            lm_head=draft_head,
+            has_own_lm_head=True,
+        )
+        session = SimpleNamespace(
+            get_seed_shared_names=lambda: ("model.layers.78.shared_head.head.weight",),
+            has_deferred_seed_start=lambda: False,
+        )
+        proposer = self._make_proposer(session, draft)
+
+        # Equality-based sharing compares allocation-time values against the
+        # target and correctly keeps the (garbage) own head.
+        proposer._maybe_share_lm_head(SimpleNamespace(lm_head=target_head))
+        assert mtp_layer.shared_head.head is draft_head
+
+        finish_rfork_deferred_seed_start(proposer, draft, SimpleNamespace(lm_head=target_head))
+
+        assert mtp_layer.shared_head.head is target_head
+        assert draft.lm_head is target_head
+
+    def test_finish_binds_the_target_embedding_for_eagle_equal_weights(self):
+        target_embed = SimpleNamespace(weight=torch.ones(4, 2))
+        draft_embed = SimpleNamespace(weight=torch.randn(4, 2))
+        draft = SimpleNamespace(model=SimpleNamespace(embed_tokens=draft_embed))
+        session = SimpleNamespace(
+            get_seed_shared_names=lambda: ("model.embed_tokens.weight",),
+            has_deferred_seed_start=lambda: False,
+        )
+        proposer = self._make_proposer(session, draft)
+
+        finish_rfork_deferred_seed_start(
+            proposer, draft, SimpleNamespace(model=SimpleNamespace(embed_tokens=target_embed))
+        )
+
+        assert draft.model.embed_tokens is target_embed
 
 
 class TestMtpSharesTheTargetLmHead:

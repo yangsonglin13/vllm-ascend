@@ -64,6 +64,13 @@ class AscendDeepSeekMTP(DeepSeekMTP):
         self._maybe_set_own_lm_head(loaded_weights)
         return loaded_weights
 
+    def _restore_load_derived_state(self) -> None:
+        """Restore the MTP-owned ``lm_head`` alias after RFork loading."""
+        if not getattr(self, "has_own_lm_head", False):
+            return
+        mtp_layer_idx = self.model.mtp_start_layer_idx
+        self.lm_head = self.model.layers[str(mtp_layer_idx)].shared_head.head
+
     def _rewrite_spec_layer_name(self, spec_layer: int, name: str) -> str:
         if "rot" in name:
             name = name.replace(f"model.layers.{spec_layer}.rot.", "rot.")

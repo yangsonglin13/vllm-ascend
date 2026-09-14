@@ -27,6 +27,7 @@ from vllm.v1.worker.gpu.spec_decode.dspark.speculator import (
     DSparkSpeculator,
 )
 
+from vllm_ascend.model_loader.rfork.load_state import finish_rfork_deferred_seed_start
 from vllm_ascend.models.qwen3_dspark import process_weight
 from vllm_ascend.utils import (
     get_rotation_matrix,
@@ -57,12 +58,17 @@ class AscendDSparkSpeculator(DSparkSpeculator):
         # unrotated. The target is QuaRot-quantized, so the aux hidden states it
         # feeds the drafter are in rotated space; fc must be rotated (W @ R) to
         # project them back to model space.
-        rotation_path = get_rotation_path(self.vllm_config)
-        if rotation_path is not None and hasattr(model.model, "fc"):
-            rotation_weight = get_rotation_matrix(rotation_path)
-            fc = model.model.fc
-            with torch.no_grad():
-                fc.weight.data.copy_(process_weight(fc.weight.data.cpu(), rotation_weight))
+        # Skip when the weights already live in rotated space (RFork transfer).
+        if not getattr(model, "fc_rotation_applied", False):
+            rotation_path = get_rotation_path(self.vllm_config)
+            if rotation_path is not None and hasattr(model.model, "fc"):
+                rotation_weight = get_rotation_matrix(rotation_path)
+                fc = model.model.fc
+                with torch.no_grad():
+                    fc.weight.data.copy_(process_weight(fc.weight.data.cpu(), rotation_weight))
+                model.fc_rotation_applied = True
+        # Sharing is final; finish the deferred RFork seed start (see AscendAutoRegressiveSpeculator.load_draft_model).
+        finish_rfork_deferred_seed_start(self, model, target_model)
         return model
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:

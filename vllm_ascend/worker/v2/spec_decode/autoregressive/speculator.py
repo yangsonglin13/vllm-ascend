@@ -40,6 +40,7 @@ from vllm_ascend.attention.dsa_v1 import AscendDSABackend
 from vllm_ascend.attention.indexer import AscendSFAIndexerBackend
 from vllm_ascend.attention.mla_v1 import AscendMLABackend
 from vllm_ascend.attention.sfa_v1 import AscendSFABackend
+from vllm_ascend.model_loader.rfork.load_state import finish_rfork_deferred_seed_start
 from vllm_ascend.worker.v2.aclgraph_utils import _get_graph_update_backend
 from vllm_ascend.worker.v2.attn_utils import (
     build_attn_metadata_wrapper,
@@ -134,6 +135,16 @@ class AscendAutoRegressiveSpeculator(AutoRegressiveSpeculator):
             model_config=self.draft_model_config,
             parallel_config=parallel_config,
         )
+
+    def load_draft_model(
+        self,
+        target_model: torch.nn.Module,
+        target_attn_layer_names: set[str],
+    ) -> torch.nn.Module:
+        model = super().load_draft_model(target_model, target_attn_layer_names)
+        # Upstream sharing is final; finish the deferred RFork seed start so this draft can also serve as a seed.
+        finish_rfork_deferred_seed_start(self, model, target_model)
+        return model
 
     @property
     def draft_prefill_attn_groups(self) -> list[list[AttentionGroup]]:

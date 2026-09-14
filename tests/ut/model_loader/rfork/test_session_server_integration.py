@@ -39,6 +39,7 @@ def live_session(runtime, monkeypatch):
     session.planner.remove_seed.return_value = True
     session.transfer_backend.transfer_session_id = "native-session"
     session.transfer_backend.weight_manifest = {"weight": [1234, 4, 4, [4], "float32"]}
+    session.transfer_backend.shared_with_target_names = []
     session.transfer_backend.weight_formats = {"weight": 2}
     handles = []
     original = module.start_rfork_server

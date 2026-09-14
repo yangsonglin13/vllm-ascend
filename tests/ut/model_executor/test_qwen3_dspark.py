@@ -68,10 +68,28 @@ class TestQwen3DSparkWeightLoading:
         mock_get_rotation_matrix.assert_called_once_with(rotation_path)
         mock_parent_load_weights.assert_called_once()
 
+        # Rotating fc records it: weight-transfer loaders copy these bytes, and
+        # downstream consumers (the MRV2 speculator) must not rotate again.
+        assert model.fc_rotation_applied is True
+
         processed_weights = mock_parent_load_weights.call_args.args[0]
         torch.testing.assert_close(processed_weights[0][1], expected_fc_weight)
         torch.testing.assert_close(processed_weights[1][1], non_fc_weight)
         torch.testing.assert_close(processed_weights[2][1], non_fc_weight)
+
+    def test_records_no_rotation_without_a_rotation_path(self) -> None:
+        """Without QuaRot the weights stay unrotated and the record says so."""
+        model_cls = qwen3_dspark.AscendQwen3DSparkForCausalLM
+        model = model_cls.__new__(model_cls)
+        object.__setattr__(model, "rotation_path", None)
+        object.__setattr__(model, "enable_confidence_head", False)
+
+        weights_to_load = [("model.fc.weight", torch.tensor([[1.0, 2.0]]))]
+        with patch.object(qwen3_dspark.Qwen3DSparkForCausalLM, "load_weights") as mock_parent_load_weights:
+            model.load_weights(iter(weights_to_load))
+
+        assert model.fc_rotation_applied is False
+        torch.testing.assert_close(mock_parent_load_weights.call_args.args[0][0][1], torch.tensor([[1.0, 2.0]]))
 
 
 def test_quarot_loads_missing_target_vocab_shards(tmp_path) -> None:

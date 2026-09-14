@@ -155,6 +155,10 @@ class AscendLinearScheme(TPWeightSwitchMixin, ABC):
         """
         return
 
+    def refresh_runtime_state_after_loading(self, layer: torch.nn.Module) -> None:
+        """Refresh host caches after processed weights are transferred."""
+        return
+
 
 class AscendAttentionScheme(ABC):
     """Base class for all attention quantization schemes.

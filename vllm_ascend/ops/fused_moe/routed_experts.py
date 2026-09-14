@@ -55,6 +55,9 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
 
     quant_type = QuantType.NONE
 
+    # ``process_weights_after_loading`` rewrites routed-expert weight storage; RFork receivers must not run it twice.
+    rewrites_weight_storage_after_loading = True
+
     def __init__(self, moe: FusedMoEConfig = None, tid2eid=None):
         super().__init__(moe=moe)
         vllm_config = get_current_vllm_config()

@@ -173,3 +173,7 @@ class AscendW4A4FlatQuantDynamicLinearMethod(AscendLinearScheme):
         layer.right_trans = torch.nn.Parameter(layer.right_trans.data)
         layer.clip_ratio = torch.nn.Parameter(layer.clip_ratio.data.to(torch.float32))
         layer.aclnn_clip_ratio = layer.clip_ratio.item()
+
+    def refresh_runtime_state_after_loading(self, layer):
+        # The NPU kernel requires a host value; sync the scalar once after a weight transfer, leaving storage intact.
+        layer.aclnn_clip_ratio = layer.clip_ratio.item()

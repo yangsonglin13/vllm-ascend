@@ -199,6 +199,9 @@ class RForkTransferBackend:
         self.registered_weight_blocks: list[tuple[int, int]] = []
         self.registered_memory_addresses: list[int] = []
         self.excluded_weight_blocks: list[tuple[int, int]] = []
+        self.shared_with_target_names: list[str] = []
+        # Skipped names: seed shared them with its own target; spec-decode binds draft modules to this target instead.
+        self.seed_shared_names: list[str] = []
         self._registered_transferable_tensors: list[tuple[str, torch.Tensor]] | None = None
         self._registered_transferable_storages: list[Any] | None = None
         self._all_transferable_tensors_excluded = False
@@ -246,6 +249,8 @@ class RForkTransferBackend:
         self.weight_formats = None
         self.registered_weight_blocks = []
         self.registered_memory_addresses = []
+        self.shared_with_target_names = []
+        self.seed_shared_names = []
         self._registered_transferable_tensors = None
         self._registered_transferable_storages = None
         self._all_transferable_tensors_excluded = False
@@ -399,6 +404,9 @@ class RForkTransferBackend:
         self.weight_formats = weight_format_dict
         self.registered_weight_blocks = list(merged_blocks)
         self.registered_memory_addresses = []
+        self.shared_with_target_names = sorted(excluded_names)
+        # Fresh registration describes the current topology; skips received from a seed are stale once serving as one.
+        self.seed_shared_names = []
         self._registered_transferable_tensors = transferable_tensors
         self._registered_transferable_storages = transferable_storages
         self._all_transferable_tensors_excluded = bool(not transferable_tensors and excluded_names)
@@ -653,17 +661,34 @@ class RForkTransferBackend:
             return False
 
         excluded_blocks = self.excluded_weight_blocks
+        seed_shared_names = set(seed_info.shared_names or ())
         local_only = local_name_set - remote_name_set
         remote_only = remote_name_set - local_name_set
         skipped_shared_names: set[str] = set()
+        ignored_remote_names: set[str] = set()
+        # Names skipped: seed shared them with its target; spec-decode explicitly binds this process's target modules.
+        received_seed_shared_names: set[str] = set()
+        # Drop leftovers from a previous transfer attempt.
+        self.seed_shared_names = []
         if local_only:
             for name, tensor in transferable_tensors:
-                if name in local_only and _is_tensor_in_blocks(tensor, excluded_blocks):
+                if name not in local_only:
+                    continue
+                if _is_tensor_in_blocks(tensor, excluded_blocks):
                     logger.debug(
                         "Skip RFork weight %s shared with the target model: not present in the seed manifest.",
                         name,
                     )
                     skipped_shared_names.add(name)
+                elif name in seed_shared_names:
+                    # Seed registered after target sharing, so its manifest lacks this name; spec-decode rebinds it.
+                    logger.info(
+                        "Skip RFork weight %s shared with the seed's target model; "
+                        "the local target model provides it after weight sharing.",
+                        name,
+                    )
+                    skipped_shared_names.add(name)
+                    received_seed_shared_names.add(name)
             if local_only - skipped_shared_names:
                 logger.error(
                     "RFork manifest names differ: local_only=%s, remote_only=%s",
@@ -679,17 +704,28 @@ class RForkTransferBackend:
                 tensor = full_model_tensors.get(name)
                 if tensor is not None and _is_tensor_in_blocks(tensor, excluded_blocks):
                     skipped_shared_names.add(name)
-            if remote_only - skipped_shared_names:
+            unmatched_remote_names = remote_only - skipped_shared_names
+            if unmatched_remote_names and processed_layout:
                 logger.error(
                     "RFork manifest names differ: local_only=%s, remote_only=%s",
                     sorted(local_only, key=str),
                     sorted(remote_only - skipped_shared_names, key=str),
                 )
                 return False
+            # Receiver not yet post-processed; seed-only derived tensors (e.g. MLA W_UV/W_UK_T) are rebuilt locally.
+            ignored_remote_names = unmatched_remote_names
 
-        parsed_remote = validate_weight_manifest(seed_info, transferable_tensors, skipped_shared_names)
+        parsed_remote = validate_weight_manifest(
+            seed_info, transferable_tensors, skipped_shared_names, ignored_remote_names=ignored_remote_names
+        )
         if parsed_remote is None:
             return False
+        if ignored_remote_names:
+            logger.debug(
+                "RFork checkpoint transfer skips %d seed-only tensors regenerated during post-load processing: %s",
+                len(ignored_remote_names),
+                sorted(ignored_remote_names)[:10],
+            )
 
         reshape_events: list[tuple[str, tuple[int, ...], tuple[int, ...]]] = []
         for name, tensor in transferable_tensors:
@@ -764,6 +800,8 @@ class RForkTransferBackend:
             transfer_elapsed,
             throughput_gib_s,
         )
+        # Publish seed-shared skips only once transfer succeeds; spec-decode reads them to bind local target modules.
+        self.seed_shared_names = sorted(received_seed_shared_names)
         return True
 
 

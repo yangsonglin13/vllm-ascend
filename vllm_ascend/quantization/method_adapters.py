@@ -152,6 +152,11 @@ class AscendLinearMethod(LinearMethodBase):
         if hasattr(self.quant_method, "process_weights_after_loading"):
             self.quant_method.process_weights_after_loading(layer)
 
+    def refresh_runtime_state_after_loading(self, layer: torch.nn.Module) -> None:
+        refresh = getattr(self.quant_method, "refresh_runtime_state_after_loading", None)
+        if callable(refresh):
+            refresh(layer)
+
     def get_computed_params(self) -> set[str]:
         """Return parameter name patterns that are computed, not loaded.
 

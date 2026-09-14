@@ -115,6 +115,8 @@ class AscendQwen3DSparkForCausalLM(Qwen3DSparkForCausalLM):
                     loaded_weight = process_weight(loaded_weight, rotation_weight)
                 processed_weights.append((name, loaded_weight))
             all_weights = processed_weights
+        # Record that fc now lives in rotated space; RFork copies these bytes, so consumers must not rotate again.
+        self.fc_rotation_applied = rotation_weight is not None
 
         if not vllm_version_is("0.27.1"):
             # main (cdc4824a21): upstream load_weights already manages

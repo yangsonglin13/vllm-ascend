@@ -72,12 +72,11 @@ class TestLoadDraftModel:
 
     @pytest.fixture
     def captured(self, monkeypatch):
-        """Stub the heavy parent ``load_draft_model`` to return a fake draft and
-        snapshot its fc weight before the override mutates it in place."""
+        """Return a fake draft and capture its fc weight before mutation."""
         out: dict = {}
 
         def _load(self, target_model, target_attn_layer_names):
-            draft = _fake_draft()
+            draft = out.get("preset_draft") or _fake_draft()
             out["before"] = draft.model.fc.weight.data.clone()
             out["draft"] = draft
             return draft
@@ -93,8 +92,28 @@ class TestLoadDraftModel:
         assert draft is captured["draft"]
         assert torch.allclose(draft.model.fc.weight.data, 2.0 * before, atol=1e-6)
         assert not torch.allclose(draft.model.fc.weight.data, before)
+        # Rotating here records that fc now lives in rotated space.
+        assert draft.fc_rotation_applied is True
+
+    def test_skips_rotation_when_weights_already_rotated(self, captured, monkeypatch):
+        # An RFork receiver's fc bytes were rotated by the seed's load_weights;
+        # rotating again would corrupt them to W @ R @ R.
+        monkeypatch.setattr(_ROT_MATRIX, _no_call)
+        spec = _spec(_quarot_config())
+        # Stash a draft whose weights already live in rotated space; the
+        # parent stub returns this exact object, so the flag survives the load.
+        draft = _fake_draft()
+        draft.fc_rotation_applied = True
+        captured["preset_draft"] = draft
+
+        result = spec.load_draft_model(MagicMock(), set())
+
+        assert result is draft
+        assert torch.equal(draft.model.fc.weight.data, captured["before"])
+        assert draft.fc_rotation_applied is True
 
     def test_noop_for_bf16_target(self, captured, monkeypatch):
         monkeypatch.setattr(_ROT_MATRIX, _no_call)
         draft = _spec(_bf16_config()).load_draft_model(MagicMock(), set())
         assert torch.equal(draft.model.fc.weight.data, captured["before"])
+        assert not hasattr(draft, "fc_rotation_applied")
