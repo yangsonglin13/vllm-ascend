@@ -14,6 +14,7 @@ def make_session(runtime):
     session.transfer_backend.read_weights_from_seed.return_value = True
     session.transfer_backend.unregister_memory_region.return_value = True
     session.transfer_backend.finalize_transfer_engine.return_value = True
+    session.transfer_backend.shared_with_target_names = []
     session.transfer_backend.weight_formats = {}
     assert session.register_destination(object(), True)
     assert session.acquire_seed()

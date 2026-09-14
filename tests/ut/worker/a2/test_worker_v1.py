@@ -1573,6 +1573,7 @@ class TestNPUWorker(TestBase):
         with patch.object(NPUWorker, "__init__", lambda x, **kwargs: None):
             worker = NPUWorker()
             worker.model_runner = MagicMock()
+            worker.vllm_config = SimpleNamespace(load_config=None, speculative_config=None)
 
             worker.reload_weights(weights_path="/tmp/weights", is_checkpoint_format=True)
 
@@ -1588,6 +1589,7 @@ class TestNPUWorkerWeightUpdate(TestBase):
         with patch.object(NPUWorker, "__init__", lambda x, **kwargs: None):
             worker = NPUWorker()
         worker.weight_transfer_engine = engine
+        worker.vllm_config = SimpleNamespace(load_config=None, speculative_config=None)
         worker._weight_update_active = False
         worker._is_checkpoint_format = True
         worker.device = torch.device("cpu")
@@ -1764,3 +1766,27 @@ class TestNPUWorkerWeightUpdate(TestBase):
         worker.shutdown()
 
         engine.shutdown.assert_called_once()
+
+    @patch("vllm_ascend.worker.worker.shutdown_rfork_sessions")
+    def test_shutdown_closes_rfork_sessions_before_model_runner(self, mock_shutdown_rfork):
+        events = []
+        engine = MagicMock()
+        engine.shutdown.side_effect = lambda: events.append("weight_transfer")
+        worker = self._make_worker(engine=engine)
+        worker.profiler = None
+        worker.model_runner.shutdown.side_effect = lambda: events.append("model_runner")
+        mock_shutdown_rfork.side_effect = lambda _config: events.append("rfork") or True
+
+        worker.shutdown()
+
+        mock_shutdown_rfork.assert_called_once_with(worker.vllm_config)
+        self.assertEqual(events, ["weight_transfer", "rfork", "model_runner"])
+
+    @patch("vllm_ascend.worker.worker.shutdown_rfork_sessions", return_value=False)
+    def test_shutdown_keeps_model_runner_when_rfork_cleanup_fails(self, _mock_shutdown_rfork):
+        worker = self._make_worker(engine=MagicMock())
+        worker.profiler = None
+
+        worker.shutdown()
+
+        worker.model_runner.shutdown.assert_not_called()

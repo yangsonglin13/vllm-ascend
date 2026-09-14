@@ -11,6 +11,7 @@ from typing import Any
 from vllm.logger import logger
 
 from vllm_ascend.model_loader.rfork.config import RForkConfig
+from vllm_ascend.model_loader.rfork.load_state import capture_load_derived_state, restore_load_derived_state
 from vllm_ascend.model_loader.rfork.planner_client import RForkPlannerClient, lease_log_id
 from vllm_ascend.model_loader.rfork.seed_client import build_seed_url, fetch_seed_transfer_info
 from vllm_ascend.model_loader.rfork.seed_server import (
@@ -30,6 +31,7 @@ from vllm_ascend.model_loader.rfork.types import (
 )
 
 HEARTBEAT_STOP_GRACE_SEC = 1.0
+HEARTBEAT_LOG_EVERY_N = 4
 LEASE_RENEW_MIN_INTERVAL_SEC = 0.1
 LEASE_RENEW_MAX_INTERVAL_SEC = 30.0
 
@@ -63,6 +65,8 @@ class RForkSession:
         self._lease_acquired_at: float | None = None
         self._registration_elapsed = 0.0
         self._deferred_seed_start: tuple[Any, bool, list[tuple[int, int]] | None] | None = None
+        # Draft seed start waits until target weight sharing is final; lease-release promotion must not overtake it.
+        self._deferred_seed_awaiting_sharing = False
         self._lock = threading.RLock()
         # Acquire before _lock; release responses must not wait on removal I/O.
         self._seed_lifecycle_lock = threading.RLock()
@@ -185,6 +189,8 @@ class RForkSession:
             )
             if seed_info is None:
                 return False
+            # Receiver never runs load_weights; restore seed load-state before post-load/spec-decode sharing reads it.
+            restore_load_derived_state(model, seed_info.load_state)
             metadata_elapsed = time.monotonic() - metadata_started
             read_started = time.monotonic()
             if not self.transfer_backend.read_weights_from_seed(
@@ -282,6 +288,7 @@ class RForkSession:
         ):
             self._lease_release_exhausted = True
             self._deferred_seed_start = None
+            self._deferred_seed_awaiting_sharing = False
             logger.error(
                 "RFork lease release stopped: lease=%s attempts=%d; lease remains unresolved, "
                 "worker will not advertise a seed. Model loading/inference may continue.",
@@ -303,6 +310,7 @@ class RForkSession:
             with self._lock:
                 if (
                     self._deferred_seed_start is None
+                    or self._deferred_seed_awaiting_sharing
                     or self.seed_lease is not None
                     or self.state is RForkLifecycleState.FINALIZED
                     or self.lease_release_stop_event.is_set()
@@ -324,6 +332,60 @@ class RForkSession:
                     "RFork deferred seed promotion failed after the source lease was released; "
                     "the model remains available for inference."
                 )
+
+    def schedule_deferred_seed_start(
+        self,
+        model,
+        processed_layout: bool,
+        exclude_blocks: list[tuple[int, int]] | None = None,
+    ) -> RForkSeedServiceStartResult:
+        """Defer draft registration until target weight sharing finishes."""
+        with self._seed_lifecycle_lock:
+            with self._lock:
+                if self.lease_release_stop_event.is_set():
+                    return RForkSeedServiceStartResult.FAILED
+                if self._deferred_seed_start is not None:
+                    logger.error("RFork cannot schedule a deferred seed start while one is already pending.")
+                    return RForkSeedServiceStartResult.FAILED
+                if self.state not in (RForkLifecycleState.INITIALIZED, RForkLifecycleState.TRANSFERRED):
+                    logger.error(
+                        "RFork deferred draft seed start requires a complete model; state=%s",
+                        self.state.name,
+                    )
+                    return RForkSeedServiceStartResult.FAILED
+                self._deferred_seed_start = (model, processed_layout, exclude_blocks)
+                self._deferred_seed_awaiting_sharing = True
+            logger.info("RFork draft seed start is deferred until weight sharing with the target model is complete.")
+            return RForkSeedServiceStartResult.DEFERRED
+
+    def has_deferred_seed_start(self) -> bool:
+        with self._lock:
+            return self._deferred_seed_start is not None
+
+    def get_seed_shared_names(self) -> tuple[str, ...]:
+        """Return weights skipped because the seed shared them with its target."""
+        with self._lock:
+            names = self.transfer_backend.seed_shared_names
+        if not isinstance(names, (list, tuple)):
+            return ()
+        return tuple(names)
+
+    def complete_deferred_seed_start(self) -> RForkSeedServiceStartResult:
+        """Register and publish the draft after target sharing finishes."""
+        with self._seed_lifecycle_lock:
+            with self._lock:
+                self._deferred_seed_awaiting_sharing = False
+                pending = self._deferred_seed_start
+                if pending is None:
+                    return RForkSeedServiceStartResult.FAILED
+                if self.state is RForkLifecycleState.FINALIZED or self.lease_release_stop_event.is_set():
+                    return RForkSeedServiceStartResult.FAILED
+                model, processed_layout, exclude_blocks = pending
+                if self.seed_lease is None:
+                    # No lease to wait for: clear the stash; start_seed_service would otherwise re-stash it.
+                    self._deferred_seed_start = None
+            # Weight sharing replaced tensors post-transfer, so rebuild registration even for processed-layout models.
+            return self.start_seed_service(model, processed_layout, exclude_blocks, refresh_registration=True)
 
     def _reset_transfer_locked(self) -> bool:
         if self.seed_server is not None:
@@ -352,13 +414,14 @@ class RForkSession:
                     logger.error("RFork cannot prepare a finalized session for fallback.")
                     return RForkFallbackCleanupResult(False, False, False)
                 self._deferred_seed_start = None
+                self._deferred_seed_awaiting_sharing = False
             service_ok = self._stop_seed_service()
             with self._lock:
                 release_ok = self._release_seed_locked()
                 reset_ok = self._reset_transfer_locked() if service_ok else False
                 return RForkFallbackCleanupResult(service_ok, release_ok, reset_ok)
 
-    def _seed_transfer_info(self) -> SeedTransferInfo:
+    def _seed_transfer_info(self, load_state: dict[str, Any] | None = None) -> SeedTransferInfo:
         session_id = self.transfer_backend.transfer_session_id
         weights = self.transfer_backend.weight_manifest
         if not isinstance(session_id, str) or not session_id or not isinstance(weights, dict) or not weights:
@@ -366,7 +429,9 @@ class RForkSession:
         return SeedTransferInfo(
             session_id=session_id,
             weights=weights,
+            shared_names=tuple(self.transfer_backend.shared_with_target_names) or None,
             formats=dict(self.transfer_backend.weight_formats) if self.transfer_backend.weight_formats else None,
+            load_state=dict(load_state) if load_state else None,
         )
 
     def start_seed_service(
@@ -374,6 +439,8 @@ class RForkSession:
         model,
         processed_layout: bool,
         exclude_blocks: list[tuple[int, int]] | None = None,
+        *,
+        refresh_registration: bool = False,
     ) -> RForkSeedServiceStartResult:
         with self._seed_lifecycle_lock:
             with self._lock:
@@ -392,8 +459,12 @@ class RForkSession:
                     logger.error("RFork seed service requires a complete model; state=%s", self.state.name)
                     return RForkSeedServiceStartResult.FAILED
                 if self.state is not RForkLifecycleState.READY:
-                    # Refresh checkpoint-layout registration after post-load storage replacement.
-                    if self.state is not RForkLifecycleState.TRANSFERRED or not processed_layout:
+                    # Refresh registration after post-load storage changes; processed layouts already use final buffers.
+                    if (
+                        refresh_registration
+                        or self.state is not RForkLifecycleState.TRANSFERRED
+                        or not processed_layout
+                    ):
                         self.state = RForkLifecycleState.CLEANUP_REQUIRED
                         try:
                             registered = self.transfer_backend.register_memory_region(
@@ -412,6 +483,8 @@ class RForkSession:
                     if self._lease_release_exhausted or self.lease_release_stop_event.is_set():
                         return RForkSeedServiceStartResult.FAILED
                     self._deferred_seed_start = (model, processed_layout, exclude_blocks)
+                    # Deferral waits only for the source lease release; sharing deferral was completed by the caller.
+                    self._deferred_seed_awaiting_sharing = False
                     self._ensure_lease_release_retry_locked()
                     logger.debug(
                         "RFork seed promotion is deferred until the source seed lease is released; "
@@ -441,7 +514,7 @@ class RForkSession:
                 return False
             self.state = RForkLifecycleState.CLEANUP_REQUIRED
         try:
-            info = self._seed_transfer_info()
+            info = self._seed_transfer_info(capture_load_derived_state(model))
             handle = start_rfork_server(
                 self.planner.seed_key,
                 info,
@@ -452,22 +525,20 @@ class RForkSession:
                 self.seed_server = handle
                 if self.lease_release_stop_event.is_set():
                     raise RuntimeError("shutdown requested during seed server startup")
+            if not handle.is_alive:
+                raise RuntimeError("seed HTTP server exited before advertisement")
             if not self.planner.report_seed_once(handle.port, seed_ip=self.config.seed_advertise_host):
                 raise RuntimeError("planner rejected the initial seed advertisement")
 
             with self._lock:
                 if self.lease_release_stop_event.is_set():
                     raise RuntimeError("shutdown requested during seed advertisement")
+                if not handle.is_alive:
+                    raise RuntimeError("seed HTTP server exited during advertisement")
                 self.heartbeat_stop_event = threading.Event()
                 self.heartbeat_thread = threading.Thread(
-                    target=self.planner.run_seed_heartbeat,
-                    args=(handle.port,),
-                    kwargs={
-                        "sleep_interval": self.config.heartbeat_interval_sec,
-                        "stop_event": self.heartbeat_stop_event,
-                        "seed_ip": self.config.seed_advertise_host,
-                        "initial_delay": True,
-                    },
+                    target=self._run_seed_heartbeat,
+                    args=(handle, self.heartbeat_stop_event),
                     daemon=True,
                     name="RForkHeartbeat",
                 )
@@ -490,6 +561,44 @@ class RForkSession:
                 self.state = RForkLifecycleState.CLEANUP_REQUIRED
             logger.warning("RFork seed service startup failed for global_rank=%s: %s", self.identity.global_rank, exc)
             return False
+
+    def _run_seed_heartbeat(self, handle: RForkSeedServerHandle, stop_event: threading.Event) -> None:
+        # Do not take _seed_lifecycle_lock: shutdown owns it while joining this thread; native cleanup stays elsewhere.
+        heartbeat_index = 0
+        while not stop_event.wait(self.config.heartbeat_interval_sec):
+            if not handle.is_alive:
+                break
+            heartbeat_index += 1
+            try:
+                reported = self.planner.report_seed_once(handle.port, seed_ip=self.config.seed_advertise_host)
+            except Exception:
+                # report_seed_once usually swallows errors; this guard is for the rest, so heartbeat exits via cleanup.
+                logger.exception("RFork heartbeat raised; withdrawing the seed.")
+                break
+            # Server may exit while add_seed is in flight; revoke that advertisement even if the report succeeded.
+            if not handle.is_alive:
+                break
+            if not reported:
+                logger.warning("RFork heartbeat failed for seed_key=%s", self.planner.seed_key)
+            elif heartbeat_index % HEARTBEAT_LOG_EVERY_N == 0:
+                logger.debug("RFork heartbeat accepted for seed_key=%s", self.planner.seed_key)
+        else:
+            return
+
+        with self._lock:
+            if stop_event.is_set() or self.seed_server is not handle:
+                return
+            stop_event.set()
+            self.state = RForkLifecycleState.CLEANUP_REQUIRED
+        logger.error("RFork seed heartbeat stopped after a service failure; inference can continue.")
+        try:
+            removed = self.planner.remove_seed()
+        except Exception:
+            logger.exception("RFork failed to withdraw the seed after a service failure.")
+            removed = False
+        if not removed:
+            logger.warning("RFork seed removal remains pending; heartbeats stopped, retaining registered memory.")
+        # Retain the handle and registrations until normal cleanup; removal alone does not prove native reads finished.
 
     def _cleanup_failed_seed_start(self) -> None:
         # The caller owns _seed_lifecycle_lock, but must not hold _lock here.
@@ -548,6 +657,7 @@ class RForkSession:
                 if self.state is RForkLifecycleState.FINALIZED:
                     return True
                 self._deferred_seed_start = None
+                self._deferred_seed_awaiting_sharing = False
             service_ok = self._stop_seed_service()
             with self._lock:
                 release_ok = self.seed_lease is None

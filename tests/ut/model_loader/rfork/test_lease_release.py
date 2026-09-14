@@ -38,7 +38,8 @@ def test_blocked_release_does_not_block_inference_or_shutdown(runtime, monkeypat
         return runtime.types.LeaseReleaseResult.RELEASED
 
     session.planner.release_seed_once.side_effect = release
-    monkeypatch.setattr(runtime.session, "fetch_seed_transfer_info", lambda *args: object())
+    seed_info = runtime.types.SeedTransferInfo("session", {}, load_state=None)
+    monkeypatch.setattr(runtime.session, "fetch_seed_transfer_info", lambda *args: seed_info)
     results = []
 
     def startup():
@@ -103,7 +104,7 @@ def test_transfer_failure_requires_cleanup_before_publication(runtime, monkeypat
     monkeypatch.setattr(
         runtime.session,
         "fetch_seed_transfer_info",
-        lambda *args: None if failure == "metadata" else object(),
+        lambda *args: None if failure == "metadata" else runtime.types.SeedTransferInfo("session", {}),
     )
     session.transfer_backend.read_weights_from_seed.return_value = failure != "read"
     session.planner.release_seed_once.return_value = runtime.types.LeaseReleaseResult.RELEASED

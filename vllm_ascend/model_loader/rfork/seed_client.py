@@ -5,6 +5,7 @@
 
 from collections.abc import Mapping
 from http import HTTPStatus
+from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 import requests
@@ -94,6 +95,16 @@ def fetch_seed_transfer_info(
             logger.error("RFork seed returned an invalid session or weight manifest.")
             return None
 
+        shared_names: list[str] | None = None
+        shared_names_candidate = response_payload.get("rfork_seed_shared_names")
+        if shared_names_candidate is not None:
+            if not isinstance(shared_names_candidate, (list, tuple)) or any(
+                not isinstance(name, str) for name in shared_names_candidate
+            ):
+                logger.error("RFork seed returned malformed shared-weight names.")
+                return None
+            shared_names = list(shared_names_candidate)
+
         formats_candidate = response_payload.get("rfork_transfer_engine_format_info")
         if not isinstance(formats_candidate, Mapping) or any(
             not isinstance(name, str) or not isinstance(value, int) or isinstance(value, bool)
@@ -103,7 +114,30 @@ def fetch_seed_transfer_info(
             return None
         formats = dict(formats_candidate)
 
-        return SeedTransferInfo(session_id=session_id, weights=weights, formats=formats)
+        load_state: dict[str, Any] | None = None
+        load_state_candidate = response_payload.get("rfork_seed_load_state")
+        if load_state_candidate is not None:
+            if not isinstance(load_state_candidate, Mapping):
+                logger.error("RFork seed returned malformed load-state metadata.")
+                return None
+            # Flags are booleans; reject stringly/numeric variants so "false" never reaches model attributes.
+            for attr, value in load_state_candidate.items():
+                if not isinstance(attr, str) or not isinstance(value, bool):
+                    logger.error(
+                        "RFork seed load-state entry %r must map to a boolean, got %r.",
+                        attr,
+                        value,
+                    )
+                    return None
+            load_state = dict(load_state_candidate)
+
+        return SeedTransferInfo(
+            session_id=session_id,
+            weights=weights,
+            shared_names=shared_names,
+            formats=formats,
+            load_state=load_state,
+        )
     except Exception as exc:
         logger.error("RFork seed metadata request failed for %s: %s", seed_url, exc)
         return None

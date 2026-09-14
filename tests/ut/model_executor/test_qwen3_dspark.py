@@ -62,3 +62,4 @@ class TestQwen3DSparkWeightLoading:
         processed_weights = mock_parent_load_weights.call_args.args[0]
         torch.testing.assert_close(processed_weights[0][1], expected_fc_weight)
         torch.testing.assert_close(processed_weights[1][1], non_fc_weight)
+        assert model.fc_rotation_applied

@@ -156,7 +156,9 @@ def start_fastapi_server(
 
         app = FastAPI()
         rfork_transfer_engine_info = (info.session_id, info.weights)
+        rfork_seed_shared_names = list(info.shared_names) if info.shared_names else None
         rfork_seed_format_info = dict(info.formats) if info.formats else None
+        rfork_seed_load_state = dict(info.load_state) if info.load_state else None
 
         @app.get("/get_rfork_transfer_engine_info")
         def get_rfork_transfer_engine_info(seed_key: str):
@@ -164,12 +166,16 @@ def start_fastapi_server(
                 return {
                     "rfork_protocol_version": RFORK_PROTOCOL_VERSION,
                     "rfork_transfer_engine_info": rfork_transfer_engine_info,
+                    "rfork_seed_shared_names": rfork_seed_shared_names,
                     "rfork_transfer_engine_format_info": rfork_seed_format_info,
+                    "rfork_seed_load_state": rfork_seed_load_state,
                 }
             return {
                 "rfork_protocol_version": RFORK_PROTOCOL_VERSION,
                 "rfork_transfer_engine_info": None,
+                "rfork_seed_shared_names": None,
                 "rfork_transfer_engine_format_info": None,
+                "rfork_seed_load_state": None,
             }
 
         @app.get("/health_check_with_key")

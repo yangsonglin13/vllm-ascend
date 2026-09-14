@@ -28,6 +28,7 @@ from vllm.v1.worker.gpu.spec_decode.dspark.speculator import (
     DSparkSpeculator,
 )
 
+from vllm_ascend.model_loader.rfork.load_state import finish_rfork_deferred_seed_start
 from vllm_ascend.utils import vllm_version_is
 from vllm_ascend.worker.v2.attn_utils import build_attn_metadata_wrapper
 
@@ -38,6 +39,15 @@ class AscendDSparkSpeculator(DSparkSpeculator):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         super().__init__(vllm_config, device)
         self.input_batch: InputBatch | None = None
+
+    def load_draft_model(
+        self,
+        target_model: torch.nn.Module,
+        target_attn_layer_names: set[str],
+    ) -> torch.nn.Module:
+        model = super().load_draft_model(target_model, target_attn_layer_names)
+        finish_rfork_deferred_seed_start(self, model, target_model)
+        return model
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
         super().init_cudagraph_manager(cudagraph_mode)

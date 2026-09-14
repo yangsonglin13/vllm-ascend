@@ -88,6 +88,8 @@ def validate_weight_manifest(
     seed_info: SeedTransferInfo,
     transferable_tensors: list[tuple[str, torch.Tensor]],
     skipped_shared_names: set[str],
+    *,
+    ignored_remote_names: set[str] | None = None,
 ) -> dict[str, tuple[int, int, int, tuple[int, ...], str]] | None:
     """Validate seed metadata against local tensors before any layout change or read."""
     remote_name_set = set(seed_info.weights)
@@ -109,6 +111,9 @@ def validate_weight_manifest(
             logger.error("Invalid weight info for %s: %s", name, weight_info)
             return None
         seed_ptr, seed_len, seed_size, seed_shape, seed_dtype = parsed_weight_info
+        # Receivers regenerate seed-only derived state: validate metadata, exclude bytes from the transfer.
+        if ignored_remote_names and name in ignored_remote_names:
+            continue
         parsed_remote[name] = (seed_ptr, seed_len, seed_size, seed_shape, seed_dtype)
         remote_total_bytes += seed_len * seed_size
 

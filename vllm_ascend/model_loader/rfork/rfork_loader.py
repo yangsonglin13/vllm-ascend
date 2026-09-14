@@ -15,6 +15,7 @@
 #
 
 import gc
+import sys
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -25,6 +26,7 @@ from typing import Any, cast
 import torch
 import torch.nn as nn
 from torch.nn import Module
+from torch.utils.hooks import RemovableHandle
 from vllm.config import ModelConfig, VllmConfig
 from vllm.config.load import LoadConfig
 from vllm.distributed import get_tensor_model_parallel_rank
@@ -42,6 +44,7 @@ from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.device.hardware_profile import get_current_hardware_profile
 from vllm_ascend.model_loader.rfork.config import RForkConfig
 from vllm_ascend.model_loader.rfork.identity import build_compatibility_fingerprint
+from vllm_ascend.model_loader.rfork.safety import mutable_weights_bypass_reason
 from vllm_ascend.model_loader.rfork.session import RForkSession
 from vllm_ascend.model_loader.rfork.types import (
     RForkFallbackCleanupResult,
@@ -57,6 +60,7 @@ class _RForkSeedUnavailable(RuntimeError):
 
 FALLBACK_CLEANUP_MAX_ATTEMPTS = 2
 FALLBACK_MEMORY_RECLAIM_PASSES = 4
+INITIAL_ASCEND_MOE_COUNTER = -1
 
 
 @dataclass
@@ -66,6 +70,11 @@ class _RForkProcessGlobalModelState:
     static_forward_context: tuple[dict[Any, Any], dict[Any, Any]] | None
     static_all_moe_layers: tuple[list[Any], list[Any]] | None
     rope_cache: dict[Any, Any] | None
+    ascend_moe_layers: tuple[list[Any], list[Any]] | None = None
+    ascend_moe_counter: int = INITIAL_ASCEND_MOE_COUNTER
+    # vllm_ascend rope cache globals (_cos_sin_cache, _cos_cache, _sin_cache); None if not imported.
+    ascend_rope_caches: tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None] | None = None
+    dynamo_bytecode_hook_ids: frozenset[int] = frozenset()
 
 
 def _is_rfork_summary_rank(session: RForkSession) -> bool:
@@ -89,33 +98,34 @@ def _log_rfork_load_summary(session: RForkSession, source: str, started_at: floa
     )
 
 
-def _start_rfork_seed_service(
+def _publish_rfork_seed(
     session: RForkSession,
     model: Module,
     processed_layout: bool,
     exclude_blocks: list[tuple[int, int]],
     *,
     load_source: str,
-) -> bool:
+) -> None:
+    is_draft = session.identity.is_draft_model
+    start = session.schedule_deferred_seed_start if is_draft else session.start_seed_service
+    action = "deferred seed scheduling" if is_draft else "seed service startup"
     try:
-        result = session.start_seed_service(model, processed_layout, exclude_blocks)
+        result = start(model, processed_layout, exclude_blocks)
     except Exception:
         logger.exception(
-            "RFork %s model loaded from %s, but seed service startup raised; inference can continue.",
+            "RFork %s model loaded from %s, but %s raised; inference can continue.",
             _rfork_model_kind(session),
             load_source,
+            action,
         )
-        return False
-    if result is RForkSeedServiceStartResult.DEFERRED:
-        return False
-    started = bool(result)
-    if not started:
+        return
+    if result is RForkSeedServiceStartResult.FAILED:
         logger.warning(
-            "RFork %s model loaded from %s is ready, but seed service startup failed; inference can continue.",
+            "RFork %s model loaded from %s is ready, but %s failed; inference can continue.",
             _rfork_model_kind(session),
             load_source,
+            action,
         )
-    return started
 
 
 def _is_mtp_hf_config(hf_config: object | None) -> bool:
@@ -203,6 +213,36 @@ def _load_with_default_loader(
     )
 
 
+def _get_dynamo_bytecode_hooks() -> dict[int, Any]:
+    # Do not import Dynamo just to snapshot it; first-time loads leave the hook set empty.
+    module = sys.modules.get("torch._dynamo.convert_frame")
+    hooks = getattr(module, "_bytecode_hooks", None)
+    return hooks if isinstance(hooks, dict) else {}
+
+
+def _remove_discarded_compilation_hooks(
+    stale_module_ids: set[int], snapshot: _RForkProcessGlobalModelState | None
+) -> None:
+    """Remove new Dynamo hooks that still own discarded model modules."""
+    hooks = _get_dynamo_bytecode_hooks()
+    removed_count = 0
+    for hook_id, hook in list(hooks.items()):
+        if snapshot is not None and hook_id in snapshot.dynamo_bytecode_hook_ids:
+            continue
+        owner = getattr(hook, "__self__", None)
+        if not isinstance(owner, Module):
+            continue
+        if snapshot is None and id(owner) not in stale_module_ids:
+            continue
+        handle = getattr(owner, "_bytecode_hook_handle", None)
+        if isinstance(handle, RemovableHandle) and handle.id == hook_id and handle.hooks_dict_ref() is hooks:
+            # Same as vLLM's wrapper.cleanup(), without version-specific imports or model code.
+            handle.remove()
+            removed_count += 1
+    if removed_count:
+        logger.info("RFork fallback removed %d discarded model compilation hooks.", removed_count)
+
+
 def _snapshot_process_global_model_state(vllm_config: VllmConfig) -> _RForkProcessGlobalModelState:
     """Snapshot registries that model construction can mutate in the process."""
     static_forward_context: tuple[dict[Any, Any], dict[Any, Any]] | None = None
@@ -228,7 +268,31 @@ def _snapshot_process_global_model_state(vllm_config: VllmConfig) -> _RForkProce
     except Exception as e:  # pragma: no cover - best-effort across vLLM versions
         logger.debug("RFork fallback: skip snapshotting _ROPE_DICT: %s", e)
 
-    return _RForkProcessGlobalModelState(static_forward_context, static_all_moe_layers, rope_cache)
+    # Construction mutates the first-wins Ascend rope cache globals; snapshot them for rollback.
+    ascend_rope_caches: tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None] | None = None
+    rope_ops_module = sys.modules.get("vllm_ascend.ops.rotary_embedding")
+    if rope_ops_module is not None:
+        ascend_rope_caches = (
+            getattr(rope_ops_module, "_cos_sin_cache", None),
+            getattr(rope_ops_module, "_cos_cache", None),
+            getattr(rope_ops_module, "_sin_cache", None),
+        )
+
+    # Inspect loaded modules only, so dense models do not import MoE; rollback restores pristine registries.
+    adaptor = getattr(sys.modules.get("vllm_ascend.eplb.adaptor.vllm_adaptor"), "VllmEplbAdaptor", None)
+    registry = getattr(adaptor, "_registered_moe_layers", None)
+    ascend_moe_layers = (registry, list(registry)) if isinstance(registry, list) else None
+    routed_experts = getattr(sys.modules.get("vllm_ascend.ops.fused_moe.routed_experts"), "AscendRoutedExperts", None)
+    ascend_moe_counter = getattr(routed_experts, "moe_counter", INITIAL_ASCEND_MOE_COUNTER)
+    return _RForkProcessGlobalModelState(
+        static_forward_context,
+        static_all_moe_layers,
+        rope_cache,
+        ascend_moe_layers,
+        ascend_moe_counter,
+        ascend_rope_caches,
+        frozenset(_get_dynamo_bytecode_hooks()),
+    )
 
 
 def _reset_process_global_model_state(
@@ -238,6 +302,26 @@ def _reset_process_global_model_state(
 ) -> None:
     """Restore process-global registries to their pre-attempt state."""
     stale_module_ids = {id(module) for module in model.modules()} if model is not None else set()
+    _remove_discarded_compilation_hooks(stale_module_ids, snapshot)
+    adaptor = getattr(sys.modules.get("vllm_ascend.eplb.adaptor.vllm_adaptor"), "VllmEplbAdaptor", None)
+    registry = getattr(adaptor, "_registered_moe_layers", None)
+    if snapshot is not None and snapshot.ascend_moe_layers is not None:
+        baseline_registry, baseline_layers = snapshot.ascend_moe_layers
+        baseline_registry[:] = baseline_layers
+        if adaptor is not None and registry is not baseline_registry:
+            adaptor._registered_moe_layers = baseline_registry
+    elif isinstance(registry, list):
+        if snapshot is not None or not stale_module_ids:
+            registry.clear()
+        else:
+            registry[:] = [layer for layer in registry if id(layer) not in stale_module_ids]
+    if snapshot is not None:
+        routed_experts = getattr(
+            sys.modules.get("vllm_ascend.ops.fused_moe.routed_experts"), "AscendRoutedExperts", None
+        )
+        if routed_experts is not None:
+            routed_experts.moe_counter = snapshot.ascend_moe_counter
+
     removed_names: set[Any] = set()
     compilation_config = getattr(vllm_config, "compilation_config", None)
     if compilation_config is not None:
@@ -284,6 +368,18 @@ def _reset_process_global_model_state(
     except Exception as e:  # pragma: no cover - best-effort across vLLM versions
         logger.debug("RFork fallback: skip resetting _ROPE_DICT: %s", e)
 
+    # Restore first-wins rope globals so a discarded attempt cannot pin its caches; clear when no snapshot.
+    rope_ops_module = sys.modules.get("vllm_ascend.ops.rotary_embedding")
+    if rope_ops_module is not None:
+        if snapshot is not None and snapshot.ascend_rope_caches is not None:
+            rope_ops_module._cos_sin_cache, rope_ops_module._cos_cache, rope_ops_module._sin_cache = (
+                snapshot.ascend_rope_caches
+            )
+        else:
+            rope_ops_module._cos_sin_cache = None
+            rope_ops_module._cos_cache = None
+            rope_ops_module._sin_cache = None
+
 
 def _iter_ascend_moe_quant_methods(model: Module) -> Iterator[Any]:
     """Yield each quant method owned by an Ascend MoE runner once."""
@@ -309,7 +405,10 @@ def _rfork_pre_transfer_weight_processing(model: Module):
     restored: list[tuple[Any, object]] = []
     for quant_method in _iter_ascend_moe_quant_methods(model):
         process_weights = getattr(quant_method, "process_weights_after_loading", None)
-        original_process_weights = getattr(process_weights, "__wrapped__", None)
+        # Use the pre-wrapper step from ``unvalidated_process_weights_after_loading`` or ``__wrapped__``.
+        original_process_weights = getattr(quant_method, "unvalidated_process_weights_after_loading", None) or (
+            getattr(process_weights, "__wrapped__", None)
+        )
         if original_process_weights is None:
             continue
 
@@ -337,13 +436,12 @@ def _is_dynamic_eplb_enabled(vllm_config: VllmConfig) -> bool:
 
 @contextmanager
 def _rfork_skip_unquantized_moe_post_load_processing(model: Module):
-    """Suppress unquantized MoE post-load processing; dense layers still run theirs."""
-
-    from vllm_ascend.ops.fused_moe.routed_experts import AscendUnquantizedFusedMoEMethod
+    """Skip MoE storage rewrites already reflected in transferred bytes."""
 
     restored_methods: list[tuple[Any, object]] = []
     for quant_method in _iter_ascend_moe_quant_methods(model):
-        if not isinstance(quant_method, AscendUnquantizedFusedMoEMethod):
+        # The class advertises that its post-load step rewrites storage; see the docstring for why.
+        if not getattr(quant_method, "rewrites_weight_storage_after_loading", False):
             continue
 
         process_weights = getattr(quant_method, "process_weights_after_loading", None)
@@ -364,15 +462,31 @@ def _noop_process_weights_after_loading(*args: Any, **kwargs: Any) -> None:
     pass
 
 
+def _requires_fused_mc2_processed_layout(model: Module) -> bool:
+    """Return whether fused MC2 rewrites the model's MoE storage layout."""
+    try:
+        enable_fused_mc2 = getattr(get_ascend_config(), "enable_fused_mc2", 0)
+    except (TypeError, ValueError, RuntimeError):
+        # AscendConfig may be unavailable during early or CPU-only loader inspection.
+        return False
+    if isinstance(enable_fused_mc2, bool) or not isinstance(enable_fused_mc2, int) or enable_fused_mc2 == 0:
+        return False
+
+    # Storage-rewriting methods advertise on the class, so no loader-side isinstance is needed.
+    return any(
+        getattr(quant_method, "rewrites_weight_storage_after_loading", False)
+        for quant_method in _iter_ascend_moe_quant_methods(model)
+    )
+
+
 def _refresh_rfork_flatquant_state(model: Module) -> None:
-    """Refresh FlatQuant's existing host cache without rerunning layout conversion."""
+    """Refresh FlatQuant's host cache without rerunning layout conversion."""
     for module in model.modules():
         if not hasattr(module, "aclnn_clip_ratio"):
             continue
         clip_ratio = getattr(module, "clip_ratio", None)
         if not isinstance(clip_ratio, torch.Tensor) or clip_ratio.numel() != 1:
             raise ValueError("RFork FlatQuant runtime state requires a scalar clip_ratio tensor")
-        # Refresh the host scalar once after transfer without rewriting device storage.
         module.aclnn_clip_ratio = clip_ratio.item()
 
 
@@ -509,9 +623,12 @@ class RForkModelLoader(BaseModelLoader):
             model_state_snapshot: _RForkProcessGlobalModelState | None = None
             exclude_blocks: list[tuple[int, int]] = []
             processed_layout_transfer = self._requires_processed_layout_transfer(model_config)
-            bypass_reason = None
-            if _is_dynamic_eplb_enabled(vllm_config):
-                bypass_reason = "dynamic EPLB"
+            bypass_reason = mutable_weights_bypass_reason(vllm_config, model_config)
+            if bypass_reason is None:
+                if getattr(get_ascend_config().eplb_config, "expert_map_path", None) is not None:
+                    bypass_reason = "static expert placement (expert_map_path)"
+                elif _is_dynamic_eplb_enabled(vllm_config):
+                    bypass_reason = "dynamic EPLB"
 
             if bypass_reason is not None:
                 logger.warning(
@@ -539,6 +656,14 @@ class RForkModelLoader(BaseModelLoader):
                     _rfork_model_kind(session),
                     time.perf_counter() - model_init_start_time,
                 )
+
+                # Config cannot see model structure; refine the MC2 layout decision on the constructed model.
+                if not processed_layout_transfer and _requires_fused_mc2_processed_layout(model):
+                    processed_layout_transfer = True
+                    logger.info(
+                        "RFork %s model uses post-load tensor layout transfer for fused MC2 MoE weights.",
+                        _rfork_model_kind(session),
+                    )
 
                 if exclude_blocks and session.can_reuse_shared_weights(
                     model, processed_layout_transfer, exclude_blocks
@@ -596,7 +721,7 @@ class RForkModelLoader(BaseModelLoader):
 
                 # Advertise only after post-load and eval; the session owns failure cleanup.
                 model = model.eval()
-                _start_rfork_seed_service(
+                _publish_rfork_seed(
                     session,
                     model,
                     processed_layout_transfer,
@@ -616,7 +741,8 @@ class RForkModelLoader(BaseModelLoader):
                 )
             except Exception as e:
                 fallback_source = "fallback"
-                logger.warning("RFork transfer failed: %s, clean up and fall back to default loader", e)
+                # Log records may outlive fallback; the traceback must not pin the discarded model.
+                logger.warning("RFork transfer failed: %s, clean up and fall back to default loader", repr(e))
 
             cleanup_result: RForkFallbackCleanupResult | None = None
             if session is not None:
@@ -637,6 +763,7 @@ class RForkModelLoader(BaseModelLoader):
                 )
 
             if model_init_started:
+                # Partial constructors leave cycles even with no model; reclaim before fallback.
                 model = None
                 for _ in range(FALLBACK_MEMORY_RECLAIM_PASSES):
                     gc.collect()
@@ -646,7 +773,7 @@ class RForkModelLoader(BaseModelLoader):
 
             # Advertise fallback only via an existing session; startup failure cleans its MR but keeps the model.
             if session is not None and cleanup_result is not None and cleanup_result.can_schedule_seed:
-                _start_rfork_seed_service(
+                _publish_rfork_seed(
                     session,
                     model,
                     processed_layout_transfer,

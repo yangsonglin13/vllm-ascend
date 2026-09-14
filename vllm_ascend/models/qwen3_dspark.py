@@ -32,6 +32,7 @@ class AscendQwen3DSparkForCausalLM(Qwen3DSparkForCausalLM):
         self.rotation_path = get_rotation_path(vllm_config) if vllm_config.quant_config is not None else None
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
+        rotation_weight = None
         if self.rotation_path is not None:
             processed_weights: list[tuple[str, torch.Tensor]] = []
             rotation_weight = get_rotataion_matrix(self.rotation_path)
@@ -39,6 +40,6 @@ class AscendQwen3DSparkForCausalLM(Qwen3DSparkForCausalLM):
                 if "fc." in name:
                     loaded_weight = process_weight(loaded_weight, rotation_weight)
                 processed_weights.append((name, loaded_weight))
-            super().load_weights(processed_weights)
-        else:
-            super().load_weights(weights)
+            weights = processed_weights
+        self.fc_rotation_applied = rotation_weight is not None
+        return super().load_weights(weights)

@@ -51,6 +51,7 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_man
     prepare_sparse_kv_offload_mtp_dummy_metadata,
 )
 from vllm_ascend.distributed.parallel_state import get_lmhead_tp_group
+from vllm_ascend.model_loader.rfork.load_state import finish_rfork_deferred_seed_start
 from vllm_ascend.models.deepseek_v4_dspark import DSparkDeepseekV4ForCausalLM
 from vllm_ascend.models.kimi_k3_dspark import K3DSparkForCausalLM
 from vllm_ascend.models.llama_eagle3_vwn import Eagle3VwnLlamaForCausalLM
@@ -535,6 +536,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         self._maybe_share_embeddings(target_language_model)
         self._maybe_share_topk_indices(target_language_model)
         self._maybe_share_lm_head(model)
+        finish_rfork_deferred_seed_start(self, self.model, model)
         # The draft FC, embedding, and lm_head boundaries are now aligned.
         # Release the temporary full-precision rotation before graph capture.
         self._quarot_rotation = None

@@ -3,7 +3,7 @@
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Any
@@ -83,5 +83,9 @@ class SeedAdvertisement:
 class SeedTransferInfo:
     session_id: str
     weights: Mapping[str, Any]
+    # Weight names the seed shares with its target; receivers skip them and bind the local target's tensors.
+    shared_names: Sequence[str] | None = None
     # NPU storage format per weight; receivers reject divergent layouts.
     formats: Mapping[str, Any] | None = None
+    # Non-tensor load state (see load_state.py); receivers restore it since they never run load_weights.
+    load_state: Mapping[str, Any] | None = None

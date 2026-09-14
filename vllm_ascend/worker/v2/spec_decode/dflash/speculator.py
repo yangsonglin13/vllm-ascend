@@ -16,6 +16,7 @@ from vllm.v1.worker.gpu.spec_decode.dflash.speculator import (
     DFlashSpeculator,
 )
 
+from vllm_ascend.model_loader.rfork.load_state import finish_rfork_deferred_seed_start
 from vllm_ascend.utils import vllm_version_is
 from vllm_ascend.worker.v2.attn_utils import build_attn_metadata_wrapper
 
@@ -23,6 +24,15 @@ logger = logging.getLogger(__name__)
 
 
 class AscendDFlashSpeculator(DFlashSpeculator):
+    def load_draft_model(
+        self,
+        target_model: torch.nn.Module,
+        target_attn_layer_names: set[str],
+    ) -> torch.nn.Module:
+        model = super().load_draft_model(target_model, target_attn_layer_names)
+        finish_rfork_deferred_seed_start(self, model, target_model)
+        return model
+
     # NOTE: upstream vLLM named this to _build_draft_attn_metadatas;
     # keep the current name for now as upstream may change it again.
     # The signature is split on vllm_version_is: v0.26.0's

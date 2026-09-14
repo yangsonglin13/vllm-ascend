@@ -29,10 +29,10 @@ from vllm_ascend.model_loader.rfork.rfork_loader import (
     _is_draft_model,
     _is_dynamic_eplb_enabled,
     _make_fallback_load_config,
+    _publish_rfork_seed,
     _reset_process_global_model_state,
     _rfork_pre_transfer_weight_processing,
     _rfork_skip_unquantized_moe_post_load_processing,
-    _start_rfork_seed_service,
 )
 from vllm_ascend.model_loader.rfork.types import (
     RForkFallbackCleanupResult,
@@ -834,7 +834,7 @@ def test_rfork_seed_start_exception_does_not_escape(monkeypatch):
         lambda *args, **kwargs: exceptions.append(args),
     )
 
-    assert not _start_rfork_seed_service(
+    _publish_rfork_seed(
         _Session(),  # type: ignore[arg-type]
         object(),
         False,
@@ -842,6 +842,20 @@ def test_rfork_seed_start_exception_does_not_escape(monkeypatch):
         load_source="fallback",
     )
     assert any("seed service startup raised" in args[0] for args in exceptions)
+
+
+def test_rfork_draft_seed_start_is_deferred():
+    calls = []
+
+    session = SimpleNamespace(
+        identity=SimpleNamespace(is_draft_model=True),
+        schedule_deferred_seed_start=lambda *args: calls.append(args),
+    )
+    model = object()
+
+    _publish_rfork_seed(session, model, False, [], load_source="transfer")
+
+    assert calls == [(model, False, [])]
 
 
 def test_rfork_fallback_clears_only_failed_model_state_before_reinit(monkeypatch):

@@ -39,6 +39,7 @@ def live_session(runtime, monkeypatch):
     session.planner.remove_seed.return_value = True
     session.transfer_backend.transfer_session_id = "native-session"
     session.transfer_backend.weight_manifest = {"weight": [1234, 4, 4, [4], "float32"]}
+    session.transfer_backend.shared_with_target_names = ["model.embed_tokens.weight"]
     session.transfer_backend.weight_formats = {"weight": 2}
     handles = []
     original = module.start_rfork_server
@@ -60,14 +61,17 @@ def live_session(runtime, monkeypatch):
 
 def test_session_serves_real_metadata_and_closes_listener(live_session):
     r = live_session
-    assert r.session.start_seed_service(object(), True) is r.runtime.types.RForkSeedServiceStartResult.STARTED
+    model = SimpleNamespace(has_own_lm_head=False)
+    assert r.session.start_seed_service(model, True) is r.runtime.types.RForkSeedServiceStartResult.STARTED
     handle = r.session.seed_server
     assert handle.is_alive
     url = f"http://127.0.0.1:{handle.port}"
     info = r.client.fetch_seed_transfer_info(url, "live-key", 1.0)
     assert info.session_id == "native-session"
     assert info.weights == r.session.transfer_backend.weight_manifest
+    assert info.shared_names == ["model.embed_tokens.weight"]
     assert info.formats == r.session.transfer_backend.weight_formats
+    assert info.load_state == {"has_own_lm_head": False}
     assert requests.get(f"{url}/health_check_with_key", params={"seed_key": "wrong"}, timeout=1).status_code == 400
     r.session.planner.report_seed_once.assert_called_once_with(handle.port, seed_ip="127.0.0.1")
     assert r.session.shutdown()
