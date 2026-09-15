@@ -1,0 +1,216 @@
+From 09b8eeae734ae1757a26fcd4f0ef4c1afb605999 Mon Sep 17 00:00:00 2001
+From: yangsonglin13 <yangsonglin566@gmail.com>
+Date: Mon, 14 Sep 2026 15:58:02 +0800
+Subject: [PATCH 6/6] fix(rfork): release compiled model hooks before fallback
+
+Remove TorchDynamo bytecode hooks owned by discarded RFork models before fallback allocation. Snapshot hook IDs before initialization to cover partially constructed models while preserving existing target hooks and unrelated callbacks.
+
+Add regression coverage using the real Dynamo registry and weak references for seed misses, initialization/layout/transfer failures, successful loading, and lazy Dynamo import. Eight regression cases failed before the fix and pass afterward.
+
+Validation: 149 CPU-isolated RFork tests passed; Ruff check/format and git diff checks passed. NPU reproduction and full runtime integration remain pending.
+Signed-off-by: yangsonglin13 <yangsonglin566@gmail.com>
+---
+ .../rfork/test_late_lease_isolated.py         | 93 +++++++++++++++++++
+ .../model_loader/rfork/rfork_loader.py        | 50 +++++++++-
+ 2 files changed, 142 insertions(+), 1 deletion(-)
+
+diff --git a/tests/ut/model_loader/rfork/test_late_lease_isolated.py b/tests/ut/model_loader/rfork/test_late_lease_isolated.py
+index 8d5721959..a52d9b156 100644
+--- a/tests/ut/model_loader/rfork/test_late_lease_isolated.py
++++ b/tests/ut/model_loader/rfork/test_late_lease_isolated.py
+@@ -11,10 +11,103 @@ from unittest.mock import Mock
+ 
+ import pytest
+ import torch
++from torch._dynamo.convert_frame import _bytecode_hooks, register_bytecode_hook
+ 
+ from tests.ut.model_loader.rfork.test_lease_release import runtime as runtime
+ 
+ 
++@pytest.mark.parametrize("failure", ["seed_miss", "initialize", "layout", "transfer", "success"])
++@pytest.mark.parametrize("preexisting_hook", [False, True])
++def test_fallback_releases_compiled_model_before_second_model(loader_runtime, monkeypatch, failure, preexisting_hook):
++    """Use Dynamo's real global hook registry, which strongly owns bound methods."""
++    r = loader_runtime
++    handles = []
++    refs = {}
++
++    class CompiledModel(torch.nn.Module):
++        def __init__(self):
++            super().__init__()
++            self.weight = torch.nn.Parameter(torch.ones(4))
++            # TorchCompileWithNoGuardsWrapper registers this during __init__,
++            # before any forward/compilation and even inside a partial model.
++            self._bytecode_hook_handle = register_bytecode_hook(self.bytecode_hook)
++            handles.append(self._bytecode_hook_handle)
++
++        def bytecode_hook(self, old_code, new_code):
++            return None
++
++    try:
++        target = CompiledModel() if preexisting_hook else None
++        baseline = dict(_bytecode_hooks)
++
++        def initialize(**kwargs):
++            model = torch.nn.Module()
++            model.decoder = CompiledModel()
++            refs["decoder"] = weakref.ref(model.decoder)
++            refs["weight"] = weakref.ref(model.decoder.weight)
++            refs["hook_id"] = model.decoder._bytecode_hook_handle.id
++            # A callback unrelated to vLLM model ownership must survive rollback.
++            unrelated = register_bytecode_hook(lambda old_code, new_code: None)
++            handles.append(unrelated)
++            refs["unrelated_hook_id"] = unrelated.id
++            if failure == "initialize":
++                raise RuntimeError("outer model constructor failed after decoder initialization")
++            return model
++
++        def fallback(**kwargs):
++            assert refs["hook_id"] not in _bytecode_hooks
++            assert refs["decoder"]() is None, "Dynamo still owns the discarded compiled model"
++            assert refs["weight"]() is None, "discarded compiled weights survive into fallback"
++            assert refs["unrelated_hook_id"] in _bytecode_hooks
++            for hook_id, hook in baseline.items():
++                assert _bytecode_hooks[hook_id] is hook
++            if target is not None:
++                assert target.weight.numel() == 4
++            return r.fallback
++
++        monkeypatch.setattr(r.module, "initialize_model", initialize)
++        monkeypatch.setattr(r.loader, "_requires_processed_layout_transfer", lambda config: True)
++        monkeypatch.setattr(sys.modules["vllm.model_executor.model_loader"], "get_model", fallback)
++        # Mock call histories would themselves retain the model argument.
++        monkeypatch.setattr(r.session, "transfer_from_seed", lambda *args: failure != "transfer")
++        r.session.acquire_seed.side_effect = lambda: failure != "seed_miss"
++        if failure == "layout":
++
++            def fail_layout(*args):
++                raise RuntimeError("layout processing failed")
++
++            monkeypatch.setattr(r.module, "process_weights_after_loading", fail_layout)
++        result = r.loader.load_model(r.vc, r.config)
++        if failure == "success":
++            assert refs["decoder"]() is result.decoder
++            assert _bytecode_hooks[refs["hook_id"]].__self__ is result.decoder
++        else:
++            assert result is r.fallback
++    finally:
++        for handle in handles:
++            handle.remove()
++
++
++def test_fallback_cleans_hooks_when_dynamo_was_imported_during_initialization(loader_runtime, monkeypatch):
++    r = loader_runtime
++    name = "torch._dynamo.convert_frame"
++    # Snapshot must not force-import Dynamo in configurations that never use it.
++    with monkeypatch.context() as context:
++        context.delitem(sys.modules, name)
++        snapshot = r.module._snapshot_process_global_model_state(r.vc)
++        assert name not in sys.modules
++        assert not snapshot.dynamo_bytecode_hook_ids
++    # An outer constructor can fail after an inner compiled model registered.
++    decoder = torch.nn.Linear(4, 4)
++    handle = register_bytecode_hook(decoder.forward)
++    decoder._bytecode_hook_handle = handle
++    try:
++        r.module._reset_process_global_model_state(r.vc, None, snapshot)
++        assert handle.id not in _bytecode_hooks
++    finally:
++        handle.remove()
++
++
+ @pytest.mark.parametrize("failure", ["seed_miss", "initialize", "layout", "transfer"])
+ @pytest.mark.parametrize("preexisting_registry", [False, True])
+ def test_fallback_releases_eplb_weights_before_second_model(loader_runtime, monkeypatch, failure, preexisting_registry):
+diff --git a/vllm_ascend/model_loader/rfork/rfork_loader.py b/vllm_ascend/model_loader/rfork/rfork_loader.py
+index 1ebea67a0..097678e54 100644
+--- a/vllm_ascend/model_loader/rfork/rfork_loader.py
++++ b/vllm_ascend/model_loader/rfork/rfork_loader.py
+@@ -26,6 +26,7 @@ from typing import Any, cast
+ import torch
+ import torch.nn as nn
+ from torch.nn import Module
++from torch.utils.hooks import RemovableHandle
+ from vllm.config import ModelConfig, VllmConfig
+ from vllm.config.load import LoadConfig
+ from vllm.distributed import get_tensor_model_parallel_rank
+@@ -66,6 +67,7 @@ class _RForkProcessGlobalModelState:
+     static_all_moe_layers: tuple[list[Any], list[Any]] | None
+     rope_cache: dict[Any, Any] | None
+     ascend_moe_layers: list[Any] | None = None
++    dynamo_bytecode_hook_ids: frozenset[int] = frozenset()
+ 
+ 
+ def _is_rfork_summary_rank(session: RForkSession) -> bool:
+@@ -185,6 +187,45 @@ def _get_ascend_moe_registry() -> list[Any] | None:
+     return layers if isinstance(layers, list) else None
+ 
+ 
++def _get_dynamo_bytecode_hooks() -> dict[int, Any]:
++    # Do not import Dynamo just to snapshot it. Model construction may load it
++    # for the first time, in which case the pre-attempt hook set is empty.
++    module = sys.modules.get("torch._dynamo.convert_frame")
++    hooks = getattr(module, "_bytecode_hooks", None)
++    return hooks if isinstance(hooks, dict) else {}
++
++
++def _remove_discarded_compilation_hooks(
++    stale_module_ids: set[int], snapshot: _RForkProcessGlobalModelState | None
++) -> None:
++    """Detach vLLM compiler callbacks before collecting a failed model attempt.
++
++    TorchCompileWithNoGuardsWrapper registers a bound bytecode_hook during
++    construction. Dynamo's global registry therefore owns the whole decoder,
++    even before the first forward. GC cannot reclaim it until its handle is
++    removed. Use the pre-attempt IDs to find partially constructed models too,
++    while preserving existing target hooks and unrelated compiler callbacks.
++    """
++    hooks = _get_dynamo_bytecode_hooks()
++    removed_count = 0
++    for hook_id, hook in list(hooks.items()):
++        if snapshot is not None and hook_id in snapshot.dynamo_bytecode_hook_ids:
++            continue
++        owner = getattr(hook, "__self__", None)
++        if not isinstance(owner, Module):
++            continue
++        if snapshot is None and id(owner) not in stale_module_ids:
++            continue
++        handle = getattr(owner, "_bytecode_hook_handle", None)
++        if isinstance(handle, RemovableHandle) and handle.id == hook_id and handle.hooks_dict_ref() is hooks:
++            # This is the same operation as vLLM's wrapper.cleanup(), without
++            # importing version-specific wrapper classes or invoking model code.
++            handle.remove()
++            removed_count += 1
++    if removed_count:
++        logger.info("RFork fallback removed %d discarded model compilation hooks.", removed_count)
++
++
+ def _snapshot_process_global_model_state(vllm_config: VllmConfig) -> _RForkProcessGlobalModelState:
+     """Snapshot registries that model construction can mutate in the process."""
+     static_forward_context: tuple[dict[Any, Any], dict[Any, Any]] | None = None
+@@ -212,7 +253,13 @@ def _snapshot_process_global_model_state(vllm_config: VllmConfig) -> _RForkProce
+ 
+     ascend_moe_registry = _get_ascend_moe_registry()
+     ascend_moe_layers = list(ascend_moe_registry) if ascend_moe_registry is not None else None
+-    return _RForkProcessGlobalModelState(static_forward_context, static_all_moe_layers, rope_cache, ascend_moe_layers)
++    return _RForkProcessGlobalModelState(
++        static_forward_context,
++        static_all_moe_layers,
++        rope_cache,
++        ascend_moe_layers,
++        frozenset(_get_dynamo_bytecode_hooks()),
++    )
+ 
+ 
+ def _reset_process_global_model_state(
+@@ -227,6 +274,7 @@ def _reset_process_global_model_state(
+     entries that were added by an earlier successful model load.
+     """
+     stale_module_ids = {id(module) for module in model.modules()} if model is not None else set()
++    _remove_discarded_compilation_hooks(stale_module_ids, snapshot)
+     # AscendMoERunner registers itself even when dynamic EPLB is disabled.
+     # Leaving those references alive retains expert weights across fallback.
+     # Restore in place because an existing adaptor can share this list; keep
+-- 
+2.51.0.windows.1
+
