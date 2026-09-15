@@ -77,7 +77,7 @@ Enable RFork with `--load-format rfork` and pass a JSON object through
 | `rfork_seed_timeout_sec` | `5.0` | Positive seed-server startup timeout. |
 | `rfork_request_timeout_sec` | `10.0` | Positive HTTP connect/read timeout. |
 | `rfork_heartbeat_interval_sec` | `30.0` | Positive JSON-only heartbeat interval. |
-| `rfork_lease_release_max_attempts` | `3` | Positive JSON-only release-attempt limit. |
+| `rfork_lease_release_max_attempts` | `3` | Positive JSON-only fast-attempt count before slower background retries for transient failures. Permanent rejection still stops retries. |
 | `rfork_lease_release_retry_interval_sec` | `30.0` | Positive JSON-only retry interval. |
 | `rfork_seed_bind_host` | `0.0.0.0` | Local seed HTTP bind address. |
 | `rfork_seed_advertise_host` | auto | Address reported to the planner. |
@@ -100,10 +100,33 @@ Explicit valid JSON values take precedence over environment variables.
 ## Compatibility key and manifest
 
 The planner key includes the complete normalized Hugging Face configuration,
-model revision, deployment strategy, parallel topology, and Ascend
-weight-layout policy. Revision matching prefers the resolved checkpoint commit
-hash. Use immutable model identities for local checkpoints because RFork does
-not hash checkpoint contents.
+model revision, deployment strategy, parallel topology, device type, and Ascend
+weight-layout policy. The effective KV producer/consumer role always isolates
+P/D seeds because SFA/MLA post-load processing can materialize different
+weights. Other known construction or weight-layout switches remain isolated:
+MLAPO and sparse-SFA layouts; DSA-CP; fine-grained module TP sizes and their DP
+layout rank; MoE shared-expert layout; model-runner generation; model length,
+batched-token and cache sizing; speculative method and draft layout; effective
+per-layer quantization; and selected Multimodal tower/pruning/parallel and
+LoRA/prompt-adapter/pooler layout fields. These can change RFork-transferable
+tensor names, shapes, dtypes, formats, or derived contents even with the same
+checkpoint. The descriptor is hashed, so the logged fingerprint is always 64
+hexadecimal characters regardless of field count.
+
+Runtime-only settings such as logging paths, planner addresses, lease timeouts,
+request scheduling policies, KV-connector network endpoints, ACLGraph capture
+sizes, request-count capacity, and KV-cache layout options are excluded because
+they do not materialize tensors collected from the model for RFork weight
+transfer. The DSA metadata-builder buffers sized by graph capture are outside
+that model-tensor collection. Revision matching prefers the
+resolved checkpoint commit hash. Use immutable model identities for local
+checkpoints because RFork does not hash checkpoint contents. RFork still
+validates the final manifest and falls back instead of copying incompatible
+tensors; update this descriptor whenever a new post-load layout switch is added.
+This config audit covers the currently known model and attention construction
+paths; it is not a promise that future model adapters cannot add new switches.
+Dynamic EPLB and static expert maps bypass RFork before fingerprinting because
+their placement cannot be transferred safely.
 
 RFork intentionally supports only its current metadata protocol; mixed RFork
 versions are rejected through a mandatory protocol-version field. Every
@@ -201,9 +224,20 @@ vllm serve <model_path> \
   latency, seed hit rate, and fallback rate under realistic concurrency.
 
 Successful loads log `source=transfer`, `local`, `fallback`, or `shared_target`.
+Successful TP0 weight reads also log transfer elapsed time, bytes, chunks, and
+throughput at INFO; other TP ranks and per-chunk timings remain at DEBUG.
 Set `VLLM_LOGGING_LEVEL=DEBUG` for per-rank registration, metadata, transfer,
 lease-release, and publication timing.
 
 Each heartbeat verifies that the seed HTTP thread is still alive. If it exits,
 RFork stops heartbeats and attempts to remove the advertisement while leaving
 the already loaded model available for inference.
+
+If the planner is temporarily unreachable, inference continues. A seed whose
+first advertisement fails due to a retryable network or server error keeps its
+HTTP service and registered weights available while heartbeats retry. Later
+successful reports restore planner discovery. Transient lease-release failures
+also continue in the background after the fast-attempt count, at a slower rate;
+the worker does not advertise itself as a new seed until the release is
+acknowledged. Permanent planner rejections still stop promotion. Planner outage
+logs are limited to the first failure, periodic summaries, and recovery events.

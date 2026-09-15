@@ -27,13 +27,17 @@ from vllm_ascend.model_loader.rfork.types import (
     RForkLifecycleState,
     RForkSeedServiceStartResult,
     SeedLease,
+    SeedReportStatus,
     SeedTransferInfo,
 )
 
 HEARTBEAT_STOP_GRACE_SEC = 1.0
 HEARTBEAT_LOG_EVERY_N = 4
+HEARTBEAT_FAILURE_LOG_EVERY_N = 20
 LEASE_RENEW_MIN_INTERVAL_SEC = 0.1
 LEASE_RENEW_MAX_INTERVAL_SEC = 30.0
+LEASE_RELEASE_DEGRADED_RETRY_INTERVAL_SEC = 60.0
+LEASE_RELEASE_DEGRADED_LOG_EVERY_N = 10
 
 
 class RForkSession:
@@ -50,7 +54,7 @@ class RForkSession:
         self.config = config
         self.identity = identity
         self.planner = RForkPlannerClient(config, identity)
-        self.transfer_backend = RForkTransferBackend()
+        self.transfer_backend = RForkTransferBackend(tp_rank=identity.tp_rank)
         self.state = RForkLifecycleState.INITIALIZED
         self.seed_lease: SeedLease | None = None
         self.seed_server: RForkSeedServerHandle | None = None
@@ -237,9 +241,10 @@ class RForkSession:
         try:
             while not self.lease_release_stop_event.is_set():
                 # Wait only between attempts, never before the initial release.
-                if self._lease_release_attempts and self.lease_release_stop_event.wait(
-                    self.config.lease_release_retry_interval_sec
-                ):
+                retry_interval = self.config.lease_release_retry_interval_sec
+                if self._lease_release_attempts >= self.config.lease_release_max_attempts:
+                    retry_interval = max(retry_interval, LEASE_RELEASE_DEGRADED_RETRY_INTERVAL_SEC)
+                if self._lease_release_attempts and self.lease_release_stop_event.wait(retry_interval):
                     return
                 with self._lock:
                     if self.state is RForkLifecycleState.FINALIZED or self.seed_lease is None:
@@ -277,15 +282,18 @@ class RForkSession:
             time.monotonic() - acquired_at if acquired_at is not None else 0.0,
         )
         if result is LeaseReleaseResult.RELEASED:
+            if self._lease_release_attempts > 1:
+                logger.info(
+                    "RFork planner lease release recovered: lease=%s attempts=%d",
+                    lease_log_id(lease),
+                    self._lease_release_attempts,
+                )
             self.seed_lease = None
             self._lease_acquired_at = None
             if self.state is RForkLifecycleState.LEASED:
                 self.state = RForkLifecycleState.REGISTERED
             return True
-        if (
-            result is LeaseReleaseResult.REJECTED
-            or self._lease_release_attempts >= self.config.lease_release_max_attempts
-        ):
+        if result is LeaseReleaseResult.REJECTED:
             self._lease_release_exhausted = True
             self._deferred_seed_start = None
             self._deferred_seed_awaiting_sharing = False
@@ -296,6 +304,22 @@ class RForkSession:
                 self._lease_release_attempts,
             )
             return True
+        if (
+            self._lease_release_attempts == 1
+            or self._lease_release_attempts == self.config.lease_release_max_attempts
+            or (
+                self._lease_release_attempts > self.config.lease_release_max_attempts
+                and (self._lease_release_attempts - self.config.lease_release_max_attempts)
+                % LEASE_RELEASE_DEGRADED_LOG_EVERY_N
+                == 0
+            )
+        ):
+            logger.warning(
+                "RFork planner lease release is temporarily unavailable: lease=%s attempts=%d; "
+                "background retries continue.",
+                lease_log_id(lease),
+                self._lease_release_attempts,
+            )
         return False
 
     def _release_seed_locked(self) -> bool:
@@ -527,8 +551,13 @@ class RForkSession:
                     raise RuntimeError("shutdown requested during seed server startup")
             if not handle.is_alive:
                 raise RuntimeError("seed HTTP server exited before advertisement")
-            if not self.planner.report_seed_once(handle.port, seed_ip=self.config.seed_advertise_host):
-                raise RuntimeError("planner rejected the initial seed advertisement")
+            initial_report = self.planner.report_seed_once(handle.port, seed_ip=self.config.seed_advertise_host)
+            pending_report = not initial_report
+            if pending_report and getattr(initial_report, "status", None) is not SeedReportStatus.RETRYABLE:
+                raise RuntimeError(
+                    "planner rejected the initial seed advertisement: "
+                    f"{getattr(initial_report, 'reason', 'unknown error')}"
+                )
 
             with self._lock:
                 if self.lease_release_stop_event.is_set():
@@ -538,7 +567,7 @@ class RForkSession:
                 self.heartbeat_stop_event = threading.Event()
                 self.heartbeat_thread = threading.Thread(
                     target=self._run_seed_heartbeat,
-                    args=(handle, self.heartbeat_stop_event),
+                    args=(handle, self.heartbeat_stop_event, int(pending_report)),
                     daemon=True,
                     name="RForkHeartbeat",
                 )
@@ -553,6 +582,13 @@ class RForkSession:
                 self.identity.global_rank,
                 handle.port,
             )
+            if pending_report:
+                logger.warning(
+                    "RFork seed service is running but planner advertisement is pending for seed_key=%s: %s; "
+                    "background heartbeats will retry.",
+                    self.planner.seed_key,
+                    initial_report.reason,
+                )
             return True
         except Exception as exc:
             with self._lock:
@@ -562,9 +598,12 @@ class RForkSession:
             logger.warning("RFork seed service startup failed for global_rank=%s: %s", self.identity.global_rank, exc)
             return False
 
-    def _run_seed_heartbeat(self, handle: RForkSeedServerHandle, stop_event: threading.Event) -> None:
+    def _run_seed_heartbeat(
+        self, handle: RForkSeedServerHandle, stop_event: threading.Event, report_failures: int = 0
+    ) -> None:
         # Do not take _seed_lifecycle_lock: shutdown owns it while joining this thread; native cleanup stays elsewhere.
         heartbeat_index = 0
+        withdrawal_reason = "seed service failure"
         while not stop_event.wait(self.config.heartbeat_interval_sec):
             if not handle.is_alive:
                 break
@@ -578,10 +617,30 @@ class RForkSession:
             # Server may exit while add_seed is in flight; revoke that advertisement even if the report succeeded.
             if not handle.is_alive:
                 break
+            if getattr(reported, "status", None) is SeedReportStatus.REJECTED:
+                withdrawal_reason = (
+                    f"planner rejected seed heartbeat for seed_key={self.planner.seed_key}: {reported.reason}"
+                )
+                break
             if not reported:
-                logger.warning("RFork heartbeat failed for seed_key=%s", self.planner.seed_key)
+                report_failures += 1
+                if report_failures == 1 or report_failures % HEARTBEAT_FAILURE_LOG_EVERY_N == 0:
+                    logger.warning(
+                        "RFork planner seed heartbeat is temporarily unavailable for seed_key=%s: %s "
+                        "(consecutive failures=%d); background retries continue.",
+                        self.planner.seed_key,
+                        getattr(reported, "reason", "unknown error"),
+                        report_failures,
+                    )
             elif heartbeat_index % HEARTBEAT_LOG_EVERY_N == 0:
                 logger.debug("RFork heartbeat accepted for seed_key=%s", self.planner.seed_key)
+            if reported and report_failures:
+                logger.info(
+                    "RFork planner seed heartbeat recovered for seed_key=%s after %d failed reports.",
+                    self.planner.seed_key,
+                    report_failures,
+                )
+                report_failures = 0
         else:
             return
 
@@ -590,7 +649,7 @@ class RForkSession:
                 return
             stop_event.set()
             self.state = RForkLifecycleState.CLEANUP_REQUIRED
-        logger.error("RFork seed heartbeat stopped after a service failure; inference can continue.")
+        logger.error("RFork seed heartbeat stopped after %s; inference can continue.", withdrawal_reason)
         try:
             removed = self.planner.remove_seed()
         except Exception:

@@ -785,25 +785,21 @@ def test_read_weights_from_seed_clears_seed_shared_names_on_failure(monkeypatch)
     assert backend.seed_shared_names == []
 
 
-def test_read_weights_from_seed_defensively_skips_pre_registered_weights(monkeypatch):
+def test_read_weights_from_seed_rejects_missing_registration_cache(monkeypatch):
     storage = torch.arange(100, dtype=torch.float32)
-    shared_weight = storage[:10]
     own_weight = storage[20:32]
     backend = RForkTransferBackend()
+    reads = []
     backend.transfer_engine = SimpleNamespace(
-        batch_transfer_sync_read=lambda *args: SimpleNamespace(is_error=lambda: False)
+        batch_transfer_sync_read=lambda *args: _append_and_return(reads, args, SimpleNamespace(is_error=lambda: False))
     )
     backend.excluded_weight_blocks = [(storage.data_ptr(), 40)]
     backend._registered_transferable_tensors = None
 
-    monkeypatch.setattr(
-        transfer_backend,
-        "collect_transferable_tensors",
-        lambda model, processed_layout: [
-            ("model.embed_tokens.weight", shared_weight),
-            ("layers.0.fc.weight", own_weight),
-        ],
-    )
+    def fail_if_rescanned(*_args):
+        raise AssertionError("RFork must not rescan tensors after registration is lost")
+
+    monkeypatch.setattr(transfer_backend, "collect_transferable_tensors", fail_if_rescanned)
 
     seed_info = SeedTransferInfo(
         "seed-session",
@@ -819,7 +815,8 @@ def test_read_weights_from_seed_defensively_skips_pre_registered_weights(monkeyp
         formats={"layers.0.fc.weight": 0},
     )
 
-    assert backend.read_weights_from_seed(object(), seed_info, True)
+    assert not backend.read_weights_from_seed(object(), seed_info, True)
+    assert reads == []
 
 
 def test_read_weights_from_seed_fails_for_unknown_weight_outside_shared_blocks(monkeypatch):

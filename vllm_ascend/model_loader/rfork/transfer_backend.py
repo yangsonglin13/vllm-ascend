@@ -201,7 +201,8 @@ def _validate_transferable_tensor_layouts(transferable_tensors: list[tuple[str, 
 class RForkTransferBackend:
     """Own one YuanRong TransferEngine and its registered model memory."""
 
-    def __init__(self) -> None:
+    def __init__(self, tp_rank: int | None = None) -> None:
+        self.tp_rank = tp_rank
         self.transfer_engine: Any | None = None
         self.transfer_session_id: str | None = None
         self.weight_manifest: dict[str, Any] | None = None
@@ -645,7 +646,8 @@ class RForkTransferBackend:
 
         transferable_tensors = self._registered_transferable_tensors
         if transferable_tensors is None:
-            transferable_tensors = list(collect_transferable_tensors(model, processed_layout))
+            logger.error("RFork cannot read seed weights without a successful destination registration.")
+            return False
         _validate_transferable_tensor_layouts(transferable_tensors)
         if not transferable_tensors:
             if self._all_transferable_tensors_excluded and self.weight_manifest == {} and not seed_info.weights:
@@ -685,16 +687,10 @@ class RForkTransferBackend:
         # Drop leftovers from a previous transfer attempt.
         self.seed_shared_names = []
         if local_only:
-            for name, tensor in transferable_tensors:
+            for name, _ in transferable_tensors:
                 if name not in local_only:
                     continue
-                if _is_tensor_in_blocks(tensor, excluded_blocks):
-                    logger.debug(
-                        "Skip RFork weight %s shared with the target model: not present in the seed manifest.",
-                        name,
-                    )
-                    skipped_shared_names.add(name)
-                elif name in seed_shared_names:
+                if name in seed_shared_names:
                     # Seed registered after target sharing, so its manifest lacks this name; spec-decode rebinds it.
                     logger.info(
                         "Skip RFork weight %s shared with the seed's target model; "
@@ -809,9 +805,11 @@ class RForkTransferBackend:
             )
         transfer_elapsed = time.perf_counter() - transfer_start
         throughput_gib_s = total_gib / transfer_elapsed if transfer_elapsed > 0 else 0.0
-        logger.debug(
-            "RFork weight transfer completed: weights=%d, chunks=%d, bytes=%.2f GiB, "
+        log_transfer = logger.info if self.tp_rank == 0 else logger.debug
+        log_transfer(
+            "RFork weight transfer completed: tp_rank=%s, weights=%d, chunks=%d, bytes=%.2f GiB, "
             "elapsed=%.4fs, throughput=%.2f GiB/s",
+            self.tp_rank,
             len(client_len_list),
             len(chunks),
             total_gib,

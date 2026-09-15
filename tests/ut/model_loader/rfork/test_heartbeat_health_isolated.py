@@ -34,6 +34,26 @@ def test_healthy_heartbeat_waits_and_reports_at_configured_interval(runtime):
     assert session.state is runtime.types.RForkLifecycleState.SERVING
 
 
+def test_planner_outage_logs_initial_failure_and_periodic_summary_then_recovery(runtime, monkeypatch):
+    session, handle = make_serving_session(runtime)
+    retryable = runtime.types.SeedReportResult(runtime.types.SeedReportStatus.RETRYABLE, "ConnectTimeout")
+    accepted = runtime.types.SeedReportResult(runtime.types.SeedReportStatus.ACCEPTED)
+    session.planner.report_seed_once.side_effect = [retryable] * 21 + [accepted]
+    stop = Mock()
+    stop.wait.side_effect = [False] * 22 + [True]
+    warning = Mock()
+    info = Mock()
+    monkeypatch.setattr(runtime.session.logger, "warning", warning)
+    monkeypatch.setattr(runtime.session.logger, "info", info)
+
+    session._run_seed_heartbeat(handle, stop)
+
+    assert session.planner.report_seed_once.call_count == 22
+    assert warning.call_count == 2
+    info.assert_called_once()
+    assert session.state is runtime.types.RForkLifecycleState.SERVING
+
+
 @pytest.mark.parametrize(
     ("phase", "removal"),
     [("before_report", "ok"), ("during_report", "failed"), ("report_exception", "exception")],
