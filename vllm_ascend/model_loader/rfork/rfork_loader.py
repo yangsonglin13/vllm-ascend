@@ -41,7 +41,7 @@ from vllm.model_executor.model_loader.utils import (
 from vllm.utils.torch_utils import set_default_torch_dtype
 
 from vllm_ascend.ascend_config import get_ascend_config
-from vllm_ascend.device.hardware_profile import get_current_hardware_profile
+from vllm_ascend.model_loader.rfork.compat import get_current_hardware_profile
 from vllm_ascend.model_loader.rfork.config import RForkConfig
 from vllm_ascend.model_loader.rfork.identity import build_compatibility_fingerprint
 from vllm_ascend.model_loader.rfork.safety import mutable_weights_bypass_reason
@@ -220,6 +220,18 @@ def _get_dynamo_bytecode_hooks() -> dict[int, Any]:
     return hooks if isinstance(hooks, dict) else {}
 
 
+def _get_ascend_moe_counter_owner() -> Any:
+    candidates = (
+        ("vllm_ascend.ops.fused_moe.routed_experts", "AscendRoutedExperts"),
+        ("vllm_ascend.ops.fused_moe.fused_moe", "AscendMoERunner"),
+    )
+    for module_name, class_name in candidates:
+        owner = getattr(sys.modules.get(module_name), class_name, None)
+        if owner is not None and hasattr(owner, "moe_counter"):
+            return owner
+    return None
+
+
 def _remove_discarded_compilation_hooks(
     stale_module_ids: set[int], snapshot: _RForkProcessGlobalModelState | None
 ) -> None:
@@ -282,8 +294,8 @@ def _snapshot_process_global_model_state(vllm_config: VllmConfig) -> _RForkProce
     adaptor = getattr(sys.modules.get("vllm_ascend.eplb.adaptor.vllm_adaptor"), "VllmEplbAdaptor", None)
     registry = getattr(adaptor, "_registered_moe_layers", None)
     ascend_moe_layers = (registry, list(registry)) if isinstance(registry, list) else None
-    routed_experts = getattr(sys.modules.get("vllm_ascend.ops.fused_moe.routed_experts"), "AscendRoutedExperts", None)
-    ascend_moe_counter = getattr(routed_experts, "moe_counter", INITIAL_ASCEND_MOE_COUNTER)
+    counter_owner = _get_ascend_moe_counter_owner()
+    ascend_moe_counter = getattr(counter_owner, "moe_counter", INITIAL_ASCEND_MOE_COUNTER)
     return _RForkProcessGlobalModelState(
         static_forward_context,
         static_all_moe_layers,
@@ -316,11 +328,9 @@ def _reset_process_global_model_state(
         else:
             registry[:] = [layer for layer in registry if id(layer) not in stale_module_ids]
     if snapshot is not None:
-        routed_experts = getattr(
-            sys.modules.get("vllm_ascend.ops.fused_moe.routed_experts"), "AscendRoutedExperts", None
-        )
-        if routed_experts is not None:
-            routed_experts.moe_counter = snapshot.ascend_moe_counter
+        counter_owner = _get_ascend_moe_counter_owner()
+        if counter_owner is not None:
+            counter_owner.moe_counter = snapshot.ascend_moe_counter
 
     removed_names: set[Any] = set()
     compilation_config = getattr(vllm_config, "compilation_config", None)

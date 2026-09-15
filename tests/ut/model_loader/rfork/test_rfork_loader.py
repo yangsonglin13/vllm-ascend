@@ -1063,12 +1063,12 @@ def test_rfork_pre_transfer_weight_processing_unwraps_and_restores_quant_methods
     assert quant_method.process_weights_after_loading is wrapped_process_weights
 
 
-def test_rfork_skips_only_unquantized_moe_post_load_processing(monkeypatch):
-    import vllm_ascend.ops.fused_moe.routed_experts as routed_experts_module
-
+def test_rfork_skips_only_storage_rewriting_moe_post_load_processing(monkeypatch):
     import vllm_ascend.ops.fused_moe.fused_moe as fused_moe_module
 
     class _FakeAscendUnquantizedFusedMoEMethod:
+        rewrites_weight_storage_after_loading = True
+
         def __init__(self, process_weights_after_loading):
             self.process_weights_after_loading = process_weights_after_loading
 
@@ -1101,11 +1101,6 @@ def test_rfork_skips_only_unquantized_moe_post_load_processing(monkeypatch):
                 ]
             )
 
-    monkeypatch.setattr(
-        routed_experts_module,
-        "AscendUnquantizedFusedMoEMethod",
-        _FakeAscendUnquantizedFusedMoEMethod,
-    )
     monkeypatch.setattr(fused_moe_module, "AscendMoERunner", _FakeAscendMoERunner)
 
     with _rfork_skip_unquantized_moe_post_load_processing(_FakeModule()):

@@ -27,7 +27,7 @@ import torch
 from vllm.config import ModelConfig, VllmConfig
 
 from vllm_ascend.ascend_config import get_ascend_config
-from vllm_ascend.device.hardware_profile import get_current_hardware_profile
+from vllm_ascend.model_loader.rfork.compat import get_current_hardware_profile
 from vllm_ascend.model_loader.rfork.types import RFORK_PROTOCOL_VERSION
 
 

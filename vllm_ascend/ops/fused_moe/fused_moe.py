@@ -111,6 +111,8 @@ def make_eplb_placement_config(eplb_config, num_redundant_experts: int) -> Simpl
 
 
 class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
+    rewrites_weight_storage_after_loading = True
+
     def __init__(self, moe: FusedMoEConfig = None, tid2eid=None):
         super().__init__(moe=moe)
         self.dynamic_eplb = get_ascend_config().eplb_config.dynamic_eplb
@@ -504,6 +506,7 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
                 return result
 
             self._quant_method.process_weights_after_loading = wrapped_process_weights  # type: ignore
+            self._quant_method.unvalidated_process_weights_after_loading = original_process_weights  # type: ignore
 
         # Register this MoE layer with EPLB for PP compatibility.
         # PPMissingLayer (nn.Identity) never calls AscendFusedMoE.__init__,
