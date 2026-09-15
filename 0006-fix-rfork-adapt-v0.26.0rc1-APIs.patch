@@ -1,0 +1,222 @@
+From 7c5afe9accd6a25900371f7e24b44962200bf7af Mon Sep 17 00:00:00 2001
+From: yangsonglin13 <yangsonglin566@gmail.com>
+Date: Tue, 15 Sep 2026 11:25:29 +0800
+Subject: [PATCH 6/7] fix(rfork): adapt v0.26.0rc1 APIs
+
+Resolve hardware-profile access through a lazy legacy fallback and map RFork MoE lifecycle contracts to the v0.26.0rc1 fused_moe implementation. Preserve the rc1 MoE counter during failed-load rollback and keep focused compatibility coverage.
+
+Signed-off-by: yangsonglin13 <yangsonglin566@gmail.com>
+---
+ .../rfork/test_compat_isolated.py             | 29 +++++++++++++++++++
+ .../rfork/test_identity_validation.py         |  1 +
+ .../model_loader/rfork/test_rfork_loader.py   | 11 ++-----
+ vllm_ascend/model_loader/rfork/compat.py      | 22 ++++++++++++++
+ vllm_ascend/model_loader/rfork/identity.py    |  2 +-
+ .../model_loader/rfork/rfork_loader.py        | 26 ++++++++++++-----
+ vllm_ascend/ops/fused_moe/fused_moe.py        |  3 ++
+ 7 files changed, 77 insertions(+), 17 deletions(-)
+ create mode 100644 tests/ut/model_loader/rfork/test_compat_isolated.py
+ create mode 100644 vllm_ascend/model_loader/rfork/compat.py
+
+diff --git a/tests/ut/model_loader/rfork/test_compat_isolated.py b/tests/ut/model_loader/rfork/test_compat_isolated.py
+new file mode 100644
+index 000000000..9711a48ea
+--- /dev/null
++++ b/tests/ut/model_loader/rfork/test_compat_isolated.py
+@@ -0,0 +1,29 @@
++# SPDX-License-Identifier: Apache-2.0
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
++
++import sys
++
++import pytest
++
++from .rfork_test_support import _load_module, _stub
++
++
++def test_native_hardware_profile_is_returned(monkeypatch):
++    expected = object()
++    _stub(
++        monkeypatch,
++        "vllm_ascend.device.hardware_profile",
++        get_current_hardware_profile=lambda: expected,
++    )
++    compat = _load_module(monkeypatch, "rfork_test_compat_native", "compat.py")
++
++    assert compat.get_current_hardware_profile() is expected
++
++
++@pytest.mark.parametrize(("is_310p", "policy"), [(True, "FORCE_NZ"), (False, "CONFIGURABLE")])
++def test_missing_hardware_profile_uses_legacy_policy(monkeypatch, is_310p, policy):
++    monkeypatch.setitem(sys.modules, "vllm_ascend.device.hardware_profile", None)
++    _stub(monkeypatch, "vllm_ascend.utils", is_310p=lambda: is_310p)
++    compat = _load_module(monkeypatch, "rfork_test_compat_legacy", "compat.py")
++
++    assert compat.get_current_hardware_profile().weight_layout_policy.name == policy
+diff --git a/tests/ut/model_loader/rfork/test_identity_validation.py b/tests/ut/model_loader/rfork/test_identity_validation.py
+index e9d209f92..28c8348ce 100644
+--- a/tests/ut/model_loader/rfork/test_identity_validation.py
++++ b/tests/ut/model_loader/rfork/test_identity_validation.py
+@@ -15,6 +15,7 @@ from .rfork_test_support import _load_module, _stub
+ 
+ @pytest.fixture
+ def identity_module(monkeypatch):
++    _load_module(monkeypatch, "vllm_ascend.model_loader.rfork.compat", "compat.py")
+     _stub(monkeypatch, "vllm.config", ModelConfig=object, VllmConfig=object)
+     _stub(monkeypatch, "vllm_ascend.model_loader.rfork.types", RFORK_PROTOCOL_VERSION=1)
+     _stub(monkeypatch, "vllm_ascend.ascend_config", get_ascend_config=lambda: SimpleNamespace(weight_nz_mode=None))
+diff --git a/tests/ut/model_loader/rfork/test_rfork_loader.py b/tests/ut/model_loader/rfork/test_rfork_loader.py
+index f5e65ea18..9509ff27a 100644
+--- a/tests/ut/model_loader/rfork/test_rfork_loader.py
++++ b/tests/ut/model_loader/rfork/test_rfork_loader.py
+@@ -1063,12 +1063,12 @@ def test_rfork_pre_transfer_weight_processing_unwraps_and_restores_quant_methods
+     assert quant_method.process_weights_after_loading is wrapped_process_weights
+ 
+ 
+-def test_rfork_skips_only_unquantized_moe_post_load_processing(monkeypatch):
+-    import vllm_ascend.ops.fused_moe.routed_experts as routed_experts_module
+-
++def test_rfork_skips_only_storage_rewriting_moe_post_load_processing(monkeypatch):
+     import vllm_ascend.ops.fused_moe.fused_moe as fused_moe_module
+ 
+     class _FakeAscendUnquantizedFusedMoEMethod:
++        rewrites_weight_storage_after_loading = True
++
+         def __init__(self, process_weights_after_loading):
+             self.process_weights_after_loading = process_weights_after_loading
+ 
+@@ -1101,11 +1101,6 @@ def test_rfork_skips_only_unquantized_moe_post_load_processing(monkeypatch):
+                 ]
+             )
+ 
+-    monkeypatch.setattr(
+-        routed_experts_module,
+-        "AscendUnquantizedFusedMoEMethod",
+-        _FakeAscendUnquantizedFusedMoEMethod,
+-    )
+     monkeypatch.setattr(fused_moe_module, "AscendMoERunner", _FakeAscendMoERunner)
+ 
+     with _rfork_skip_unquantized_moe_post_load_processing(_FakeModule()):
+diff --git a/vllm_ascend/model_loader/rfork/compat.py b/vllm_ascend/model_loader/rfork/compat.py
+new file mode 100644
+index 000000000..ed615ce7d
+--- /dev/null
++++ b/vllm_ascend/model_loader/rfork/compat.py
+@@ -0,0 +1,22 @@
++# SPDX-License-Identifier: Apache-2.0
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
++
++"""RFork compatibility helpers for older Ascend releases."""
++
++from types import SimpleNamespace
++from typing import Any
++
++
++def get_current_hardware_profile() -> Any:
++    try:
++        from vllm_ascend.device.hardware_profile import get_current_hardware_profile as get_native_profile
++    except ModuleNotFoundError as exc:
++        if exc.name != "vllm_ascend.device.hardware_profile":
++            raise
++
++        from vllm_ascend.utils import is_310p
++
++        policy_name = "FORCE_NZ" if is_310p() else "CONFIGURABLE"
++        return SimpleNamespace(weight_layout_policy=SimpleNamespace(name=policy_name))
++
++    return get_native_profile()
+diff --git a/vllm_ascend/model_loader/rfork/identity.py b/vllm_ascend/model_loader/rfork/identity.py
+index f0fb351a3..8e43f9fbe 100644
+--- a/vllm_ascend/model_loader/rfork/identity.py
++++ b/vllm_ascend/model_loader/rfork/identity.py
+@@ -27,7 +27,7 @@ import torch
+ from vllm.config import ModelConfig, VllmConfig
+ 
+ from vllm_ascend.ascend_config import get_ascend_config
+-from vllm_ascend.device.hardware_profile import get_current_hardware_profile
++from vllm_ascend.model_loader.rfork.compat import get_current_hardware_profile
+ from vllm_ascend.model_loader.rfork.types import RFORK_PROTOCOL_VERSION
+ 
+ 
+diff --git a/vllm_ascend/model_loader/rfork/rfork_loader.py b/vllm_ascend/model_loader/rfork/rfork_loader.py
+index 27ed08c76..cb22b1518 100644
+--- a/vllm_ascend/model_loader/rfork/rfork_loader.py
++++ b/vllm_ascend/model_loader/rfork/rfork_loader.py
+@@ -41,7 +41,7 @@ from vllm.model_executor.model_loader.utils import (
+ from vllm.utils.torch_utils import set_default_torch_dtype
+ 
+ from vllm_ascend.ascend_config import get_ascend_config
+-from vllm_ascend.device.hardware_profile import get_current_hardware_profile
++from vllm_ascend.model_loader.rfork.compat import get_current_hardware_profile
+ from vllm_ascend.model_loader.rfork.config import RForkConfig
+ from vllm_ascend.model_loader.rfork.identity import build_compatibility_fingerprint
+ from vllm_ascend.model_loader.rfork.safety import mutable_weights_bypass_reason
+@@ -220,6 +220,18 @@ def _get_dynamo_bytecode_hooks() -> dict[int, Any]:
+     return hooks if isinstance(hooks, dict) else {}
+ 
+ 
++def _get_ascend_moe_counter_owner() -> Any:
++    candidates = (
++        ("vllm_ascend.ops.fused_moe.routed_experts", "AscendRoutedExperts"),
++        ("vllm_ascend.ops.fused_moe.fused_moe", "AscendMoERunner"),
++    )
++    for module_name, class_name in candidates:
++        owner = getattr(sys.modules.get(module_name), class_name, None)
++        if owner is not None and hasattr(owner, "moe_counter"):
++            return owner
++    return None
++
++
+ def _remove_discarded_compilation_hooks(
+     stale_module_ids: set[int], snapshot: _RForkProcessGlobalModelState | None
+ ) -> None:
+@@ -282,8 +294,8 @@ def _snapshot_process_global_model_state(vllm_config: VllmConfig) -> _RForkProce
+     adaptor = getattr(sys.modules.get("vllm_ascend.eplb.adaptor.vllm_adaptor"), "VllmEplbAdaptor", None)
+     registry = getattr(adaptor, "_registered_moe_layers", None)
+     ascend_moe_layers = (registry, list(registry)) if isinstance(registry, list) else None
+-    routed_experts = getattr(sys.modules.get("vllm_ascend.ops.fused_moe.routed_experts"), "AscendRoutedExperts", None)
+-    ascend_moe_counter = getattr(routed_experts, "moe_counter", INITIAL_ASCEND_MOE_COUNTER)
++    counter_owner = _get_ascend_moe_counter_owner()
++    ascend_moe_counter = getattr(counter_owner, "moe_counter", INITIAL_ASCEND_MOE_COUNTER)
+     return _RForkProcessGlobalModelState(
+         static_forward_context,
+         static_all_moe_layers,
+@@ -316,11 +328,9 @@ def _reset_process_global_model_state(
+         else:
+             registry[:] = [layer for layer in registry if id(layer) not in stale_module_ids]
+     if snapshot is not None:
+-        routed_experts = getattr(
+-            sys.modules.get("vllm_ascend.ops.fused_moe.routed_experts"), "AscendRoutedExperts", None
+-        )
+-        if routed_experts is not None:
+-            routed_experts.moe_counter = snapshot.ascend_moe_counter
++        counter_owner = _get_ascend_moe_counter_owner()
++        if counter_owner is not None:
++            counter_owner.moe_counter = snapshot.ascend_moe_counter
+ 
+     removed_names: set[Any] = set()
+     compilation_config = getattr(vllm_config, "compilation_config", None)
+diff --git a/vllm_ascend/ops/fused_moe/fused_moe.py b/vllm_ascend/ops/fused_moe/fused_moe.py
+index d5b0f43d5..8b0d95281 100644
+--- a/vllm_ascend/ops/fused_moe/fused_moe.py
++++ b/vllm_ascend/ops/fused_moe/fused_moe.py
+@@ -111,6 +111,8 @@ def make_eplb_placement_config(eplb_config, num_redundant_experts: int) -> Simpl
+ 
+ 
+ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
++    rewrites_weight_storage_after_loading = True
++
+     def __init__(self, moe: FusedMoEConfig = None, tid2eid=None):
+         super().__init__(moe=moe)
+         self.dynamic_eplb = get_ascend_config().eplb_config.dynamic_eplb
+@@ -504,6 +506,7 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
+                 return result
+ 
+             self._quant_method.process_weights_after_loading = wrapped_process_weights  # type: ignore
++            self._quant_method.unvalidated_process_weights_after_loading = original_process_weights  # type: ignore
+ 
+         # Register this MoE layer with EPLB for PP compatibility.
+         # PPMissingLayer (nn.Identity) never calls AscendFusedMoE.__init__,
+-- 
+2.51.0.windows.1
+
