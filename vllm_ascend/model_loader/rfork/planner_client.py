@@ -120,7 +120,7 @@ class RForkPlannerClient:
                 seed_key=self.seed_key,
                 lease_ttl_sec=parsed_lease_ttl_sec,
             )
-        except Exception as exc:
+        except (requests.RequestException, RuntimeError, ValueError) as exc:
             logger.warning("RFork planner seed acquisition failed: %s", exc)
             return None
 
@@ -194,7 +194,7 @@ class RForkPlannerClient:
                 lease_log_id(lease),
                 response.status_code,
             )
-        except Exception as exc:
+        except (requests.RequestException, RuntimeError) as exc:
             logger.warning(
                 "RFork planner lease renewal failed: lease=%s error=%s",
                 lease_log_id(lease),
@@ -205,7 +205,7 @@ class RForkPlannerClient:
     def remove_seed(self, advertisement: SeedAdvertisement | None = None) -> bool:
         try:
             self._require_planner()
-        except Exception as exc:
+        except RuntimeError as exc:
             logger.warning("RFork planner seed removal setup failed: %s", exc)
             return False
 
@@ -239,7 +239,7 @@ class RForkPlannerClient:
                     SEED_REMOVAL_MAX_ATTEMPTS,
                     response.status_code,
                 )
-            except Exception as exc:
+            except requests.RequestException as exc:
                 logger.warning(
                     "RFork planner seed removal attempt %d/%d failed: %s",
                     attempt + 1,
@@ -276,5 +276,5 @@ class RForkPlannerClient:
             return SeedReportResult(SeedReportStatus.REJECTED, f"status={response.status_code}")
         except requests.RequestException as exc:
             return SeedReportResult(SeedReportStatus.RETRYABLE, type(exc).__name__)
-        except Exception as exc:
+        except (RuntimeError, ValueError, OSError) as exc:
             return SeedReportResult(SeedReportStatus.REJECTED, type(exc).__name__)

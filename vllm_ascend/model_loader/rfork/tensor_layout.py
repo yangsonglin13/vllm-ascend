@@ -277,42 +277,59 @@ def _try_collect(
     name: str,
     tensor: torch.Tensor,
     seen_names: dict[str, int],
+    seen_tensors: dict[tuple[Any, ...], int],
     collected: list[tuple[str, torch.Tensor]],
 ) -> None:
     if not is_transferable_tensor(tensor):
         return
     validate_transferable_tensor_layout(name, tensor)
     data_ptr = tensor.data_ptr()
-    existing_index = seen_names.get(name)
-    if existing_index is None:
-        seen_names[name] = len(collected)
-        collected.append((name, tensor))
-        return
-
-    # Deduplicate a name only for the same tensor and exact layout; conflicting aliases desync manifests.
-    existing_tensor = collected[existing_index][1]
-    if existing_tensor is tensor or (
-        existing_tensor.data_ptr() == data_ptr
-        and existing_tensor.numel() == tensor.numel()
-        and tuple(existing_tensor.shape) == tuple(tensor.shape)
-        and existing_tensor.dtype == tensor.dtype
-        and tuple(existing_tensor.stride()) == tuple(tensor.stride())
-    ):
-        return
-
-    raise ValueError(
-        "RFork encountered conflicting tensor entries for logical name "
-        f"{name!r}; shape, dtype, stride, or storage differs."
+    tensor_signature = (
+        data_ptr,
+        tensor.numel(),
+        tuple(tensor.shape),
+        tensor.dtype,
+        tensor.device,
+        tuple(tensor.stride()),
     )
+    existing_index = seen_names.get(name)
+    if existing_index is not None:
+        existing_tensor = collected[existing_index][1]
+        if existing_tensor is tensor or tensor_signature == (
+            existing_tensor.data_ptr(),
+            existing_tensor.numel(),
+            tuple(existing_tensor.shape),
+            existing_tensor.dtype,
+            existing_tensor.device,
+            tuple(existing_tensor.stride()),
+        ):
+            return
+        raise ValueError(
+            "RFork encountered conflicting tensor entries for logical name "
+            f"{name!r}; shape, dtype, stride, or storage differs."
+        )
+
+    # Parameters and buffers are canonical. An implementation object may expose
+    # the exact same tensor under another public name; transferring that range
+    # twice only bloats the manifest. Distinct views retain separate entries.
+    existing_index = seen_tensors.get(tensor_signature)
+    if existing_index is not None:
+        seen_names[name] = existing_index
+        return
+
+    seen_names[name] = len(collected)
+    seen_tensors[tensor_signature] = len(collected)
+    collected.append((name, tensor))
 
 
 def collect_transferable_tensors(model: nn.Module, processed_layout: bool) -> list[tuple[str, torch.Tensor]]:
     seen: dict[str, int] = {}
+    seen_tensors: dict[tuple[Any, ...], int] = {}
     collected: list[tuple[str, torch.Tensor]] = []
     for name, tensor in model.named_parameters():
-        _try_collect(name, tensor, seen, collected)
+        _try_collect(name, tensor, seen, seen_tensors, collected)
     for name, tensor in model.named_buffers():
-        _try_collect(name, tensor, seen, collected)
+        _try_collect(name, tensor, seen, seen_tensors, collected)
     for module_prefix, module in model.named_modules():
         if processed_layout:
             attributes = (
@@ -332,7 +349,7 @@ def collect_transferable_tensors(model: nn.Module, processed_layout: bool) -> li
                 scan_objects,
             ):
                 full_name = f"{module_prefix}.{tensor_name}" if module_prefix else tensor_name
-                _try_collect(full_name, tensor, seen, collected)
+                _try_collect(full_name, tensor, seen, seen_tensors, collected)
     return collected
 
 

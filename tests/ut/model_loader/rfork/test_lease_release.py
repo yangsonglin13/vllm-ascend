@@ -65,6 +65,34 @@ def test_seed_report_classifies_response_without_changing_wire_protocol(runtime,
     )
 
 
+def test_acquire_seed_does_not_swallow_programming_errors(runtime, monkeypatch):
+    monkeypatch.setattr(runtime.client.requests, "get", Mock(side_effect=AttributeError("unexpected bug")))
+    client = runtime.client.RForkPlannerClient(runtime.config, runtime.identity)
+
+    with pytest.raises(AttributeError, match="unexpected bug"):
+        client.acquire_seed()
+
+
+def test_shutdown_is_reentrant_safe_and_unregisters_atexit(runtime, monkeypatch):
+    session = runtime.session.RForkSession(runtime.config, runtime.identity)
+    unregister = Mock()
+    monkeypatch.setattr(runtime.session.atexit, "unregister", unregister)
+    monkeypatch.setattr(session, "_stop_seed_service", Mock(return_value=True))
+    nested_results = []
+
+    def finalize():
+        nested_results.append(session.shutdown())
+        return True
+
+    session.transfer_backend.finalize_transfer_engine.side_effect = finalize
+
+    assert session.shutdown()
+    assert session.shutdown()
+    assert nested_results == [False]
+    session.transfer_backend.finalize_transfer_engine.assert_called_once_with()
+    unregister.assert_called_once_with(session._atexit_callback)
+
+
 def test_blocked_release_does_not_block_inference_or_shutdown(runtime, monkeypatch):
     session = make_session(runtime)
     entered, resume, startup_done = threading.Event(), threading.Event(), threading.Event()

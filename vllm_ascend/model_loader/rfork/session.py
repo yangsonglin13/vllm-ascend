@@ -75,7 +75,9 @@ class RForkSession:
         self._lock = threading.RLock()
         # Acquire before _lock; release responses must not wait on removal I/O.
         self._seed_lifecycle_lock = threading.RLock()
-        atexit.register(self.shutdown)
+        self._shutdown_in_progress = False
+        self._atexit_callback = self.shutdown
+        atexit.register(self._atexit_callback)
 
     def register_destination(
         self, model, processed_layout: bool, exclude_blocks: list[tuple[int, int]] | None = None
@@ -744,26 +746,37 @@ class RForkSession:
             with self._lock:
                 if self.state is RForkLifecycleState.FINALIZED:
                     return True
+                if self._shutdown_in_progress:
+                    logger.debug("RFork shutdown is already in progress; skipping a reentrant cleanup request.")
+                    return False
+                self._shutdown_in_progress = True
                 self._deferred_seed_start = None
                 self._deferred_seed_awaiting_sharing = False
-            service_ok = self._stop_seed_service()
-            with self._lock:
-                release_ok = self.seed_lease is None
-                finalize_ok = self.transfer_backend.finalize_transfer_engine() if service_ok and release_ok else False
-                if finalize_ok:
-                    self.state = RForkLifecycleState.FINALIZED
-                elif not service_ok:
-                    logger.warning(
-                        "RFork shutdown retained registered memory because seed service cleanup is incomplete."
+            try:
+                service_ok = self._stop_seed_service()
+                with self._lock:
+                    release_ok = self.seed_lease is None
+                    finalize_ok = (
+                        self.transfer_backend.finalize_transfer_engine() if service_ok and release_ok else False
                     )
-                elif not release_ok:
-                    logger.warning(
-                        "RFork shutdown retained TransferEngine state because the source lease is unresolved. "
-                        "No new release retries will be started; an in-flight request may still acknowledge. "
-                        "Otherwise lease recovery depends on the planner's expiry/reclamation policy."
-                    )
-                else:
-                    logger.warning(
-                        "RFork shutdown retained TransferEngine state because finalization did not complete."
-                    )
-                return service_ok and release_ok and finalize_ok
+                    if finalize_ok:
+                        self.state = RForkLifecycleState.FINALIZED
+                        atexit.unregister(self._atexit_callback)
+                    elif not service_ok:
+                        logger.warning(
+                            "RFork shutdown retained registered memory because seed service cleanup is incomplete."
+                        )
+                    elif not release_ok:
+                        logger.warning(
+                            "RFork shutdown retained TransferEngine state because the source lease is unresolved. "
+                            "No new release retries will be started; an in-flight request may still acknowledge. "
+                            "Otherwise lease recovery depends on the planner's expiry/reclamation policy."
+                        )
+                    else:
+                        logger.warning(
+                            "RFork shutdown retained TransferEngine state because finalization did not complete."
+                        )
+                    return service_ok and release_ok and finalize_ok
+            finally:
+                with self._lock:
+                    self._shutdown_in_progress = False
