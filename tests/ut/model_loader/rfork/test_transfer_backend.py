@@ -22,6 +22,7 @@ from typing import Any
 import torch
 
 import vllm_ascend.model_loader.rfork.transfer_backend as transfer_backend
+from vllm_ascend.model_loader.rfork import tensor_layout
 from vllm_ascend.model_loader.rfork.transfer_backend import (
     RForkTransferBackend,
     _split_tensors_by_excluded_blocks,
@@ -32,6 +33,18 @@ from vllm_ascend.model_loader.rfork.types import SeedTransferInfo
 def _extend_and_return(items: list[Any], values: Any, result: Any) -> Any:
     items.extend(values)
     return result
+
+
+def test_tensor_collection_deduplicates_exact_impl_alias_but_keeps_distinct_view(monkeypatch):
+    weight = torch.nn.Parameter(torch.arange(4, dtype=torch.float32))
+    model = torch.nn.Module()
+    model.register_parameter("weight", weight)
+    model.impl = SimpleNamespace(weight=weight, view=weight[:2])
+    monkeypatch.setattr(tensor_layout, "is_transferable_tensor", lambda _tensor: True)
+
+    collected = tensor_layout.collect_processed_layout_tensors(model)
+
+    assert [(name, tensor.numel()) for name, tensor in collected] == [("weight", 4), ("impl.view", 2)]
 
 
 def test_read_weights_from_seed_refreshes_registered_shape_after_reshape(monkeypatch):

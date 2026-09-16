@@ -496,7 +496,8 @@ def build_router(store: Store):
             seed_port=parsed.seed_port,
             seed_rank=parsed.seed_rank,
         )
-        # Treat an already GC'd seed as successfully removed.
+        # Preserve a 404 for an already GC'd seed. RFork clients treat this
+        # confirmed absence as an idempotent removal success.
         if not removed:
             return Response(status_code=status.HTTP_404_NOT_FOUND)
         return Response(status_code=status.HTTP_200_OK)

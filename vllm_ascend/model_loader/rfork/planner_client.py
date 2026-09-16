@@ -44,6 +44,7 @@ class RForkPlannerClient:
         self.request_timeout_sec = float(request_timeout_sec)
         self.config = config
         self.last_advertisement: SeedAdvertisement | None = None
+        self._advertisement_lock = threading.Lock()
         compatibility_fingerprint = identity.compatibility_fingerprint
         if compatibility_fingerprint is None:
             raise RuntimeError(
@@ -104,7 +105,7 @@ class RForkPlannerClient:
                 seed_rank=parsed_rank,
                 seed_key=self.seed_key,
             )
-        except Exception as exc:
+        except (requests.RequestException, RuntimeError, ValueError) as exc:
             logger.warning("RFork planner seed acquisition failed: %s", exc)
             return None
 
@@ -169,68 +170,72 @@ class RForkPlannerClient:
     def remove_seed(self, advertisement: SeedAdvertisement | None = None) -> bool:
         try:
             self._require_planner()
-        except Exception as exc:
+        except RuntimeError as exc:
             logger.warning("RFork planner seed removal setup failed: %s", exc)
             return False
 
-        target = advertisement or self.last_advertisement
-        if target is None:
-            return True
-        headers = {
-            "SEED_KEY": self.seed_key,
-            "SEED_IP": target.seed_ip,
-            "SEED_PORT": str(target.seed_port),
-            "SEED_RANK": str(target.seed_rank),
-        }
-        for attempt in range(SEED_REMOVAL_MAX_ATTEMPTS):
-            try:
-                response = requests.post(
-                    f"{self.planner_url}/remove_seed",
-                    headers=headers,
-                    timeout=self.request_timeout_sec,
-                )
-                if response.status_code in (200, 404):
-                    if target == self.last_advertisement:
-                        self.last_advertisement = None
-                    return True
-                logger.warning(
-                    "RFork planner seed removal attempt %d/%d returned status=%s",
-                    attempt + 1,
-                    SEED_REMOVAL_MAX_ATTEMPTS,
-                    response.status_code,
-                )
-            except Exception as exc:
-                logger.warning(
-                    "RFork planner seed removal attempt %d/%d failed: %s",
-                    attempt + 1,
-                    SEED_REMOVAL_MAX_ATTEMPTS,
-                    exc,
-                )
-            if attempt + 1 < SEED_REMOVAL_MAX_ATTEMPTS:
-                time.sleep(SEED_REMOVAL_RETRY_BACKOFF_SEC * (attempt + 1))
-        return False
+        # Serialize seed reporting and removal across the heartbeat and shutdown
+        # threads so a successful removal cannot clear a newer advertisement.
+        with self._advertisement_lock:
+            target = advertisement or self.last_advertisement
+            if target is None:
+                return True
+            headers = {
+                "SEED_KEY": self.seed_key,
+                "SEED_IP": target.seed_ip,
+                "SEED_PORT": str(target.seed_port),
+                "SEED_RANK": str(target.seed_rank),
+            }
+            for attempt in range(SEED_REMOVAL_MAX_ATTEMPTS):
+                try:
+                    response = requests.post(
+                        f"{self.planner_url}/remove_seed",
+                        headers=headers,
+                        timeout=self.request_timeout_sec,
+                    )
+                    if response.status_code in (200, 404):
+                        if target == self.last_advertisement:
+                            self.last_advertisement = None
+                        return True
+                    logger.warning(
+                        "RFork planner seed removal attempt %d/%d returned status=%s",
+                        attempt + 1,
+                        SEED_REMOVAL_MAX_ATTEMPTS,
+                        response.status_code,
+                    )
+                except requests.RequestException as exc:
+                    logger.warning(
+                        "RFork planner seed removal attempt %d/%d failed: %s",
+                        attempt + 1,
+                        SEED_REMOVAL_MAX_ATTEMPTS,
+                        exc,
+                    )
+                if attempt + 1 < SEED_REMOVAL_MAX_ATTEMPTS:
+                    time.sleep(SEED_REMOVAL_RETRY_BACKOFF_SEC * (attempt + 1))
+            return False
 
     def report_seed_once(self, port: int, seed_ip: str | None = None) -> bool:
         try:
             self._require_planner()
-            advertisement = SeedAdvertisement(seed_ip or get_ip(), port, self.tp_rank)
-            response = requests.post(
-                f"{self.planner_url}/add_seed",
-                headers={
-                    "SEED_KEY": self.seed_key,
-                    "SEED_IP": advertisement.seed_ip,
-                    "SEED_PORT": str(advertisement.seed_port),
-                    "SEED_RANK": str(advertisement.seed_rank),
-                    "SEED_REFCNT": "0",
-                },
-                timeout=self.request_timeout_sec,
-            )
-            if response.status_code != 200:
-                logger.warning("RFork planner seed report returned status=%s", response.status_code)
-                return False
-            self.last_advertisement = advertisement
-            return True
-        except Exception as exc:
+            with self._advertisement_lock:
+                advertisement = SeedAdvertisement(seed_ip or get_ip(), port, self.tp_rank)
+                response = requests.post(
+                    f"{self.planner_url}/add_seed",
+                    headers={
+                        "SEED_KEY": self.seed_key,
+                        "SEED_IP": advertisement.seed_ip,
+                        "SEED_PORT": str(advertisement.seed_port),
+                        "SEED_RANK": str(advertisement.seed_rank),
+                        "SEED_REFCNT": "0",
+                    },
+                    timeout=self.request_timeout_sec,
+                )
+                if response.status_code != 200:
+                    logger.warning("RFork planner seed report returned status=%s", response.status_code)
+                    return False
+                self.last_advertisement = advertisement
+                return True
+        except (requests.RequestException, RuntimeError, ValueError, OSError) as exc:
             logger.warning("RFork planner seed report failed: %s", exc)
             return False
 

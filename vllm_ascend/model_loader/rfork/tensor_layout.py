@@ -110,46 +110,62 @@ def _try_collect(
     name: str,
     tensor: torch.Tensor,
     seen_names: dict[str, int],
+    seen_tensors: dict[tuple[Any, ...], int],
     collected: list[tuple[str, torch.Tensor]],
 ) -> None:
     if not is_transferable_tensor(tensor):
         return
     data_ptr = tensor.data_ptr()
-    existing_index = seen_names.get(name)
-    if existing_index is None:
-        seen_names[name] = len(collected)
-        collected.append((name, tensor))
-        return
-
-    # The same logical name can be encountered through named_parameters and a
-    # public implementation attribute.  Deduplicate it only when it describes
-    # exactly the same logical tensor.  A same-pointer view with a different
-    # range or layout is a conflicting manifest entry and must fail loudly;
-    # silently choosing the smaller or larger view can make a seed and receiver
-    # disagree about the bytes represented by that name.
-    existing_tensor = collected[existing_index][1]
-    if existing_tensor is tensor or (
-        existing_tensor.data_ptr() == data_ptr
-        and existing_tensor.numel() == tensor.numel()
-        and tuple(existing_tensor.shape) == tuple(tensor.shape)
-        and existing_tensor.dtype == tensor.dtype
-        and tuple(existing_tensor.stride()) == tuple(tensor.stride())
-    ):
-        return
-
-    raise ValueError(
-        "RFork encountered conflicting tensor entries for logical name "
-        f"{name!r}; shape, dtype, stride, or storage differs."
+    tensor_signature = (
+        data_ptr,
+        tensor.numel(),
+        tuple(tensor.shape),
+        tensor.dtype,
+        tensor.device,
+        tuple(tensor.stride()),
     )
+    existing_index = seen_names.get(name)
+    if existing_index is not None:
+        # A repeated logical name must always describe the same bytes and
+        # layout. Silently accepting a different view would make the seed and
+        # receiver disagree about the manifest entry.
+        existing_tensor = collected[existing_index][1]
+        if existing_tensor is tensor or tensor_signature == (
+            existing_tensor.data_ptr(),
+            existing_tensor.numel(),
+            tuple(existing_tensor.shape),
+            existing_tensor.dtype,
+            existing_tensor.device,
+            tuple(existing_tensor.stride()),
+        ):
+            return
+        raise ValueError(
+            "RFork encountered conflicting tensor entries for logical name "
+            f"{name!r}; shape, dtype, stride, or storage differs."
+        )
+
+    # named_parameters/named_buffers are canonical. An implementation object
+    # can expose the exact same tensor under another public name; transferring
+    # that identical range twice only bloats the manifest and transfer request.
+    # Views with a different range or layout retain their own logical entry.
+    existing_index = seen_tensors.get(tensor_signature)
+    if existing_index is not None:
+        seen_names[name] = existing_index
+        return
+
+    seen_names[name] = len(collected)
+    seen_tensors[tensor_signature] = len(collected)
+    collected.append((name, tensor))
 
 
 def collect_processed_layout_tensors(model: nn.Module) -> list[tuple[str, torch.Tensor]]:
     seen: dict[str, int] = {}
+    seen_tensors: dict[tuple[Any, ...], int] = {}
     collected: list[tuple[str, torch.Tensor]] = []
     for name, tensor in model.named_parameters():
-        _try_collect(name, tensor, seen, collected)
+        _try_collect(name, tensor, seen, seen_tensors, collected)
     for name, tensor in model.named_buffers():
-        _try_collect(name, tensor, seen, collected)
+        _try_collect(name, tensor, seen, seen_tensors, collected)
     for module_prefix, module in model.named_modules():
         for attr_name, attr_value in vars(module).items():
             if attr_name.startswith("_") or isinstance(attr_value, nn.Module):
@@ -161,24 +177,25 @@ def collect_processed_layout_tensors(model: nn.Module) -> list[tuple[str, torch.
                 attr_name == "impl",
             ):
                 full_name = f"{module_prefix}.{tensor_name}" if module_prefix else tensor_name
-                _try_collect(full_name, tensor, seen, collected)
+                _try_collect(full_name, tensor, seen, seen_tensors, collected)
     return collected
 
 
 def collect_checkpoint_layout_tensors(model: nn.Module) -> list[tuple[str, torch.Tensor]]:
     seen: dict[str, int] = {}
+    seen_tensors: dict[tuple[Any, ...], int] = {}
     collected: list[tuple[str, torch.Tensor]] = []
     for name, tensor in model.named_parameters():
-        _try_collect(name, tensor, seen, collected)
+        _try_collect(name, tensor, seen, seen_tensors, collected)
     for name, tensor in model.named_buffers():
-        _try_collect(name, tensor, seen, collected)
+        _try_collect(name, tensor, seen, seen_tensors, collected)
     for module_prefix, module in model.named_modules():
         impl = getattr(module, "impl", None)
         if impl is None or isinstance(impl, nn.Module):
             continue
         for tensor_name, tensor in _iter_tensors_in_value("impl", impl, set(), scan_objects=True):
             full_name = f"{module_prefix}.{tensor_name}" if module_prefix else tensor_name
-            _try_collect(full_name, tensor, seen, collected)
+            _try_collect(full_name, tensor, seen, seen_tensors, collected)
     return collected
 
 

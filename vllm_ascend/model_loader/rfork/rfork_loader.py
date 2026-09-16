@@ -57,6 +57,7 @@ class _RForkSeedUnavailable(RuntimeError):
 
 
 FALLBACK_CLEANUP_MAX_ATTEMPTS = 2
+RFORK_FALLBACK_EXCEPTIONS = (ImportError, OSError, RuntimeError, ValueError)
 
 
 @dataclass
@@ -642,12 +643,16 @@ class RForkModelLoader(BaseModelLoader):
                 )
                 return model
             except _RForkSeedUnavailable:
-                assert session is not None
-                logger.debug(
-                    "RFork has no available %s seed; loading locally and registering this worker as a seed.",
-                    _rfork_model_kind(session),
-                )
-            except Exception as e:
+                if session is None:
+                    logger.warning(
+                        "RFork seed lookup ended before session initialization; falling back to the default loader."
+                    )
+                else:
+                    logger.debug(
+                        "RFork has no available %s seed; loading locally and registering this worker as a seed.",
+                        _rfork_model_kind(session),
+                    )
+            except RFORK_FALLBACK_EXCEPTIONS as e:
                 # A queued/captured LogRecord must not retain the exception's
                 # traceback and the discarded model through its arguments.
                 logger.warning("RFork transfer failed: %s, clean up and fall back to default loader", str(e))
