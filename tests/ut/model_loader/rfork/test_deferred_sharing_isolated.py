@@ -106,3 +106,10 @@ def test_transfer_restores_load_state_before_read_completion(monkeypatch):
 
     assert session.transfer_from_seed(model, True)
     assert model.has_own_lm_head is False
+    session.log_transferred_model_layout(model, True)
+    session.transfer_backend.log_model_layout_summary.assert_called_once_with(
+        model,
+        True,
+        stage="receiver_after_transfer_finalize",
+        peer_session_id="seed-session",
+    )

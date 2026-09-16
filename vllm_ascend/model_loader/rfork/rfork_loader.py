@@ -729,6 +729,8 @@ class RForkModelLoader(BaseModelLoader):
                     with _rfork_skip_unquantized_moe_post_load_processing(model):
                         process_weights_after_loading(model, model_config, target_device)
 
+                session.log_transferred_model_layout(model, processed_layout_transfer)
+
                 # Advertise only after post-load and eval; the session owns failure cleanup.
                 model = model.eval()
                 _publish_rfork_seed(

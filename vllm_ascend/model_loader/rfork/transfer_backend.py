@@ -26,6 +26,7 @@ from vllm_ascend.model_loader.rfork.tensor_layout import (
     collect_transferable_tensors,
     find_non_npu_state_tensors,
     is_transferable_tensor,
+    log_tensor_layout_summary,
     reshape_tensor_to_seed_shape,
     validate_transferable_tensor_layout,
 )
@@ -36,6 +37,7 @@ MAX_TRANSFER_CHUNK_SEGMENTS = 512
 MAX_MEMORY_REGISTRATION_BATCH_ITEMS = 4096
 MAX_TRANSFER_ENGINE_FINALIZE_ATTEMPTS = 10
 TRANSFER_ENGINE_FINALIZE_RETRY_INTERVAL_SEC = 1.0
+TENSOR_LAYOUT_ERROR_EXCERPT_CHARS = 256
 POST_LOAD_REGENERATED_TENSOR_NAMES = frozenset(
     {
         "W_UK_T",
@@ -271,6 +273,39 @@ class RForkTransferBackend:
         with self._lifecycle_lock:
             return list(self.registered_weight_blocks)
 
+    def log_model_layout_summary(
+        self,
+        model,
+        processed_layout: bool,
+        *,
+        stage: str,
+        peer_session_id: str | None = None,
+    ) -> None:
+        """Observe a live model layout without changing transfer acceptance."""
+        try:
+            with self._lifecycle_lock:
+                tensors = list(collect_transferable_tensors(model, processed_layout))
+                tensors, _ = _split_tensors_by_excluded_blocks(tensors, self.excluded_weight_blocks)
+                log_tensor_layout_summary(
+                    tensors,
+                    stage=stage,
+                    session_id=self.transfer_session_id,
+                    peer_session_id=peer_session_id,
+                    processed_layout=processed_layout,
+                )
+        except Exception as exc:
+            # Diagnostics must not turn an otherwise usable transferred model into a fallback.
+            error_excerpt = " ".join(str(exc).split())[:TENSOR_LAYOUT_ERROR_EXCERPT_CHARS]
+            logger.info(
+                "RFork tensor layout summary: stage=%s session=%s peer_session=%s layout=%s unavailable=%s:%s",
+                stage,
+                self.transfer_session_id,
+                peer_session_id,
+                "processed" if processed_layout else "checkpoint",
+                type(exc).__name__,
+                error_excerpt,
+            )
+
     def register_memory_region(
         self,
         model,
@@ -475,6 +510,13 @@ class RForkTransferBackend:
             "register_memory_region time: %.4fs, weights: %d",
             time.perf_counter() - start_reg_mr_time,
             len(weight_mr_dict),
+        )
+        log_tensor_layout_summary(
+            transferable_tensors,
+            stage="registration",
+            session_id=self.transfer_session_id,
+            processed_layout=processed_layout,
+            known_formats=weight_format_dict,
         )
         return True
 
@@ -768,6 +810,15 @@ class RForkTransferBackend:
             seed_ptr_list.append(parsed_remote[name][0])
             client_ptr_list.append(tensor.data_ptr())
             client_len_list.append(tensor.numel() * tensor.element_size())
+
+        log_tensor_layout_summary(
+            [(name, tensor) for name, tensor in transferable_tensors if name not in skipped_shared_names],
+            stage="receiver_before_read",
+            session_id=self.transfer_session_id,
+            peer_session_id=seed_info.session_id,
+            processed_layout=processed_layout,
+            known_formats=self.weight_formats,
+        )
 
         chunks = list(iter_transfer_chunks(weight_names, seed_ptr_list, client_ptr_list, client_len_list))
         total_bytes = sum(client_len_list)

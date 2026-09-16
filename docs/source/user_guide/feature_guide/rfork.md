@@ -153,9 +153,9 @@ empty, meta, CPU, gapped, or overlapping tensors are rejected.
 
 Dense transposes are supported because their logical elements still cover one
 continuous byte range. A receiver tensor may be reshaped with a storage-preserving
-view when its element count matches the manifest. Both instances must use the
-same code and effective layout; shape equality alone does not prove arbitrary
-stride or NZ-padding compatibility.
+view when its element count matches the manifest. Shape equality alone does not
+prove arbitrary stride or physical-layout compatibility; the diagnostic summary
+below records those differences without changing transfer acceptance.
 
 A draft model may reuse tensors already owned and registered by its target. If
 all transferable tensors are shared, RFork skips draft transfer and post-load
@@ -226,6 +226,20 @@ vllm serve <model_path> \
 Successful loads log `source=transfer`, `local`, `fallback`, or `shared_target`.
 Successful TP0 weight reads also log transfer elapsed time, bytes, chunks, and
 throughput at INFO; other TP ranks and per-chunk timings remain at DEBUG.
+Every successful registration, receiver-before-read, and final receiver stage
+emits one bounded `RFork tensor layout summary` at INFO per rank. The summary hashes all tensor
+names, shapes, strides, dtypes, NPU formats, logical byte counts, storage byte
+capacities, storage offsets, and NPU descriptor element counts into fixed-size
+semantic and physical digests. It also reports aggregate counts and at most
+three representative tensors, preferring storage views or tensors whose NPU
+descriptor size differs from logical `numel`. Match a receiver's `peer_session`
+to the seed's `session`. Digest differences are diagnostic and do not by
+themselves reject a transfer. On checkpoint-layout transfers, compare
+`receiver_before_read` with `receiver_after_post_load` to determine whether the
+post-load hook rebuilt the layout. Processed-layout transfers instead emit
+`receiver_after_transfer_finalize`, because their layout processing happened
+before the read. The summary does not copy tensor data or prove value equality;
+validate output accuracy separately on NPU hardware.
 Set `VLLM_LOGGING_LEVEL=DEBUG` for per-rank registration, metadata, transfer,
 lease-release, and publication timing.
 

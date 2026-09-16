@@ -68,6 +68,7 @@ class RForkSession:
         self._lease_release_exhausted = False
         self._lease_acquired_at: float | None = None
         self._registration_elapsed = 0.0
+        self._source_transfer_session_id: str | None = None
         self._deferred_seed_start: tuple[Any, bool, list[tuple[int, int]] | None] | None = None
         # Draft seed start waits until target weight sharing is final; lease-release promotion must not overtake it.
         self._deferred_seed_awaiting_sharing = False
@@ -88,6 +89,7 @@ class RForkSession:
             ):
                 return False
             self.state = RForkLifecycleState.CLEANUP_REQUIRED
+            self._source_transfer_session_id = None
             started_at = time.monotonic()
             if not self.transfer_backend.register_memory_region(model, processed_layout, exclude_blocks):
                 return False
@@ -203,6 +205,7 @@ class RForkSession:
                 processed_layout=processed_layout,
             ):
                 return False
+            self._source_transfer_session_id = seed_info.session_id
             self.state = RForkLifecycleState.TRANSFERRED
             logger.debug(
                 "RFork transfer stages: lease=%s global_rank=%s registration=%.3fs metadata=%.3fs read=%.3fs",
@@ -215,6 +218,17 @@ class RForkSession:
             # Lease bookkeeping must never put planner network latency on the startup thread.
             self._ensure_lease_release_retry_locked()
             return True
+
+    def log_transferred_model_layout(self, model, processed_layout: bool) -> None:
+        """Log the final receiver layout without affecting transfer state."""
+        with self._lock:
+            peer_session_id = self._source_transfer_session_id
+        self.transfer_backend.log_model_layout_summary(
+            model,
+            processed_layout,
+            stage=("receiver_after_transfer_finalize" if processed_layout else "receiver_after_post_load"),
+            peer_session_id=peer_session_id,
+        )
 
     def _ensure_lease_release_retry_locked(self) -> None:
         self._stop_lease_renewal_locked()

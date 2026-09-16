@@ -5,7 +5,10 @@
 
 """Collect live model tensors and adapt their layout for RFork transfer."""
 
+import hashlib
 import inspect
+import json
+import logging
 from collections.abc import Iterator
 from typing import Any
 
@@ -14,6 +17,148 @@ from torch import nn
 from vllm.logger import logger
 
 from vllm_ascend.model_loader.rfork.manifest import numel_from_shape
+
+TENSOR_LAYOUT_SAMPLE_LIMIT = 3
+
+
+def _layout_digest(records: list[dict[str, Any]]) -> str:
+    payload = json.dumps(records, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def log_tensor_layout_summary(
+    tensors: list[tuple[str, torch.Tensor]],
+    *,
+    stage: str,
+    session_id: str | None,
+    processed_layout: bool,
+    peer_session_id: str | None = None,
+    known_formats: dict[str, int] | None = None,
+) -> None:
+    """Log a bounded summary of logical and physical tensor layouts at INFO."""
+    if not logger.isEnabledFor(logging.INFO):
+        return
+
+    try:
+        import torch_npu
+    except Exception:
+        torch_npu = None
+
+    semantic_records: list[dict[str, Any]] = []
+    physical_records: list[dict[str, Any]] = []
+    samples: list[dict[str, Any]] = []
+    fallback_samples: list[dict[str, Any]] = []
+    format_counts: dict[str, int] = {}
+    error_counts: dict[str, int] = {}
+    logical_bytes_total = 0
+    unique_storage_bytes = 0
+    unique_storages: set[tuple[str, int]] = set()
+    storage_view_tensors = 0
+    physical_nonlogical_tensors = 0
+
+    def capture(read, field: str):
+        try:
+            return read()
+        except Exception as exc:
+            error_name = f"{field}:{type(exc).__name__}"
+            error_counts[error_name] = error_counts.get(error_name, 0) + 1
+            return "unavailable"
+
+    for name, tensor in sorted(tensors, key=lambda item: item[0]):
+        device = capture(lambda tensor=tensor: str(tensor.device), "device")
+        dtype = capture(lambda tensor=tensor: str(tensor.dtype), "dtype")
+        shape = capture(lambda tensor=tensor: tuple(int(value) for value in tensor.shape), "shape")
+        stride = capture(lambda tensor=tensor: tuple(int(value) for value in tensor.stride()), "stride")
+        numel = capture(lambda tensor=tensor: int(tensor.numel()), "numel")
+        element_size = capture(lambda tensor=tensor: int(tensor.element_size()), "element_size")
+        logical_bytes = (
+            numel * element_size if isinstance(numel, int) and isinstance(element_size, int) else "unavailable"
+        )
+        storage_offset = capture(lambda tensor=tensor: int(tensor.storage_offset()), "storage_offset")
+        storage_bytes = capture(lambda tensor=tensor: int(tensor.untyped_storage().nbytes()), "storage_bytes")
+        storage_ptr = capture(lambda tensor=tensor: int(tensor.untyped_storage().data_ptr()), "storage_ptr")
+        if known_formats is not None and name in known_formats:
+            npu_format: Any = known_formats[name]
+        elif getattr(getattr(tensor, "device", None), "type", None) == "npu" and torch_npu is not None:
+            npu_format = capture(
+                lambda tensor=tensor: int(torch_npu.get_npu_format(tensor)),
+                "npu_format",
+            )
+        else:
+            npu_format = "unavailable"
+        if getattr(getattr(tensor, "device", None), "type", None) == "npu" and torch_npu is not None:
+            npu_storage_numel: Any = capture(
+                lambda tensor=tensor: int(torch_npu.get_storage_size(tensor)),
+                "npu_storage_numel",
+            )
+        else:
+            npu_storage_numel = "unavailable"
+
+        if isinstance(logical_bytes, int):
+            logical_bytes_total += logical_bytes
+        if isinstance(storage_ptr, int) and isinstance(storage_bytes, int):
+            storage_key = (str(device), storage_ptr)
+            if storage_key not in unique_storages:
+                unique_storages.add(storage_key)
+                unique_storage_bytes += storage_bytes
+        is_storage_view = (
+            isinstance(storage_offset, int)
+            and isinstance(storage_bytes, int)
+            and isinstance(logical_bytes, int)
+            and (storage_offset != 0 or storage_bytes != logical_bytes)
+        )
+        is_physical_nonlogical = (
+            isinstance(npu_storage_numel, int) and isinstance(numel, int) and npu_storage_numel != numel
+        )
+        storage_view_tensors += int(is_storage_view)
+        physical_nonlogical_tensors += int(is_physical_nonlogical)
+
+        semantic = {
+            "name": name,
+            "dtype": dtype,
+            "shape": shape,
+            "stride": stride,
+            "logical_bytes": logical_bytes,
+            "npu_format": npu_format,
+        }
+        physical = {
+            "name": name,
+            "storage_offset": storage_offset,
+            "storage_bytes": storage_bytes,
+            "npu_storage_numel": npu_storage_numel,
+        }
+        semantic_records.append(semantic)
+        physical_records.append(physical)
+        sample = {**semantic, **physical, "device": device}
+        if len(fallback_samples) < TENSOR_LAYOUT_SAMPLE_LIMIT:
+            fallback_samples.append(sample)
+        if (is_storage_view or is_physical_nonlogical) and len(samples) < TENSOR_LAYOUT_SAMPLE_LIMIT:
+            samples.append(sample)
+
+        format_key = str(npu_format)
+        format_counts[format_key] = format_counts.get(format_key, 0) + 1
+
+    if not samples:
+        samples = fallback_samples
+    logger.info(
+        "RFork tensor layout summary: stage=%s session=%s peer_session=%s layout=%s tensors=%d "
+        "logical_bytes=%d unique_storage_bytes=%d storage_view_tensors=%d physical_nonlogical_tensors=%d "
+        "formats=%s semantic_digest=%s physical_digest=%s samples=%s errors=%s",
+        stage,
+        session_id,
+        peer_session_id,
+        "processed" if processed_layout else "checkpoint",
+        len(semantic_records),
+        logical_bytes_total,
+        unique_storage_bytes,
+        storage_view_tensors,
+        physical_nonlogical_tensors,
+        format_counts,
+        _layout_digest(semantic_records),
+        _layout_digest(physical_records),
+        samples,
+        error_counts,
+    )
 
 
 def reshape_tensor_to_seed_shape(
