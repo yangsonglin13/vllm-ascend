@@ -230,6 +230,21 @@ class RForkSession:
             peer_session_id=peer_session_id,
         )
 
+    def log_checkpoint_layout_candidate(self, model) -> None:
+        """Log the pre-post-load layout for diagnostics without affecting loading."""
+        try:
+            self.transfer_backend.log_model_layout_summary(
+                model,
+                False,
+                stage="checkpoint_layout_candidate",
+            )
+        except Exception as exc:
+            # Candidate inspection is observational; a diagnostic failure must not trigger fallback.
+            logger.debug(
+                "RFork checkpoint layout candidate diagnostic failed: %s",
+                type(exc).__name__,
+            )
+
     def _ensure_lease_release_retry_locked(self) -> None:
         self._stop_lease_renewal_locked()
         if (

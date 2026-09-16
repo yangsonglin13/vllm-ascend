@@ -667,6 +667,17 @@ class RForkModelLoader(BaseModelLoader):
                     time.perf_counter() - model_init_start_time,
                 )
 
+                # Capture the common checkpoint-layout candidate before either transfer mode runs
+                # model post-load processing. This is diagnostic only and must not affect loading.
+                try:
+                    session.log_checkpoint_layout_candidate(model)
+                except Exception as exc:
+                    logger.debug(
+                        "RFork %s checkpoint layout candidate diagnostic raised: %s",
+                        _rfork_model_kind(session),
+                        type(exc).__name__,
+                    )
+
                 # Config cannot see model structure; refine the MC2 layout decision on the constructed model.
                 if not processed_layout_transfer and _requires_fused_mc2_processed_layout(model):
                     processed_layout_transfer = True

@@ -17,6 +17,7 @@
 from contextlib import nullcontext
 from functools import wraps
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -315,6 +316,9 @@ def test_rfork_draft_load_passes_target_registered_blocks_to_session(monkeypatch
         def can_reuse_shared_weights(self, model, processed_layout, exclude_blocks):
             return False
 
+        def log_checkpoint_layout_candidate(self, model):
+            events.append("checkpoint_layout_candidate")
+
         def register_destination(self, model, processed_layout, exclude_blocks=None):
             captured_blocks.append(list(exclude_blocks or []))
             return True
@@ -393,6 +397,9 @@ def test_rfork_acquires_seed_after_model_preparation(monkeypatch, processed_layo
     model = _Model()
 
     class _Session:
+        def log_checkpoint_layout_candidate(self, model):
+            events.append("checkpoint_layout_candidate")
+
         def register_destination(self, model, processed_layout, exclude_blocks=None):
             return True
 
@@ -440,9 +447,37 @@ def test_rfork_acquires_seed_after_model_preparation(monkeypatch, processed_layo
     assert loader.load_model(vllm_config=vllm_config, model_config=model_config) is model
 
     if processed_layout:
-        assert events[:6] == ["initialize", "layout", "synchronize", "acquire", "transfer", "layout_summary"]
+        assert events[:7] == [
+            "initialize",
+            "checkpoint_layout_candidate",
+            "layout",
+            "synchronize",
+            "acquire",
+            "transfer",
+            "layout_summary",
+        ]
     else:
-        assert events[:5] == ["initialize", "acquire", "transfer", "post_load", "layout_summary"]
+        assert events[:6] == [
+            "initialize",
+            "checkpoint_layout_candidate",
+            "acquire",
+            "transfer",
+            "post_load",
+            "layout_summary",
+        ]
+
+
+def test_rfork_checkpoint_layout_candidate_is_observational():
+    from vllm_ascend.model_loader.rfork.session import RForkSession
+
+    log_summary = Mock(side_effect=RuntimeError("inspection failed"))
+    session = RForkSession.__new__(RForkSession)
+    session.transfer_backend = SimpleNamespace(log_model_layout_summary=log_summary)
+    model = object()
+
+    session.log_checkpoint_layout_candidate(model)
+
+    log_summary.assert_called_once_with(model, False, stage="checkpoint_layout_candidate")
 
 
 @pytest.mark.parametrize("failure_stage", ["initialize", "layout"])
@@ -467,6 +502,9 @@ def test_rfork_model_preparation_failure_does_not_acquire_seed(monkeypatch, fail
     )
 
     class _Session:
+        def log_checkpoint_layout_candidate(self, model):
+            pass
+
         def register_destination(self, model, processed_layout, exclude_blocks=None):
             return True
 
@@ -725,6 +763,9 @@ def test_rfork_seed_start_failure_returns_valid_model_without_disk_reload(monkey
     model = _Model()
 
     class _Session:
+        def log_checkpoint_layout_candidate(self, model):
+            pass
+
         def register_destination(self, model, processed_layout, exclude_blocks=None):
             return True
 
@@ -789,6 +830,9 @@ def test_rfork_fallback_seed_is_deferred_when_only_lease_release_is_pending(monk
     seed_start_models = []
 
     class _Session:
+        def log_checkpoint_layout_candidate(self, model):
+            pass
+
         def register_destination(self, model, processed_layout, exclude_blocks=None):
             return True
 
@@ -914,6 +958,7 @@ def test_rfork_fallback_clears_only_failed_model_state_before_reinit(monkeypatch
         return expected_model
 
     rfork_session = SimpleNamespace(
+        log_checkpoint_layout_candidate=lambda model: None,
         register_destination=lambda model, processed_layout, exclude_blocks=None: True,
         acquire_seed=lambda: True,
         transfer_from_seed=lambda model, processed_layout: False,
@@ -998,6 +1043,7 @@ def test_rfork_seed_miss_fallback_preserves_existing_process_global_state(monkey
         return expected_model
 
     rfork_session = SimpleNamespace(
+        log_checkpoint_layout_candidate=lambda model: None,
         register_destination=lambda model, processed_layout, exclude_blocks=None: True,
         acquire_seed=lambda: False,
         prepare_for_fallback=lambda: RForkFallbackCleanupResult(True, True, True),
