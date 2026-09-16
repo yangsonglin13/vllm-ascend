@@ -41,7 +41,7 @@ from vllm.model_executor.model_loader.utils import (
 from vllm.utils.torch_utils import set_default_torch_dtype
 
 from vllm_ascend.ascend_config import get_ascend_config
-from vllm_ascend.device.hardware_profile import get_current_hardware_profile
+from vllm_ascend.model_loader.rfork.compat import get_current_hardware_profile
 from vllm_ascend.model_loader.rfork.config import RForkConfig
 from vllm_ascend.model_loader.rfork.identity import build_compatibility_fingerprint
 from vllm_ascend.model_loader.rfork.session import RForkSession
@@ -386,7 +386,7 @@ def _is_dynamic_eplb_enabled(vllm_config: VllmConfig) -> bool:
 def _rfork_skip_unquantized_moe_post_load_processing(model: Module):
     """Suppress unquantized MoE post-load processing; dense layers still run theirs."""
 
-    from vllm_ascend.ops.fused_moe.routed_experts import AscendUnquantizedFusedMoEMethod
+    from vllm_ascend.ops.fused_moe.fused_moe import AscendUnquantizedFusedMoEMethod
 
     restored_methods: list[tuple[Any, object]] = []
     for quant_method in _iter_ascend_moe_quant_methods(model):
