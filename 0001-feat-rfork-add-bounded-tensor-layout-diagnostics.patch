@@ -1,0 +1,551 @@
+From 061aa3ee1cdd93a4e2f0d244eb72175c2574f281 Mon Sep 17 00:00:00 2001
+From: yangsonglin13 <yangsonglin566@gmail.com>
+Date: Wed, 16 Sep 2026 10:00:43 +0800
+Subject: [PATCH 1/3] feat(rfork): add bounded tensor layout diagnostics
+
+Log compact per-stage layout summaries with fixed-size semantic and physical digests, aggregate storage metadata, and bounded tensor samples. Observe receiver layouts before reads and after transfer finalization without changing RFork acceptance or fallback behavior.
+
+Signed-off-by: yangsonglin13 <yangsonglin566@gmail.com>
+---
+ docs/source/user_guide/feature_guide/rfork.md |  20 ++-
+ .../rfork/test_deferred_sharing_isolated.py   |   7 +
+ .../rfork/test_registration_cache_isolated.py | 102 ++++++++++++
+ .../model_loader/rfork/test_rfork_loader.py   |  13 +-
+ .../model_loader/rfork/rfork_loader.py        |   2 +
+ vllm_ascend/model_loader/rfork/session.py     |  14 ++
+ .../model_loader/rfork/tensor_layout.py       | 145 ++++++++++++++++++
+ .../model_loader/rfork/transfer_backend.py    |  51 ++++++
+ 8 files changed, 349 insertions(+), 5 deletions(-)
+
+diff --git a/docs/source/user_guide/feature_guide/rfork.md b/docs/source/user_guide/feature_guide/rfork.md
+index df0c76d63..231773365 100644
+--- a/docs/source/user_guide/feature_guide/rfork.md
++++ b/docs/source/user_guide/feature_guide/rfork.md
+@@ -153,9 +153,9 @@ empty, meta, CPU, gapped, or overlapping tensors are rejected.
+ 
+ Dense transposes are supported because their logical elements still cover one
+ continuous byte range. A receiver tensor may be reshaped with a storage-preserving
+-view when its element count matches the manifest. Both instances must use the
+-same code and effective layout; shape equality alone does not prove arbitrary
+-stride or NZ-padding compatibility.
++view when its element count matches the manifest. Shape equality alone does not
++prove arbitrary stride or physical-layout compatibility; the diagnostic summary
++below records those differences without changing transfer acceptance.
+ 
+ A draft model may reuse tensors already owned and registered by its target. If
+ all transferable tensors are shared, RFork skips draft transfer and post-load
+@@ -226,6 +226,20 @@ vllm serve <model_path> \
+ Successful loads log `source=transfer`, `local`, `fallback`, or `shared_target`.
+ Successful TP0 weight reads also log transfer elapsed time, bytes, chunks, and
+ throughput at INFO; other TP ranks and per-chunk timings remain at DEBUG.
++Every successful registration, receiver-before-read, and final receiver stage
++emits one bounded `RFork tensor layout summary` at INFO per rank. The summary hashes all tensor
++names, shapes, strides, dtypes, NPU formats, logical byte counts, storage byte
++capacities, storage offsets, and NPU descriptor element counts into fixed-size
++semantic and physical digests. It also reports aggregate counts and at most
++three representative tensors, preferring storage views or tensors whose NPU
++descriptor size differs from logical `numel`. Match a receiver's `peer_session`
++to the seed's `session`. Digest differences are diagnostic and do not by
++themselves reject a transfer. On checkpoint-layout transfers, compare
++`receiver_before_read` with `receiver_after_post_load` to determine whether the
++post-load hook rebuilt the layout. Processed-layout transfers instead emit
++`receiver_after_transfer_finalize`, because their layout processing happened
++before the read. The summary does not copy tensor data or prove value equality;
++validate output accuracy separately on NPU hardware.
+ Set `VLLM_LOGGING_LEVEL=DEBUG` for per-rank registration, metadata, transfer,
+ lease-release, and publication timing.
+ 
+diff --git a/tests/ut/model_loader/rfork/test_deferred_sharing_isolated.py b/tests/ut/model_loader/rfork/test_deferred_sharing_isolated.py
+index 111b8c8ec..fb37ee018 100644
+--- a/tests/ut/model_loader/rfork/test_deferred_sharing_isolated.py
++++ b/tests/ut/model_loader/rfork/test_deferred_sharing_isolated.py
+@@ -106,3 +106,10 @@ def test_transfer_restores_load_state_before_read_completion(monkeypatch):
+ 
+     assert session.transfer_from_seed(model, True)
+     assert model.has_own_lm_head is False
++    session.log_transferred_model_layout(model, True)
++    session.transfer_backend.log_model_layout_summary.assert_called_once_with(
++        model,
++        True,
++        stage="receiver_after_transfer_finalize",
++        peer_session_id="seed-session",
++    )
+diff --git a/tests/ut/model_loader/rfork/test_registration_cache_isolated.py b/tests/ut/model_loader/rfork/test_registration_cache_isolated.py
+index 3fdf5a717..b6d436ffa 100644
+--- a/tests/ut/model_loader/rfork/test_registration_cache_isolated.py
++++ b/tests/ut/model_loader/rfork/test_registration_cache_isolated.py
+@@ -1,6 +1,8 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+ 
++import logging
++import re
+ import sys
+ from types import SimpleNamespace
+ from unittest.mock import Mock
+@@ -46,3 +48,103 @@ def test_registered_seed_shared_name_still_skips_local_weight(tensor_runtime, mo
+     assert backend.read_weights_from_seed(object(), seed_info, True)
+     assert backend.seed_shared_names == ["model.embed_tokens.weight"]
+     read.assert_called_once()
++
++
++def test_layout_summary_is_one_bounded_info_record_with_fixed_digests(tensor_runtime, caplog):
++    tensors = [(f"weight_{index}", torch.arange(4, dtype=torch.float32)) for index in range(6)]
++    formats = {name: 29 for name, _ in tensors}
++
++    with caplog.at_level(logging.INFO, logger=tensor_runtime.tensor_layout.logger.name):
++        tensor_runtime.tensor_layout.log_tensor_layout_summary(
++            tensors,
++            stage="receiver_before_read",
++            session_id="receiver-session",
++            peer_session_id="seed-session",
++            processed_layout=True,
++            known_formats=formats,
++        )
++
++    records = [record.getMessage() for record in caplog.records if "RFork tensor layout summary" in record.getMessage()]
++    assert len(records) == 1
++    message = records[0]
++    assert "tensors=6" in message
++    assert "session=receiver-session peer_session=seed-session" in message
++    assert len(re.findall(r"(?:semantic|physical)_digest=[0-9a-f]{64}", message)) == 2
++    assert "weight_0" in message and "weight_2" in message
++    assert "weight_3" not in message and "weight_5" not in message
++
++
++def test_layout_summary_includes_npu_format_and_physical_size(tensor_runtime, monkeypatch, caplog):
++    class _NPUTensorProxy:
++        device = SimpleNamespace(type="npu")
++
++        def __init__(self, tensor):
++            self._tensor = tensor
++
++        def __getattr__(self, name):
++            return getattr(self._tensor, name)
++
++    monkeypatch.setitem(
++        sys.modules,
++        "torch_npu",
++        SimpleNamespace(
++            get_npu_format=lambda tensor: 29,
++            get_storage_size=lambda tensor: tensor.numel() + 8,
++        ),
++    )
++    tensor = _NPUTensorProxy(torch.arange(4, dtype=torch.float32))
++
++    with caplog.at_level(logging.INFO, logger=tensor_runtime.tensor_layout.logger.name):
++        tensor_runtime.tensor_layout.log_tensor_layout_summary(
++            [("weight", tensor)],
++            stage="registered",
++            session_id="seed-session",
++            processed_layout=True,
++        )
++
++    message = next(
++        record.getMessage() for record in caplog.records if "RFork tensor layout summary" in record.getMessage()
++    )
++    assert "physical_nonlogical_tensors=1" in message
++    assert "formats={'29': 1}" in message
++    assert "'npu_format': 29" in message
++    assert "'npu_storage_numel': 12" in message
++
++
++def test_post_load_layout_summary_is_observational(tensor_runtime, monkeypatch, caplog):
++    tensor_layout = tensor_runtime.tensor_layout
++    monkeypatch.setattr(tensor_layout, "is_tensor_on_transfer_device", lambda tensor: True)
++    model = torch.nn.Module()
++    model.weight = torch.nn.Parameter(torch.arange(4, dtype=torch.float32))
++    original = model.weight.detach().clone()
++    backend = tensor_runtime.RForkTransferBackend()
++    backend.transfer_session_id = "receiver-session"
++
++    with caplog.at_level(logging.INFO, logger=tensor_layout.logger.name):
++        backend.log_model_layout_summary(
++            model,
++            False,
++            stage="receiver_after_post_load",
++            peer_session_id="seed-session",
++        )
++
++    message = next(record.getMessage() for record in caplog.records if "RFork tensor layout summary" in record.message)
++    assert "stage=receiver_after_post_load" in message
++    assert "session=receiver-session peer_session=seed-session" in message
++    assert "tensors=1" in message
++    torch.testing.assert_close(model.weight, original)
++
++
++def test_post_load_layout_diagnostic_failure_does_not_escape(tensor_runtime, monkeypatch, caplog):
++    transfer_backend = tensor_runtime.transfer_backend
++    monkeypatch.setattr(
++        transfer_backend,
++        "collect_transferable_tensors",
++        Mock(side_effect=RuntimeError("inspection failed")),
++    )
++    backend = tensor_runtime.RForkTransferBackend()
++
++    with caplog.at_level(logging.INFO, logger=transfer_backend.logger.name):
++        backend.log_model_layout_summary(object(), False, stage="receiver_after_post_load")
++
++    assert "unavailable=RuntimeError:inspection failed" in caplog.text
+diff --git a/tests/ut/model_loader/rfork/test_rfork_loader.py b/tests/ut/model_loader/rfork/test_rfork_loader.py
+index 9509ff27a..438c4a3e3 100644
+--- a/tests/ut/model_loader/rfork/test_rfork_loader.py
++++ b/tests/ut/model_loader/rfork/test_rfork_loader.py
+@@ -327,6 +327,9 @@ def test_rfork_draft_load_passes_target_registered_blocks_to_session(monkeypatch
+             events.append("transfer")
+             return True
+ 
++        def log_transferred_model_layout(self, model, processed_layout):
++            events.append("layout_summary")
++
+         def start_seed_service(self, model, processed_layout, exclude_blocks=None):
+             events.append("start_seed_service")
+             captured_blocks.append(list(exclude_blocks or []))
+@@ -401,6 +404,9 @@ def test_rfork_acquires_seed_after_model_preparation(monkeypatch, processed_layo
+             events.append("transfer")
+             return True
+ 
++        def log_transferred_model_layout(self, model, processed_layout):
++            events.append("layout_summary")
++
+         def start_seed_service(self, model, processed_layout, exclude_blocks=None):
+             events.append("start_seed_service")
+             return True
+@@ -434,9 +440,9 @@ def test_rfork_acquires_seed_after_model_preparation(monkeypatch, processed_layo
+     assert loader.load_model(vllm_config=vllm_config, model_config=model_config) is model
+ 
+     if processed_layout:
+-        assert events[:5] == ["initialize", "layout", "synchronize", "acquire", "transfer"]
++        assert events[:6] == ["initialize", "layout", "synchronize", "acquire", "transfer", "layout_summary"]
+     else:
+-        assert events[:4] == ["initialize", "acquire", "transfer", "post_load"]
++        assert events[:5] == ["initialize", "acquire", "transfer", "post_load", "layout_summary"]
+ 
+ 
+ @pytest.mark.parametrize("failure_stage", ["initialize", "layout"])
+@@ -730,6 +736,9 @@ def test_rfork_seed_start_failure_returns_valid_model_without_disk_reload(monkey
+             events.append("transfer")
+             return True
+ 
++        def log_transferred_model_layout(self, model, processed_layout):
++            events.append("layout_summary")
++
+         def start_seed_service(self, model, processed_layout, exclude_blocks=None):
+             events.append("start_seed_service")
+             return RForkSeedServiceStartResult.FAILED
+diff --git a/vllm_ascend/model_loader/rfork/rfork_loader.py b/vllm_ascend/model_loader/rfork/rfork_loader.py
+index cb22b1518..0b5c9c9d6 100644
+--- a/vllm_ascend/model_loader/rfork/rfork_loader.py
++++ b/vllm_ascend/model_loader/rfork/rfork_loader.py
+@@ -729,6 +729,8 @@ class RForkModelLoader(BaseModelLoader):
+                     with _rfork_skip_unquantized_moe_post_load_processing(model):
+                         process_weights_after_loading(model, model_config, target_device)
+ 
++                session.log_transferred_model_layout(model, processed_layout_transfer)
++
+                 # Advertise only after post-load and eval; the session owns failure cleanup.
+                 model = model.eval()
+                 _publish_rfork_seed(
+diff --git a/vllm_ascend/model_loader/rfork/session.py b/vllm_ascend/model_loader/rfork/session.py
+index d8e17a995..37c01ee9a 100644
+--- a/vllm_ascend/model_loader/rfork/session.py
++++ b/vllm_ascend/model_loader/rfork/session.py
+@@ -68,6 +68,7 @@ class RForkSession:
+         self._lease_release_exhausted = False
+         self._lease_acquired_at: float | None = None
+         self._registration_elapsed = 0.0
++        self._source_transfer_session_id: str | None = None
+         self._deferred_seed_start: tuple[Any, bool, list[tuple[int, int]] | None] | None = None
+         # Draft seed start waits until target weight sharing is final; lease-release promotion must not overtake it.
+         self._deferred_seed_awaiting_sharing = False
+@@ -88,6 +89,7 @@ class RForkSession:
+             ):
+                 return False
+             self.state = RForkLifecycleState.CLEANUP_REQUIRED
++            self._source_transfer_session_id = None
+             started_at = time.monotonic()
+             if not self.transfer_backend.register_memory_region(model, processed_layout, exclude_blocks):
+                 return False
+@@ -203,6 +205,7 @@ class RForkSession:
+                 processed_layout=processed_layout,
+             ):
+                 return False
++            self._source_transfer_session_id = seed_info.session_id
+             self.state = RForkLifecycleState.TRANSFERRED
+             logger.debug(
+                 "RFork transfer stages: lease=%s global_rank=%s registration=%.3fs metadata=%.3fs read=%.3fs",
+@@ -216,6 +219,17 @@ class RForkSession:
+             self._ensure_lease_release_retry_locked()
+             return True
+ 
++    def log_transferred_model_layout(self, model, processed_layout: bool) -> None:
++        """Log the final receiver layout without affecting transfer state."""
++        with self._lock:
++            peer_session_id = self._source_transfer_session_id
++        self.transfer_backend.log_model_layout_summary(
++            model,
++            processed_layout,
++            stage=("receiver_after_transfer_finalize" if processed_layout else "receiver_after_post_load"),
++            peer_session_id=peer_session_id,
++        )
++
+     def _ensure_lease_release_retry_locked(self) -> None:
+         self._stop_lease_renewal_locked()
+         if (
+diff --git a/vllm_ascend/model_loader/rfork/tensor_layout.py b/vllm_ascend/model_loader/rfork/tensor_layout.py
+index 830908e53..1478ecf0e 100644
+--- a/vllm_ascend/model_loader/rfork/tensor_layout.py
++++ b/vllm_ascend/model_loader/rfork/tensor_layout.py
+@@ -5,7 +5,10 @@
+ 
+ """Collect live model tensors and adapt their layout for RFork transfer."""
+ 
++import hashlib
+ import inspect
++import json
++import logging
+ from collections.abc import Iterator
+ from typing import Any
+ 
+@@ -15,6 +18,148 @@ from vllm.logger import logger
+ 
+ from vllm_ascend.model_loader.rfork.manifest import numel_from_shape
+ 
++TENSOR_LAYOUT_SAMPLE_LIMIT = 3
++
++
++def _layout_digest(records: list[dict[str, Any]]) -> str:
++    payload = json.dumps(records, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
++    return hashlib.sha256(payload.encode()).hexdigest()
++
++
++def log_tensor_layout_summary(
++    tensors: list[tuple[str, torch.Tensor]],
++    *,
++    stage: str,
++    session_id: str | None,
++    processed_layout: bool,
++    peer_session_id: str | None = None,
++    known_formats: dict[str, int] | None = None,
++) -> None:
++    """Log a bounded summary of logical and physical tensor layouts at INFO."""
++    if not logger.isEnabledFor(logging.INFO):
++        return
++
++    try:
++        import torch_npu
++    except Exception:
++        torch_npu = None
++
++    semantic_records: list[dict[str, Any]] = []
++    physical_records: list[dict[str, Any]] = []
++    samples: list[dict[str, Any]] = []
++    fallback_samples: list[dict[str, Any]] = []
++    format_counts: dict[str, int] = {}
++    error_counts: dict[str, int] = {}
++    logical_bytes_total = 0
++    unique_storage_bytes = 0
++    unique_storages: set[tuple[str, int]] = set()
++    storage_view_tensors = 0
++    physical_nonlogical_tensors = 0
++
++    def capture(read, field: str):
++        try:
++            return read()
++        except Exception as exc:
++            error_name = f"{field}:{type(exc).__name__}"
++            error_counts[error_name] = error_counts.get(error_name, 0) + 1
++            return "unavailable"
++
++    for name, tensor in sorted(tensors, key=lambda item: item[0]):
++        device = capture(lambda tensor=tensor: str(tensor.device), "device")
++        dtype = capture(lambda tensor=tensor: str(tensor.dtype), "dtype")
++        shape = capture(lambda tensor=tensor: tuple(int(value) for value in tensor.shape), "shape")
++        stride = capture(lambda tensor=tensor: tuple(int(value) for value in tensor.stride()), "stride")
++        numel = capture(lambda tensor=tensor: int(tensor.numel()), "numel")
++        element_size = capture(lambda tensor=tensor: int(tensor.element_size()), "element_size")
++        logical_bytes = (
++            numel * element_size if isinstance(numel, int) and isinstance(element_size, int) else "unavailable"
++        )
++        storage_offset = capture(lambda tensor=tensor: int(tensor.storage_offset()), "storage_offset")
++        storage_bytes = capture(lambda tensor=tensor: int(tensor.untyped_storage().nbytes()), "storage_bytes")
++        storage_ptr = capture(lambda tensor=tensor: int(tensor.untyped_storage().data_ptr()), "storage_ptr")
++        if known_formats is not None and name in known_formats:
++            npu_format: Any = known_formats[name]
++        elif getattr(getattr(tensor, "device", None), "type", None) == "npu" and torch_npu is not None:
++            npu_format = capture(
++                lambda tensor=tensor: int(torch_npu.get_npu_format(tensor)),
++                "npu_format",
++            )
++        else:
++            npu_format = "unavailable"
++        if getattr(getattr(tensor, "device", None), "type", None) == "npu" and torch_npu is not None:
++            npu_storage_numel: Any = capture(
++                lambda tensor=tensor: int(torch_npu.get_storage_size(tensor)),
++                "npu_storage_numel",
++            )
++        else:
++            npu_storage_numel = "unavailable"
++
++        if isinstance(logical_bytes, int):
++            logical_bytes_total += logical_bytes
++        if isinstance(storage_ptr, int) and isinstance(storage_bytes, int):
++            storage_key = (str(device), storage_ptr)
++            if storage_key not in unique_storages:
++                unique_storages.add(storage_key)
++                unique_storage_bytes += storage_bytes
++        is_storage_view = (
++            isinstance(storage_offset, int)
++            and isinstance(storage_bytes, int)
++            and isinstance(logical_bytes, int)
++            and (storage_offset != 0 or storage_bytes != logical_bytes)
++        )
++        is_physical_nonlogical = (
++            isinstance(npu_storage_numel, int) and isinstance(numel, int) and npu_storage_numel != numel
++        )
++        storage_view_tensors += int(is_storage_view)
++        physical_nonlogical_tensors += int(is_physical_nonlogical)
++
++        semantic = {
++            "name": name,
++            "dtype": dtype,
++            "shape": shape,
++            "stride": stride,
++            "logical_bytes": logical_bytes,
++            "npu_format": npu_format,
++        }
++        physical = {
++            "name": name,
++            "storage_offset": storage_offset,
++            "storage_bytes": storage_bytes,
++            "npu_storage_numel": npu_storage_numel,
++        }
++        semantic_records.append(semantic)
++        physical_records.append(physical)
++        sample = {**semantic, **physical, "device": device}
++        if len(fallback_samples) < TENSOR_LAYOUT_SAMPLE_LIMIT:
++            fallback_samples.append(sample)
++        if (is_storage_view or is_physical_nonlogical) and len(samples) < TENSOR_LAYOUT_SAMPLE_LIMIT:
++            samples.append(sample)
++
++        format_key = str(npu_format)
++        format_counts[format_key] = format_counts.get(format_key, 0) + 1
++
++    if not samples:
++        samples = fallback_samples
++    logger.info(
++        "RFork tensor layout summary: stage=%s session=%s peer_session=%s layout=%s tensors=%d "
++        "logical_bytes=%d unique_storage_bytes=%d storage_view_tensors=%d physical_nonlogical_tensors=%d "
++        "formats=%s semantic_digest=%s physical_digest=%s samples=%s errors=%s",
++        stage,
++        session_id,
++        peer_session_id,
++        "processed" if processed_layout else "checkpoint",
++        len(semantic_records),
++        logical_bytes_total,
++        unique_storage_bytes,
++        storage_view_tensors,
++        physical_nonlogical_tensors,
++        format_counts,
++        _layout_digest(semantic_records),
++        _layout_digest(physical_records),
++        samples,
++        error_counts,
++    )
++
+ 
+ def reshape_tensor_to_seed_shape(
+     name: str,
+diff --git a/vllm_ascend/model_loader/rfork/transfer_backend.py b/vllm_ascend/model_loader/rfork/transfer_backend.py
+index a16d27c63..e3061ad42 100644
+--- a/vllm_ascend/model_loader/rfork/transfer_backend.py
++++ b/vllm_ascend/model_loader/rfork/transfer_backend.py
+@@ -26,6 +26,7 @@ from vllm_ascend.model_loader.rfork.tensor_layout import (
+     collect_transferable_tensors,
+     find_non_npu_state_tensors,
+     is_transferable_tensor,
++    log_tensor_layout_summary,
+     reshape_tensor_to_seed_shape,
+     validate_transferable_tensor_layout,
+ )
+@@ -36,6 +37,7 @@ MAX_TRANSFER_CHUNK_SEGMENTS = 512
+ MAX_MEMORY_REGISTRATION_BATCH_ITEMS = 4096
+ MAX_TRANSFER_ENGINE_FINALIZE_ATTEMPTS = 10
+ TRANSFER_ENGINE_FINALIZE_RETRY_INTERVAL_SEC = 1.0
++TENSOR_LAYOUT_ERROR_EXCERPT_CHARS = 256
+ POST_LOAD_REGENERATED_TENSOR_NAMES = frozenset(
+     {
+         "W_UK_T",
+@@ -271,6 +273,39 @@ class RForkTransferBackend:
+         with self._lifecycle_lock:
+             return list(self.registered_weight_blocks)
+ 
++    def log_model_layout_summary(
++        self,
++        model,
++        processed_layout: bool,
++        *,
++        stage: str,
++        peer_session_id: str | None = None,
++    ) -> None:
++        """Observe a live model layout without changing transfer acceptance."""
++        try:
++            with self._lifecycle_lock:
++                tensors = list(collect_transferable_tensors(model, processed_layout))
++                tensors, _ = _split_tensors_by_excluded_blocks(tensors, self.excluded_weight_blocks)
++                log_tensor_layout_summary(
++                    tensors,
++                    stage=stage,
++                    session_id=self.transfer_session_id,
++                    peer_session_id=peer_session_id,
++                    processed_layout=processed_layout,
++                )
++        except Exception as exc:
++            # Diagnostics must not turn an otherwise usable transferred model into a fallback.
++            error_excerpt = " ".join(str(exc).split())[:TENSOR_LAYOUT_ERROR_EXCERPT_CHARS]
++            logger.info(
++                "RFork tensor layout summary: stage=%s session=%s peer_session=%s layout=%s unavailable=%s:%s",
++                stage,
++                self.transfer_session_id,
++                peer_session_id,
++                "processed" if processed_layout else "checkpoint",
++                type(exc).__name__,
++                error_excerpt,
++            )
++
+     def register_memory_region(
+         self,
+         model,
+@@ -476,6 +511,13 @@ class RForkTransferBackend:
+             time.perf_counter() - start_reg_mr_time,
+             len(weight_mr_dict),
+         )
++        log_tensor_layout_summary(
++            transferable_tensors,
++            stage="registration",
++            session_id=self.transfer_session_id,
++            processed_layout=processed_layout,
++            known_formats=weight_format_dict,
++        )
+         return True
+ 
+     def _unregister_weight_blocks(self, transfer_engine: Any) -> bool:
+@@ -769,6 +811,15 @@ class RForkTransferBackend:
+             client_ptr_list.append(tensor.data_ptr())
+             client_len_list.append(tensor.numel() * tensor.element_size())
+ 
++        log_tensor_layout_summary(
++            [(name, tensor) for name, tensor in transferable_tensors if name not in skipped_shared_names],
++            stage="receiver_before_read",
++            session_id=self.transfer_session_id,
++            peer_session_id=seed_info.session_id,
++            processed_layout=processed_layout,
++            known_formats=self.weight_formats,
++        )
++
+         chunks = list(iter_transfer_chunks(weight_names, seed_ptr_list, client_ptr_list, client_len_list))
+         total_bytes = sum(client_len_list)
+         total_gib = total_bytes / (1024**3)
+-- 
+2.51.0.windows.1
+

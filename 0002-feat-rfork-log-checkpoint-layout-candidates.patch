@@ -1,0 +1,183 @@
+From 30ea4d7e5b2c62c0ee98bba01fffe1c4a8f94bd2 Mon Sep 17 00:00:00 2001
+From: yangsonglin13 <yangsonglin566@gmail.com>
+Date: Wed, 16 Sep 2026 15:22:08 +0800
+Subject: [PATCH 2/3] feat(rfork): log checkpoint layout candidates
+
+Record bounded checkpoint-layout summaries before post-load processing so prefill and decode candidates can be compared without changing transfer behavior. Keep diagnostic failures observational and cover both transfer paths.
+
+Signed-off-by: yangsonglin13 <yangsonglin566@gmail.com>
+---
+ .../model_loader/rfork/test_rfork_loader.py   | 50 ++++++++++++++++++-
+ .../model_loader/rfork/rfork_loader.py        | 11 ++++
+ vllm_ascend/model_loader/rfork/session.py     | 15 ++++++
+ 3 files changed, 74 insertions(+), 2 deletions(-)
+
+diff --git a/tests/ut/model_loader/rfork/test_rfork_loader.py b/tests/ut/model_loader/rfork/test_rfork_loader.py
+index 438c4a3e3..db2d04778 100644
+--- a/tests/ut/model_loader/rfork/test_rfork_loader.py
++++ b/tests/ut/model_loader/rfork/test_rfork_loader.py
+@@ -17,6 +17,7 @@
+ from contextlib import nullcontext
+ from functools import wraps
+ from types import SimpleNamespace
++from unittest.mock import Mock
+ 
+ import pytest
+ import torch
+@@ -315,6 +316,9 @@ def test_rfork_draft_load_passes_target_registered_blocks_to_session(monkeypatch
+         def can_reuse_shared_weights(self, model, processed_layout, exclude_blocks):
+             return False
+ 
++        def log_checkpoint_layout_candidate(self, model):
++            events.append("checkpoint_layout_candidate")
++
+         def register_destination(self, model, processed_layout, exclude_blocks=None):
+             captured_blocks.append(list(exclude_blocks or []))
+             return True
+@@ -393,6 +397,9 @@ def test_rfork_acquires_seed_after_model_preparation(monkeypatch, processed_layo
+     model = _Model()
+ 
+     class _Session:
++        def log_checkpoint_layout_candidate(self, model):
++            events.append("checkpoint_layout_candidate")
++
+         def register_destination(self, model, processed_layout, exclude_blocks=None):
+             return True
+ 
+@@ -440,9 +447,37 @@ def test_rfork_acquires_seed_after_model_preparation(monkeypatch, processed_layo
+     assert loader.load_model(vllm_config=vllm_config, model_config=model_config) is model
+ 
+     if processed_layout:
+-        assert events[:6] == ["initialize", "layout", "synchronize", "acquire", "transfer", "layout_summary"]
++        assert events[:7] == [
++            "initialize",
++            "checkpoint_layout_candidate",
++            "layout",
++            "synchronize",
++            "acquire",
++            "transfer",
++            "layout_summary",
++        ]
+     else:
+-        assert events[:5] == ["initialize", "acquire", "transfer", "post_load", "layout_summary"]
++        assert events[:6] == [
++            "initialize",
++            "checkpoint_layout_candidate",
++            "acquire",
++            "transfer",
++            "post_load",
++            "layout_summary",
++        ]
++
++
++def test_rfork_checkpoint_layout_candidate_is_observational():
++    from vllm_ascend.model_loader.rfork.session import RForkSession
++
++    log_summary = Mock(side_effect=RuntimeError("inspection failed"))
++    session = RForkSession.__new__(RForkSession)
++    session.transfer_backend = SimpleNamespace(log_model_layout_summary=log_summary)
++    model = object()
++
++    session.log_checkpoint_layout_candidate(model)
++
++    log_summary.assert_called_once_with(model, False, stage="checkpoint_layout_candidate")
+ 
+ 
+ @pytest.mark.parametrize("failure_stage", ["initialize", "layout"])
+@@ -467,6 +502,9 @@ def test_rfork_model_preparation_failure_does_not_acquire_seed(monkeypatch, fail
+     )
+ 
+     class _Session:
++        def log_checkpoint_layout_candidate(self, model):
++            pass
++
+         def register_destination(self, model, processed_layout, exclude_blocks=None):
+             return True
+ 
+@@ -725,6 +763,9 @@ def test_rfork_seed_start_failure_returns_valid_model_without_disk_reload(monkey
+     model = _Model()
+ 
+     class _Session:
++        def log_checkpoint_layout_candidate(self, model):
++            pass
++
+         def register_destination(self, model, processed_layout, exclude_blocks=None):
+             return True
+ 
+@@ -789,6 +830,9 @@ def test_rfork_fallback_seed_is_deferred_when_only_lease_release_is_pending(monk
+     seed_start_models = []
+ 
+     class _Session:
++        def log_checkpoint_layout_candidate(self, model):
++            pass
++
+         def register_destination(self, model, processed_layout, exclude_blocks=None):
+             return True
+ 
+@@ -914,6 +958,7 @@ def test_rfork_fallback_clears_only_failed_model_state_before_reinit(monkeypatch
+         return expected_model
+ 
+     rfork_session = SimpleNamespace(
++        log_checkpoint_layout_candidate=lambda model: None,
+         register_destination=lambda model, processed_layout, exclude_blocks=None: True,
+         acquire_seed=lambda: True,
+         transfer_from_seed=lambda model, processed_layout: False,
+@@ -998,6 +1043,7 @@ def test_rfork_seed_miss_fallback_preserves_existing_process_global_state(monkey
+         return expected_model
+ 
+     rfork_session = SimpleNamespace(
++        log_checkpoint_layout_candidate=lambda model: None,
+         register_destination=lambda model, processed_layout, exclude_blocks=None: True,
+         acquire_seed=lambda: False,
+         prepare_for_fallback=lambda: RForkFallbackCleanupResult(True, True, True),
+diff --git a/vllm_ascend/model_loader/rfork/rfork_loader.py b/vllm_ascend/model_loader/rfork/rfork_loader.py
+index 0b5c9c9d6..c2cef9e50 100644
+--- a/vllm_ascend/model_loader/rfork/rfork_loader.py
++++ b/vllm_ascend/model_loader/rfork/rfork_loader.py
+@@ -667,6 +667,17 @@ class RForkModelLoader(BaseModelLoader):
+                     time.perf_counter() - model_init_start_time,
+                 )
+ 
++                # Capture the common checkpoint-layout candidate before either transfer mode runs
++                # model post-load processing. This is diagnostic only and must not affect loading.
++                try:
++                    session.log_checkpoint_layout_candidate(model)
++                except Exception as exc:
++                    logger.debug(
++                        "RFork %s checkpoint layout candidate diagnostic raised: %s",
++                        _rfork_model_kind(session),
++                        type(exc).__name__,
++                    )
++
+                 # Config cannot see model structure; refine the MC2 layout decision on the constructed model.
+                 if not processed_layout_transfer and _requires_fused_mc2_processed_layout(model):
+                     processed_layout_transfer = True
+diff --git a/vllm_ascend/model_loader/rfork/session.py b/vllm_ascend/model_loader/rfork/session.py
+index 37c01ee9a..d5397d908 100644
+--- a/vllm_ascend/model_loader/rfork/session.py
++++ b/vllm_ascend/model_loader/rfork/session.py
+@@ -230,6 +230,21 @@ class RForkSession:
+             peer_session_id=peer_session_id,
+         )
+ 
++    def log_checkpoint_layout_candidate(self, model) -> None:
++        """Log the pre-post-load layout for diagnostics without affecting loading."""
++        try:
++            self.transfer_backend.log_model_layout_summary(
++                model,
++                False,
++                stage="checkpoint_layout_candidate",
++            )
++        except Exception as exc:
++            # Candidate inspection is observational; a diagnostic failure must not trigger fallback.
++            logger.debug(
++                "RFork checkpoint layout candidate diagnostic failed: %s",
++                type(exc).__name__,
++            )
++
+     def _ensure_lease_release_retry_locked(self) -> None:
+         self._stop_lease_renewal_locked()
+         if (
+-- 
+2.51.0.windows.1
+
