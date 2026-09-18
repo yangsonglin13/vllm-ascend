@@ -1,0 +1,438 @@
+From 7ddcfca9291fe9336a1ab8f9064d0dd819ddb2a4 Mon Sep 17 00:00:00 2001
+From: yangsonglin13 <yangsonglin566@gmail.com>
+Date: Wed, 16 Sep 2026 16:41:30 +0800
+Subject: [PATCH 6/6] fix(rfork): harden cleanup and planner concurrency
+
+Guard shutdown against reentrant cleanup and unregister its atexit callback after successful finalization. Serialize seed advertisement updates across heartbeat and shutdown, and narrow planner and loader fallback exception handling to expected failures.
+
+Deduplicate exact tensor aliases exposed by implementation objects while preserving distinct shared views. Clarify that planner 404 responses represent idempotent seed absence for RFork clients.
+
+Signed-off-by: yangsonglin13 <yangsonglin566@gmail.com>
+---
+ examples/rfork/rfork_planner.py               |   3 +-
+ .../rfork/test_transfer_backend.py            |  13 ++
+ .../model_loader/rfork/planner_client.py      | 117 +++++++++---------
+ .../model_loader/rfork/rfork_loader.py        |  17 ++-
+ vllm_ascend/model_loader/rfork/session.py     |  50 +++++---
+ .../model_loader/rfork/tensor_layout.py       |  75 ++++++-----
+ 6 files changed, 165 insertions(+), 110 deletions(-)
+
+diff --git a/examples/rfork/rfork_planner.py b/examples/rfork/rfork_planner.py
+index 61cb79f30..197eb6c00 100644
+--- a/examples/rfork/rfork_planner.py
++++ b/examples/rfork/rfork_planner.py
+@@ -496,7 +496,8 @@ def build_router(store: Store):
+             seed_port=parsed.seed_port,
+             seed_rank=parsed.seed_rank,
+         )
+-        # Treat an already GC'd seed as successfully removed.
++        # Preserve a 404 for an already GC'd seed. RFork clients treat this
++        # confirmed absence as an idempotent removal success.
+         if not removed:
+             return Response(status_code=status.HTTP_404_NOT_FOUND)
+         return Response(status_code=status.HTTP_200_OK)
+diff --git a/tests/ut/model_loader/rfork/test_transfer_backend.py b/tests/ut/model_loader/rfork/test_transfer_backend.py
+index e0b771d38..5b9497029 100644
+--- a/tests/ut/model_loader/rfork/test_transfer_backend.py
++++ b/tests/ut/model_loader/rfork/test_transfer_backend.py
+@@ -22,6 +22,7 @@ from typing import Any
+ import torch
+ 
+ import vllm_ascend.model_loader.rfork.transfer_backend as transfer_backend
++from vllm_ascend.model_loader.rfork import tensor_layout
+ from vllm_ascend.model_loader.rfork.transfer_backend import (
+     RForkTransferBackend,
+     _split_tensors_by_excluded_blocks,
+@@ -34,6 +35,18 @@ def _extend_and_return(items: list[Any], values: Any, result: Any) -> Any:
+     return result
+ 
+ 
++def test_tensor_collection_deduplicates_exact_impl_alias_but_keeps_distinct_view(monkeypatch):
++    weight = torch.nn.Parameter(torch.arange(4, dtype=torch.float32))
++    model = torch.nn.Module()
++    model.register_parameter("weight", weight)
++    model.impl = SimpleNamespace(weight=weight, view=weight[:2])
++    monkeypatch.setattr(tensor_layout, "is_transferable_tensor", lambda _tensor: True)
++
++    collected = tensor_layout.collect_processed_layout_tensors(model)
++
++    assert [(name, tensor.numel()) for name, tensor in collected] == [("weight", 4), ("impl.view", 2)]
++
++
+ def test_read_weights_from_seed_refreshes_registered_shape_after_reshape(monkeypatch):
+     tensor = torch.arange(6).reshape(2, 3)
+     backend = RForkTransferBackend.__new__(RForkTransferBackend)
+diff --git a/vllm_ascend/model_loader/rfork/planner_client.py b/vllm_ascend/model_loader/rfork/planner_client.py
+index 0659a6ab7..6613275d8 100644
+--- a/vllm_ascend/model_loader/rfork/planner_client.py
++++ b/vllm_ascend/model_loader/rfork/planner_client.py
+@@ -44,6 +44,7 @@ class RForkPlannerClient:
+         self.request_timeout_sec = float(request_timeout_sec)
+         self.config = config
+         self.last_advertisement: SeedAdvertisement | None = None
++        self._advertisement_lock = threading.Lock()
+         compatibility_fingerprint = identity.compatibility_fingerprint
+         if compatibility_fingerprint is None:
+             raise RuntimeError(
+@@ -104,7 +105,7 @@ class RForkPlannerClient:
+                 seed_rank=parsed_rank,
+                 seed_key=self.seed_key,
+             )
+-        except Exception as exc:
++        except (requests.RequestException, RuntimeError, ValueError) as exc:
+             logger.warning("RFork planner seed acquisition failed: %s", exc)
+             return None
+ 
+@@ -169,68 +170,72 @@ class RForkPlannerClient:
+     def remove_seed(self, advertisement: SeedAdvertisement | None = None) -> bool:
+         try:
+             self._require_planner()
+-        except Exception as exc:
++        except RuntimeError as exc:
+             logger.warning("RFork planner seed removal setup failed: %s", exc)
+             return False
+ 
+-        target = advertisement or self.last_advertisement
+-        if target is None:
+-            return True
+-        headers = {
+-            "SEED_KEY": self.seed_key,
+-            "SEED_IP": target.seed_ip,
+-            "SEED_PORT": str(target.seed_port),
+-            "SEED_RANK": str(target.seed_rank),
+-        }
+-        for attempt in range(SEED_REMOVAL_MAX_ATTEMPTS):
+-            try:
+-                response = requests.post(
+-                    f"{self.planner_url}/remove_seed",
+-                    headers=headers,
+-                    timeout=self.request_timeout_sec,
+-                )
+-                if response.status_code in (200, 404):
+-                    if target == self.last_advertisement:
+-                        self.last_advertisement = None
+-                    return True
+-                logger.warning(
+-                    "RFork planner seed removal attempt %d/%d returned status=%s",
+-                    attempt + 1,
+-                    SEED_REMOVAL_MAX_ATTEMPTS,
+-                    response.status_code,
+-                )
+-            except Exception as exc:
+-                logger.warning(
+-                    "RFork planner seed removal attempt %d/%d failed: %s",
+-                    attempt + 1,
+-                    SEED_REMOVAL_MAX_ATTEMPTS,
+-                    exc,
+-                )
+-            if attempt + 1 < SEED_REMOVAL_MAX_ATTEMPTS:
+-                time.sleep(SEED_REMOVAL_RETRY_BACKOFF_SEC * (attempt + 1))
+-        return False
++        # Serialize seed reporting and removal across the heartbeat and shutdown
++        # threads so a successful removal cannot clear a newer advertisement.
++        with self._advertisement_lock:
++            target = advertisement or self.last_advertisement
++            if target is None:
++                return True
++            headers = {
++                "SEED_KEY": self.seed_key,
++                "SEED_IP": target.seed_ip,
++                "SEED_PORT": str(target.seed_port),
++                "SEED_RANK": str(target.seed_rank),
++            }
++            for attempt in range(SEED_REMOVAL_MAX_ATTEMPTS):
++                try:
++                    response = requests.post(
++                        f"{self.planner_url}/remove_seed",
++                        headers=headers,
++                        timeout=self.request_timeout_sec,
++                    )
++                    if response.status_code in (200, 404):
++                        if target == self.last_advertisement:
++                            self.last_advertisement = None
++                        return True
++                    logger.warning(
++                        "RFork planner seed removal attempt %d/%d returned status=%s",
++                        attempt + 1,
++                        SEED_REMOVAL_MAX_ATTEMPTS,
++                        response.status_code,
++                    )
++                except requests.RequestException as exc:
++                    logger.warning(
++                        "RFork planner seed removal attempt %d/%d failed: %s",
++                        attempt + 1,
++                        SEED_REMOVAL_MAX_ATTEMPTS,
++                        exc,
++                    )
++                if attempt + 1 < SEED_REMOVAL_MAX_ATTEMPTS:
++                    time.sleep(SEED_REMOVAL_RETRY_BACKOFF_SEC * (attempt + 1))
++            return False
+ 
+     def report_seed_once(self, port: int, seed_ip: str | None = None) -> bool:
+         try:
+             self._require_planner()
+-            advertisement = SeedAdvertisement(seed_ip or get_ip(), port, self.tp_rank)
+-            response = requests.post(
+-                f"{self.planner_url}/add_seed",
+-                headers={
+-                    "SEED_KEY": self.seed_key,
+-                    "SEED_IP": advertisement.seed_ip,
+-                    "SEED_PORT": str(advertisement.seed_port),
+-                    "SEED_RANK": str(advertisement.seed_rank),
+-                    "SEED_REFCNT": "0",
+-                },
+-                timeout=self.request_timeout_sec,
+-            )
+-            if response.status_code != 200:
+-                logger.warning("RFork planner seed report returned status=%s", response.status_code)
+-                return False
+-            self.last_advertisement = advertisement
+-            return True
+-        except Exception as exc:
++            with self._advertisement_lock:
++                advertisement = SeedAdvertisement(seed_ip or get_ip(), port, self.tp_rank)
++                response = requests.post(
++                    f"{self.planner_url}/add_seed",
++                    headers={
++                        "SEED_KEY": self.seed_key,
++                        "SEED_IP": advertisement.seed_ip,
++                        "SEED_PORT": str(advertisement.seed_port),
++                        "SEED_RANK": str(advertisement.seed_rank),
++                        "SEED_REFCNT": "0",
++                    },
++                    timeout=self.request_timeout_sec,
++                )
++                if response.status_code != 200:
++                    logger.warning("RFork planner seed report returned status=%s", response.status_code)
++                    return False
++                self.last_advertisement = advertisement
++                return True
++        except (requests.RequestException, RuntimeError, ValueError, OSError) as exc:
+             logger.warning("RFork planner seed report failed: %s", exc)
+             return False
+ 
+diff --git a/vllm_ascend/model_loader/rfork/rfork_loader.py b/vllm_ascend/model_loader/rfork/rfork_loader.py
+index 4d0402255..d6007839a 100644
+--- a/vllm_ascend/model_loader/rfork/rfork_loader.py
++++ b/vllm_ascend/model_loader/rfork/rfork_loader.py
+@@ -57,6 +57,7 @@ class _RForkSeedUnavailable(RuntimeError):
+ 
+ 
+ FALLBACK_CLEANUP_MAX_ATTEMPTS = 2
++RFORK_FALLBACK_EXCEPTIONS = (ImportError, OSError, RuntimeError, ValueError)
+ 
+ 
+ @dataclass
+@@ -642,12 +643,16 @@ class RForkModelLoader(BaseModelLoader):
+                 )
+                 return model
+             except _RForkSeedUnavailable:
+-                assert session is not None
+-                logger.debug(
+-                    "RFork has no available %s seed; loading locally and registering this worker as a seed.",
+-                    _rfork_model_kind(session),
+-                )
+-            except Exception as e:
++                if session is None:
++                    logger.warning(
++                        "RFork seed lookup ended before session initialization; falling back to the default loader."
++                    )
++                else:
++                    logger.debug(
++                        "RFork has no available %s seed; loading locally and registering this worker as a seed.",
++                        _rfork_model_kind(session),
++                    )
++            except RFORK_FALLBACK_EXCEPTIONS as e:
+                 # A queued/captured LogRecord must not retain the exception's
+                 # traceback and the discarded model through its arguments.
+                 logger.warning("RFork transfer failed: %s, clean up and fall back to default loader", str(e))
+diff --git a/vllm_ascend/model_loader/rfork/session.py b/vllm_ascend/model_loader/rfork/session.py
+index 63164d2f5..1033248c4 100644
+--- a/vllm_ascend/model_loader/rfork/session.py
++++ b/vllm_ascend/model_loader/rfork/session.py
+@@ -59,7 +59,9 @@ class RForkSession:
+         self._lease_acquired_at: float | None = None
+         self._deferred_seed_start: tuple[Any, bool, list[tuple[int, int]] | None] | None = None
+         self._lock = threading.RLock()
+-        atexit.register(self.shutdown)
++        self._shutdown_in_progress = False
++        self._atexit_callback = self.shutdown
++        atexit.register(self._atexit_callback)
+ 
+     def acquire_seed(self) -> bool:
+         with self._lock:
+@@ -465,20 +467,32 @@ class RForkSession:
+         with self._lock:
+             if self.state is RForkLifecycleState.FINALIZED:
+                 return True
+-            self._deferred_seed_start = None
+-            service_ok = self._stop_seed_service_locked()
+-            release_ok = self.seed_lease is None
+-            finalize_ok = self.transfer_backend.finalize_transfer_engine() if service_ok and release_ok else False
+-            if finalize_ok:
+-                self.state = RForkLifecycleState.FINALIZED
+-            elif not service_ok:
+-                logger.warning("RFork shutdown retained registered memory because seed service cleanup is incomplete.")
+-            elif not release_ok:
+-                logger.warning(
+-                    "RFork shutdown retained TransferEngine state because the source lease is unresolved. "
+-                    "No new release retries will be started; an in-flight request may still acknowledge. "
+-                    "Otherwise lease recovery depends on the planner's expiry/reclamation policy."
+-                )
+-            else:
+-                logger.warning("RFork shutdown retained TransferEngine state because finalization did not complete.")
+-            return service_ok and release_ok and finalize_ok
++            if self._shutdown_in_progress:
++                logger.debug("RFork shutdown is already in progress; skipping a reentrant cleanup request.")
++                return False
++            self._shutdown_in_progress = True
++            try:
++                self._deferred_seed_start = None
++                service_ok = self._stop_seed_service_locked()
++                release_ok = self.seed_lease is None
++                finalize_ok = self.transfer_backend.finalize_transfer_engine() if service_ok and release_ok else False
++                if finalize_ok:
++                    self.state = RForkLifecycleState.FINALIZED
++                    atexit.unregister(self._atexit_callback)
++                elif not service_ok:
++                    logger.warning(
++                        "RFork shutdown retained registered memory because seed service cleanup is incomplete."
++                    )
++                elif not release_ok:
++                    logger.warning(
++                        "RFork shutdown retained TransferEngine state because the source lease is unresolved. "
++                        "No new release retries will be started; an in-flight request may still acknowledge. "
++                        "Otherwise lease recovery depends on the planner's expiry/reclamation policy."
++                    )
++                else:
++                    logger.warning(
++                        "RFork shutdown retained TransferEngine state because finalization did not complete."
++                    )
++                return service_ok and release_ok and finalize_ok
++            finally:
++                self._shutdown_in_progress = False
+diff --git a/vllm_ascend/model_loader/rfork/tensor_layout.py b/vllm_ascend/model_loader/rfork/tensor_layout.py
+index 8070b1557..f2358bd42 100644
+--- a/vllm_ascend/model_loader/rfork/tensor_layout.py
++++ b/vllm_ascend/model_loader/rfork/tensor_layout.py
+@@ -110,46 +110,62 @@ def _try_collect(
+     name: str,
+     tensor: torch.Tensor,
+     seen_names: dict[str, int],
++    seen_tensors: dict[tuple[Any, ...], int],
+     collected: list[tuple[str, torch.Tensor]],
+ ) -> None:
+     if not is_transferable_tensor(tensor):
+         return
+     data_ptr = tensor.data_ptr()
++    tensor_signature = (
++        data_ptr,
++        tensor.numel(),
++        tuple(tensor.shape),
++        tensor.dtype,
++        tensor.device,
++        tuple(tensor.stride()),
++    )
+     existing_index = seen_names.get(name)
+-    if existing_index is None:
+-        seen_names[name] = len(collected)
+-        collected.append((name, tensor))
+-        return
+-
+-    # The same logical name can be encountered through named_parameters and a
+-    # public implementation attribute.  Deduplicate it only when it describes
+-    # exactly the same logical tensor.  A same-pointer view with a different
+-    # range or layout is a conflicting manifest entry and must fail loudly;
+-    # silently choosing the smaller or larger view can make a seed and receiver
+-    # disagree about the bytes represented by that name.
+-    existing_tensor = collected[existing_index][1]
+-    if existing_tensor is tensor or (
+-        existing_tensor.data_ptr() == data_ptr
+-        and existing_tensor.numel() == tensor.numel()
+-        and tuple(existing_tensor.shape) == tuple(tensor.shape)
+-        and existing_tensor.dtype == tensor.dtype
+-        and tuple(existing_tensor.stride()) == tuple(tensor.stride())
+-    ):
++    if existing_index is not None:
++        # A repeated logical name must always describe the same bytes and
++        # layout. Silently accepting a different view would make the seed and
++        # receiver disagree about the manifest entry.
++        existing_tensor = collected[existing_index][1]
++        if existing_tensor is tensor or tensor_signature == (
++            existing_tensor.data_ptr(),
++            existing_tensor.numel(),
++            tuple(existing_tensor.shape),
++            existing_tensor.dtype,
++            existing_tensor.device,
++            tuple(existing_tensor.stride()),
++        ):
++            return
++        raise ValueError(
++            "RFork encountered conflicting tensor entries for logical name "
++            f"{name!r}; shape, dtype, stride, or storage differs."
++        )
++
++    # named_parameters/named_buffers are canonical. An implementation object
++    # can expose the exact same tensor under another public name; transferring
++    # that identical range twice only bloats the manifest and transfer request.
++    # Views with a different range or layout retain their own logical entry.
++    existing_index = seen_tensors.get(tensor_signature)
++    if existing_index is not None:
++        seen_names[name] = existing_index
+         return
+ 
+-    raise ValueError(
+-        "RFork encountered conflicting tensor entries for logical name "
+-        f"{name!r}; shape, dtype, stride, or storage differs."
+-    )
++    seen_names[name] = len(collected)
++    seen_tensors[tensor_signature] = len(collected)
++    collected.append((name, tensor))
+ 
+ 
+ def collect_processed_layout_tensors(model: nn.Module) -> list[tuple[str, torch.Tensor]]:
+     seen: dict[str, int] = {}
++    seen_tensors: dict[tuple[Any, ...], int] = {}
+     collected: list[tuple[str, torch.Tensor]] = []
+     for name, tensor in model.named_parameters():
+-        _try_collect(name, tensor, seen, collected)
++        _try_collect(name, tensor, seen, seen_tensors, collected)
+     for name, tensor in model.named_buffers():
+-        _try_collect(name, tensor, seen, collected)
++        _try_collect(name, tensor, seen, seen_tensors, collected)
+     for module_prefix, module in model.named_modules():
+         for attr_name, attr_value in vars(module).items():
+             if attr_name.startswith("_") or isinstance(attr_value, nn.Module):
+@@ -161,24 +177,25 @@ def collect_processed_layout_tensors(model: nn.Module) -> list[tuple[str, torch.
+                 attr_name == "impl",
+             ):
+                 full_name = f"{module_prefix}.{tensor_name}" if module_prefix else tensor_name
+-                _try_collect(full_name, tensor, seen, collected)
++                _try_collect(full_name, tensor, seen, seen_tensors, collected)
+     return collected
+ 
+ 
+ def collect_checkpoint_layout_tensors(model: nn.Module) -> list[tuple[str, torch.Tensor]]:
+     seen: dict[str, int] = {}
++    seen_tensors: dict[tuple[Any, ...], int] = {}
+     collected: list[tuple[str, torch.Tensor]] = []
+     for name, tensor in model.named_parameters():
+-        _try_collect(name, tensor, seen, collected)
++        _try_collect(name, tensor, seen, seen_tensors, collected)
+     for name, tensor in model.named_buffers():
+-        _try_collect(name, tensor, seen, collected)
++        _try_collect(name, tensor, seen, seen_tensors, collected)
+     for module_prefix, module in model.named_modules():
+         impl = getattr(module, "impl", None)
+         if impl is None or isinstance(impl, nn.Module):
+             continue
+         for tensor_name, tensor in _iter_tensors_in_value("impl", impl, set(), scan_objects=True):
+             full_name = f"{module_prefix}.{tensor_name}" if module_prefix else tensor_name
+-            _try_collect(full_name, tensor, seen, collected)
++            _try_collect(full_name, tensor, seen, seen_tensors, collected)
+     return collected
+ 
+ 
+-- 
+2.51.0.windows.1
+
