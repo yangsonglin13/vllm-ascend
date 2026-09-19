@@ -20,6 +20,15 @@ from vllm_ascend.model_loader.rfork.manifest import numel_from_shape
 
 TENSOR_LAYOUT_SAMPLE_LIMIT = 3
 
+# Runtime scratch tensors are local execution state, not checkpoint-derived
+# model state.  They must keep the capacity selected by the receiving instance
+# instead of being copied from a seed that may use different scheduler limits.
+_RUNTIME_ONLY_TENSOR_NAMES = frozenset({"topk_indices_buffer"})
+
+
+def _is_runtime_only_tensor(name: str) -> bool:
+    return name.rsplit(".", 1)[-1] in _RUNTIME_ONLY_TENSOR_NAMES
+
 
 def _layout_digest(records: list[dict[str, Any]]) -> str:
     payload = json.dumps(records, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
@@ -280,7 +289,7 @@ def _try_collect(
     seen_tensors: dict[tuple[Any, ...], int],
     collected: list[tuple[str, torch.Tensor]],
 ) -> None:
-    if not is_transferable_tensor(tensor):
+    if _is_runtime_only_tensor(name) or not is_transferable_tensor(tensor):
         return
     validate_transferable_tensor_layout(name, tensor)
     data_ptr = tensor.data_ptr()
