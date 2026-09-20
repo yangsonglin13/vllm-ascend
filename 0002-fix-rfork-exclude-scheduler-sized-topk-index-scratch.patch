@@ -1,0 +1,85 @@
+From a7d1b5c2d92cc2467b92573f0e0eb73a9d45b68d Mon Sep 17 00:00:00 2001
+From: yangsonglin13 <yangsonglin566@gmail.com>
+Date: Sun, 20 Sep 2026 20:07:31 +0800
+Subject: [PATCH 2/2] fix(rfork): exclude scheduler-sized topk index scratch
+ buffers from seed transfer
+
+Keep scheduler-sized topk index scratch buffers local to each instance so seeds remain compatible across different batching limits. Extend regression coverage for both raw and processed tensor layouts.
+
+Signed-off-by: yangsonglin13 <yangsonglin566@gmail.com>
+---
+ .../rfork/test_tensor_safety_isolated.py      | 28 +++++++++++++++++++
+ .../model_loader/rfork/tensor_layout.py       | 11 +++++++-
+ 2 files changed, 38 insertions(+), 1 deletion(-)
+
+diff --git a/tests/ut/model_loader/rfork/test_tensor_safety_isolated.py b/tests/ut/model_loader/rfork/test_tensor_safety_isolated.py
+index ef92a66f8..b3373da19 100644
+--- a/tests/ut/model_loader/rfork/test_tensor_safety_isolated.py
++++ b/tests/ut/model_loader/rfork/test_tensor_safety_isolated.py
+@@ -140,6 +140,34 @@ def test_collector_scans_custom_callable_impl_and_skips_function(tensor_runtime,
+     assert all(not name.startswith("impl.function") for name in names)
+ 
+ 
++@pytest.mark.parametrize("processed_layout", [False, True])
++def test_collector_excludes_scheduler_sized_topk_indices_buffer(tensor_runtime, monkeypatch, processed_layout):
++    monkeypatch.setattr(tensor_runtime.tensor_layout, "is_transferable_tensor", lambda _tensor: True)
++
++    def make_model(max_num_batched_tokens):
++        model = nn.Module()
++        model.weight = nn.Parameter(torch.ones(2))
++        model.topk_indices_buffer = torch.empty(max_num_batched_tokens, 2048, dtype=torch.int32)
++        model.indexer_op = nn.Module()
++        model.indexer_op.impl = SimpleNamespace(
++            packed_weight=torch.ones(3),
++            topk_indices_buffer=model.topk_indices_buffer,
++        )
++        return model
++
++    manifests = []
++    for max_num_batched_tokens in (2048, 4096):
++        collected = tensor_runtime.tensor_layout.collect_transferable_tensors(
++            make_model(max_num_batched_tokens), processed_layout
++        )
++        assert all(name.rsplit(".", 1)[-1] != "topk_indices_buffer" for name, _ in collected)
++        manifests.append([(name, tuple(tensor.shape)) for name, tensor in collected])
++
++    assert manifests[0] == manifests[1]
++    assert ("weight", (2,)) in manifests[0]
++    assert ("indexer_op.impl.packed_weight", (3,)) in manifests[0]
++
++
+ def test_registration_merges_small_then_large_alias_ranges(tensor_runtime, monkeypatch):
+     storage = torch.arange(8, dtype=torch.float32)
+     small = storage[:2]
+diff --git a/vllm_ascend/model_loader/rfork/tensor_layout.py b/vllm_ascend/model_loader/rfork/tensor_layout.py
+index 8070b1557..cab700490 100644
+--- a/vllm_ascend/model_loader/rfork/tensor_layout.py
++++ b/vllm_ascend/model_loader/rfork/tensor_layout.py
+@@ -15,6 +15,15 @@ from vllm.logger import logger
+ 
+ from vllm_ascend.model_loader.rfork.manifest import numel_from_shape
+ 
++# Runtime scratch tensors are local execution state, not checkpoint-derived
++# model state.  They must keep the capacity selected by the receiving instance
++# instead of being copied from a seed that may use different scheduler limits.
++_RUNTIME_ONLY_TENSOR_NAMES = frozenset({"topk_indices_buffer"})
++
++
++def _is_runtime_only_tensor(name: str) -> bool:
++    return name.rsplit(".", 1)[-1] in _RUNTIME_ONLY_TENSOR_NAMES
++
+ 
+ def reshape_tensor_to_seed_shape(
+     name: str,
+@@ -112,7 +121,7 @@ def _try_collect(
+     seen_names: dict[str, int],
+     collected: list[tuple[str, torch.Tensor]],
+ ) -> None:
+-    if not is_transferable_tensor(tensor):
++    if _is_runtime_only_tensor(name) or not is_transferable_tensor(tensor):
+         return
+     data_ptr = tensor.data_ptr()
+     existing_index = seen_names.get(name)
+-- 
+2.51.0.windows.1
+

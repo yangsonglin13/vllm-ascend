@@ -1,0 +1,176 @@
+From 651a653eceda6a2aa0e265299df8ecfa89851068 Mon Sep 17 00:00:00 2001
+From: yangsonglin13 <yangsonglin566@gmail.com>
+Date: Sun, 20 Sep 2026 20:07:21 +0800
+Subject: [PATCH 1/2] fix(rfork): support rank-offset seed server port
+
+Allow an optional rank-offset seed server port while preserving dynamic port assignment and validating the configured base port.
+
+Signed-off-by: yangsonglin13 <yangsonglin566@gmail.com>
+---
+ .../test_seed_server_cleanup_isolated.py      |  2 +-
+ vllm_ascend/model_loader/rfork/config.py      |  5 +++++
+ vllm_ascend/model_loader/rfork/seed_server.py | 21 +++++++++++--------
+ vllm_ascend/model_loader/rfork/session.py     | 17 +++++++++++++++
+ 4 files changed, 35 insertions(+), 10 deletions(-)
+
+diff --git a/tests/ut/model_loader/rfork/test_seed_server_cleanup_isolated.py b/tests/ut/model_loader/rfork/test_seed_server_cleanup_isolated.py
+index bd4c37bf4..e96dd8627 100644
+--- a/tests/ut/model_loader/rfork/test_seed_server_cleanup_isolated.py
++++ b/tests/ut/model_loader/rfork/test_seed_server_cleanup_isolated.py
+@@ -116,7 +116,7 @@ def _configure_server_fakes(seed_server, monkeypatch, *, blocking_queue=False):
+     _ControlledServer.allow_run_exit.clear()
+     sockets = []
+ 
+-    def create_socket(bind_host):
++    def create_socket(bind_host, port=0):
+         sock = _ControlledSocket()
+         sockets.append(sock)
+         return sock
+diff --git a/vllm_ascend/model_loader/rfork/config.py b/vllm_ascend/model_loader/rfork/config.py
+index 7aedfc26e..63c98f63b 100644
+--- a/vllm_ascend/model_loader/rfork/config.py
++++ b/vllm_ascend/model_loader/rfork/config.py
+@@ -60,6 +60,7 @@ class RForkConfig:
+     seed_timeout_sec: float = DEFAULT_RFORK_SEED_TIMEOUT_SEC
+     request_timeout_sec: float = DEFAULT_RFORK_REQUEST_TIMEOUT_SEC
+     seed_bind_host: str = "0.0.0.0"
++    seed_port_base: int = 0
+     seed_advertise_host: str | None = None
+     heartbeat_interval_sec: float = DEFAULT_RFORK_HEARTBEAT_INTERVAL_SEC
+     lease_release_max_attempts: int = DEFAULT_RFORK_LEASE_RELEASE_MAX_ATTEMPTS
+@@ -75,6 +76,9 @@ class RForkConfig:
+         attempts = self.lease_release_max_attempts
+         if isinstance(attempts, bool) or not isinstance(attempts, int) or attempts <= 0:
+             raise ValueError("rfork_lease_release_max_attempts must be a positive JSON integer")
++        port_base = self.seed_port_base
++        if isinstance(port_base, bool) or not isinstance(port_base, int) or port_base < 0 or port_base > 65535:
++            raise ValueError("rfork_seed_port_base must be a JSON integer in range [0, 65535]")
+ 
+     @classmethod
+     def from_extra_config(cls, raw_config: object) -> "RForkConfig":
+@@ -125,6 +129,7 @@ class RForkConfig:
+                 )
+                 or "0.0.0.0"
+             ),
++            seed_port_base=config.get("rfork_seed_port_base", 0) if isinstance(config.get("rfork_seed_port_base"), int) else 0,
+             seed_advertise_host=_string_value(
+                 config,
+                 ("rfork_seed_advertise_host", "seed_advertise_host", "advertise_host"),
+diff --git a/vllm_ascend/model_loader/rfork/seed_server.py b/vllm_ascend/model_loader/rfork/seed_server.py
+index 82559c583..c6af04bbf 100644
+--- a/vllm_ascend/model_loader/rfork/seed_server.py
++++ b/vllm_ascend/model_loader/rfork/seed_server.py
+@@ -102,10 +102,10 @@ class RForkSeedServerStartupError(RuntimeError):
+         self.handle = handle
+ 
+ 
+-def _create_bound_socket(bind_host: str) -> socket.socket:
++def _create_bound_socket(bind_host: str, port: int = 0) -> socket.socket:
+     """Create an IPv4 or IPv6 listener from the bind host's resolver result."""
+     host = bind_host or "0.0.0.0"
+-    infos = socket.getaddrinfo(host, 0, socket.AF_UNSPEC, socket.SOCK_STREAM, 0, socket.AI_PASSIVE)
++    infos = socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_STREAM, 0, socket.AI_PASSIVE)
+     last_error: OSError | None = None
+     for family, socktype, protocol, _, sockaddr in infos:
+         sock: socket.socket | None = None
+@@ -121,7 +121,7 @@ def _create_bound_socket(bind_host: str) -> socket.socket:
+                 sock.close()
+     if last_error is None:
+         raise OSError(f"unable to resolve RFork seed bind host {host!r}")
+-    raise OSError(f"unable to bind RFork seed host {host!r}: {last_error}") from last_error
++    raise OSError(f"unable to bind RFork seed host {host!r} port {port}: {last_error}") from last_error
+ 
+ 
+ def _health_url(bind_host: str, sock: socket.socket, port: int) -> str:
+@@ -143,16 +143,17 @@ def start_fastapi_server(
+     info: SeedTransferInfo,
+     *,
+     bind_host: str = "0.0.0.0",
++    port: int = 0,
+     stop_event: threading.Event | None = None,
+     startup_state: _ServerStartupState | None = None,
+ ):
+-    logger.debug("[RFork Seed] Preparing socket with dynamic port on %s...", bind_host)
++    logger.debug("[RFork Seed] Preparing socket with port %s on %s...", port if port > 0 else "dynamic", bind_host)
+ 
+     sock: socket.socket | None = None
+     try:
+-        sock = _create_bound_socket(bind_host)
+-        _, port = sock.getsockname()[:2]
+-        logger.debug("[RFork Seed] Assigned dynamic port: %s", port)
++        sock = _create_bound_socket(bind_host, port)
++        _, actual_port = sock.getsockname()[:2]
++        logger.debug("[RFork Seed] Bound to port: %s", actual_port)
+ 
+         app = FastAPI()
+         rfork_transfer_engine_info = (info.session_id, info.weights)
+@@ -188,7 +189,7 @@ def start_fastapi_server(
+ 
+         config = uvicorn.Config(app, host=None, port=None, log_level="warning")
+         server = uvicorn.Server(config)
+-        startup = _ServerStartup(server=server, sock=sock, port=port)
++        startup = _ServerStartup(server=server, sock=sock, port=actual_port)
+         if startup_state is not None:
+             # Publish the resource before queue.put and serialize it with the
+             # caller's timeout cleanup.  A queue timeout must never make a
+@@ -224,7 +225,7 @@ def start_fastapi_server(
+             sock.close()
+             return
+ 
+-        logger.debug("[RFork Seed] FastAPI server starting on port %s...", port)
++        logger.debug("[RFork Seed] FastAPI server starting on port %s...", actual_port)
+         server.run(sockets=[sock])
+     except Exception as exc:
+         logger.error("[RFork Seed] server thread failed: %s", exc)
+@@ -265,6 +266,7 @@ def start_rfork_server(
+     health_timeout_sec: float = 30.0,
+     *,
+     bind_host: str = "0.0.0.0",
++    port: int = 0,
+ ) -> RForkSeedServerHandle:
+     if isinstance(health_timeout_sec, bool) or not isinstance(health_timeout_sec, (int, float)):
+         raise ValueError("health_timeout_sec must be a finite positive number")
+@@ -281,6 +283,7 @@ def start_rfork_server(
+             seed_key,
+             rfork_transfer_engine_info,
+             bind_host=bind_host,
++            port=port,
+             stop_event=startup_stop_event,
+             startup_state=startup_state,
+         )
+diff --git a/vllm_ascend/model_loader/rfork/session.py b/vllm_ascend/model_loader/rfork/session.py
+index 84b601529..de427428e 100644
+--- a/vllm_ascend/model_loader/rfork/session.py
++++ b/vllm_ascend/model_loader/rfork/session.py
+@@ -361,11 +361,28 @@ class RForkSession:
+             logger.error("RFork seed service cannot start while a source seed lease is outstanding.")
+             return False
+         try:
++            # Calculate port for this rank: base_port + global_rank
++            # If base_port is 0, OS will assign a random port (original behavior)
++            # Use global_rank because it's unique across all processes (TP, PP, EP)
++            port = self.config.seed_port_base
++            if port > 0:
++                port += self.identity.global_rank
++                if port > 65535:
++                    logger.warning(
++                        "rfork_seed_port_base (%d) + global_rank (%d) = %d exceeds 65535, "
++                        "falling back to OS-assigned random port",
++                        self.config.seed_port_base,
++                        self.identity.global_rank,
++                        port,
++                    )
++                    port = 0
++
+             handle = start_rfork_server(
+                 self.planner.seed_key,
+                 self._seed_transfer_info(),
+                 health_timeout_sec=self.config.seed_timeout_sec,
+                 bind_host=self.config.seed_bind_host,
++                port=port,
+             )
+             self.seed_server = handle
+             if not self.planner.report_seed_once(
+-- 
+2.51.0.windows.1
+
