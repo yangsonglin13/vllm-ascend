@@ -361,11 +361,28 @@ class RForkSession:
             logger.error("RFork seed service cannot start while a source seed lease is outstanding.")
             return False
         try:
+            # Calculate port for this rank: base_port + global_rank
+            # If base_port is 0, OS will assign a random port (original behavior)
+            # Use global_rank because it's unique across all processes (TP, PP, EP)
+            port = self.config.seed_port_base
+            if port > 0:
+                port += self.identity.global_rank
+                if port > 65535:
+                    logger.warning(
+                        "rfork_seed_port_base (%d) + global_rank (%d) = %d exceeds 65535, "
+                        "falling back to OS-assigned random port",
+                        self.config.seed_port_base,
+                        self.identity.global_rank,
+                        port,
+                    )
+                    port = 0
+
             handle = start_rfork_server(
                 self.planner.seed_key,
                 self._seed_transfer_info(),
                 health_timeout_sec=self.config.seed_timeout_sec,
                 bind_host=self.config.seed_bind_host,
+                port=port,
             )
             self.seed_server = handle
             if not self.planner.report_seed_once(

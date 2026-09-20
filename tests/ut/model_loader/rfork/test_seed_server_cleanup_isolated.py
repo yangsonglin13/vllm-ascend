@@ -116,7 +116,7 @@ def _configure_server_fakes(seed_server, monkeypatch, *, blocking_queue=False):
     _ControlledServer.allow_run_exit.clear()
     sockets = []
 
-    def create_socket(bind_host):
+    def create_socket(bind_host, port=0):
         sock = _ControlledSocket()
         sockets.append(sock)
         return sock
