@@ -1,0 +1,2494 @@
+From 3dfe3a709bdde68a3b2602e407b3b9da5ab64646 Mon Sep 17 00:00:00 2001
+From: yangsonglin13 <yangsonglin566@gmail.com>
+Date: Thu, 17 Sep 2026 11:42:27 +0800
+Subject: [PATCH 2/4] fix(rfork): harden weight reuse and planner recovery
+
+Add P/D model and layout switches to compatibility fingerprints, keep seed services alive across transient planner failures with background retries, and require destination registration cache for reads.
+
+Also add bounded tensor layout diagnostics, guard session shutdown against reentrant cleanup, and limit planner exception handling to expected failures. Document intentional RFork transfer contracts.
+
+Signed-off-by: yangsonglin13 <yangsonglin566@gmail.com>
+---
+ docs/source/user_guide/feature_guide/rfork.md |  67 ++-
+ .../rfork/test_identity_validation.py         | 562 +++++++++++++++++-
+ .../model_loader/rfork/test_lease_release.py  |  99 ++-
+ .../rfork/test_registration_cache_isolated.py | 137 +++++
+ .../model_loader/rfork/test_rfork_loader.py   |  13 +-
+ .../rfork/test_session_server_integration.py  |  39 +-
+ .../rfork/test_transfer_backend.py            |  21 +-
+ .../rfork/test_transfer_timing_isolated.py    |  66 ++
+ vllm_ascend/model_loader/rfork/identity.py    | 260 +++++++-
+ .../model_loader/rfork/planner_client.py      |  44 +-
+ .../model_loader/rfork/rfork_loader.py        |   5 +-
+ vllm_ascend/model_loader/rfork/session.py     | 198 ++++--
+ .../model_loader/rfork/tensor_layout.py       | 202 ++++++-
+ .../model_loader/rfork/transfer_backend.py    |  83 ++-
+ vllm_ascend/model_loader/rfork/types.py       |  15 +
+ 15 files changed, 1676 insertions(+), 135 deletions(-)
+ create mode 100644 tests/ut/model_loader/rfork/test_registration_cache_isolated.py
+ create mode 100644 tests/ut/model_loader/rfork/test_transfer_timing_isolated.py
+
+diff --git a/docs/source/user_guide/feature_guide/rfork.md b/docs/source/user_guide/feature_guide/rfork.md
+index 8a5390569..c4d651360 100644
+--- a/docs/source/user_guide/feature_guide/rfork.md
++++ b/docs/source/user_guide/feature_guide/rfork.md
+@@ -47,6 +47,12 @@ To enable RFork, pass `--load-format rfork` and provide RFork settings through `
+ | **rfork_scheduler_url** | String | Base URL of the planner service used for seed allocation, release, and heartbeat. | Required for planner-based matching. Example: `http://127.0.0.1:1223`. |
+ | **rfork_seed_timeout_sec** | Number | Timeout for waiting until the local seed HTTP service becomes healthy after startup. | Optional. Default: `5.0`. Must be greater than `0`. Invalid values fall back to the default. |
+ | **rfork_seed_key_separator** | String | Separator used when building the RFork seed key string. | Optional. Default: `$`. Keep the same value across compatible instances. |
++| **rfork_request_timeout_sec** | Number | HTTP connect/read timeout for planner and seed requests. | Optional. Default: `10.0`. Must be greater than `0`. |
++| **rfork_heartbeat_interval_sec** | Number | Interval between planner heartbeat reports. | Optional. Default: `30.0`. JSON configuration only. |
++| **rfork_lease_release_max_attempts** | Integer | Fast-attempt count before transient lease-release failures continue at a slower background interval. | Optional. Default: `3`. Permanent planner rejection still stops retries. |
++| **rfork_lease_release_retry_interval_sec** | Number | Interval between fast lease-release retries. | Optional. Default: `30.0`. JSON configuration only. |
++| **rfork_seed_bind_host** | String | Local address used by the seed HTTP service. | Optional. Default: `0.0.0.0`. |
++| **rfork_seed_advertise_host** | String | Seed address advertised to the planner. | Optional. Automatically detected when unset. |
+ 
+ ### How RFork Matches Seeds
+ 
+@@ -64,6 +70,12 @@ RFork does not match instances by `model_url` alone. The local seed key is compo
+ This means two instances must agree on both model identity and deployment topology before the planner will treat them as interchangeable seeds.
+ For deployments without pipeline or expert parallelism, the existing seed-key format is unchanged.
+ 
++The compatibility fingerprint also includes the normalized model configuration, model revision, parallel topology,
++device type, effective P/D role, quantization, speculative decoding, model-runner generation, and Ascend weight-layout
++settings that can change transferable tensor names, shapes, dtypes, formats, or derived contents. Runtime-only settings
++such as planner addresses, request scheduling policy, logging paths, and ACLGraph capture sizes are excluded. The final
++manifest is still validated before transfer, and RFork falls back rather than copying incompatible tensors.
++
+ ### Quantized Models
+ 
+ For quantized models, RFork transfers tensors after Ascend weight post-processing instead of raw checkpoint parameters. The receiver first builds the same post-load tensor layout as the seed, then RFork copies the live NPU tensors used by inference.
+@@ -75,7 +87,32 @@ When validating RFork for a quantized model:
+ - Apply the same vLLM Ascend code to both the seed instance and the receiver instance.
+ - Restart the planner and all vLLM instances after changing RFork code, because existing seeds keep their old transfer metadata.
+ - Use a new `model_deploy_strategy_name` after changing model arguments or RFork code, so the planner does not match a receiver with an incompatible old seed.
+-- A successful RFork transfer logs `transfer weights starts` and `transfer weights time`. The fallback path logs `RFork transfer failed`.
++- A successful TP0 RFork transfer logs elapsed time, bytes, chunks, and throughput at INFO. Other TP ranks and
++  per-chunk details remain at DEBUG. The fallback path logs `RFork transfer failed`.
++
++### Intentional transfer contracts
++
++The following behaviors are deliberate RFork protocol choices, not missing
++manifest checks:
++
++- **Dense transpose and reshape:** RFork transfers the one continuous byte range
++  covered by a non-overlapping dense tensor. Before the native read, the receiver
++  may replace its tensor metadata with a storage-preserving view of the seed
++  shape. RFork therefore does not require a separate seed/receiver stride-equality
++  check. Compatible instances are expected to construct the same dense byte
++  order through the fingerprinted configuration and the same post-load path;
++  semantic and physical layout digests are diagnostic evidence for that contract.
++  Gapped or overlapping layouts are still rejected. A new layout implementation
++  that changes byte order must update the compatibility descriptor or extend the
++  transfer protocol instead of relying on the existing dense-view contract.
++- **Processed NZ payload length:** RFork intentionally reads exactly
++  `numel * element_size` bytes for each named tensor, including processed NZ,
++  packed-weight, and derived-scale tensors. Allocation capacity, descriptor-only
++  padding outside the tensor's dense logical range, and adjacent or shared storage
++  are not part of that tensor's payload and are not copied implicitly. A future
++  NPU format that requires bytes outside this range needs explicit manifest and
++  transfer-protocol support; the diagnostic physical-size fields do not silently
++  widen a read.
+ 
+ ## Tested Models
+ 
+@@ -145,6 +182,26 @@ vllm serve <model_path> \
+ - `<deploy_strategy>`: Stable deployment-strategy name used to build the RFork seed key.
+ - `<port>`: Serving port of the vLLM instance being started.
+ 
++Successful loads log `source=transfer`, `local`, `fallback`, or `shared_target`.
++Successful TP0 weight reads also log transfer elapsed time, bytes, chunks, and
++throughput at INFO; other TP ranks and per-chunk timings remain at DEBUG.
++Every successful registration, receiver-before-read, and final receiver stage
++emits one bounded `RFork tensor layout summary` at INFO per rank. The summary hashes all tensor
++names, shapes, strides, dtypes, NPU formats, logical byte counts, storage byte
++capacities, storage offsets, and NPU descriptor element counts into fixed-size
++semantic and physical digests. It also reports aggregate counts and at most
++three representative tensors, preferring storage views or tensors whose NPU
++descriptor size differs from logical `numel`. Match a receiver's `peer_session`
++to the seed's `session`. Digest differences are diagnostic and do not by
++themselves reject a transfer. On checkpoint-layout transfers, compare
++`receiver_before_read` with `receiver_after_post_load` to determine whether the
++post-load hook rebuilt the layout. Processed-layout transfers instead emit
++`receiver_after_transfer_finalize`, because their layout processing happened
++before the read. The summary does not copy tensor data or prove value equality;
++validate output accuracy separately on NPU hardware.
++Set `VLLM_LOGGING_LEVEL=DEBUG` for per-rank registration, metadata, transfer,
++lease-release, and publication timing.
++
+ ---
+ 
+ ## Note & Caveats
+@@ -153,3 +210,11 @@ vllm serve <model_path> \
+ - If RFORK is used, **each worker process** must bind a listening port. That port is assigned randomly.
+ - RFork weight transfer does not support dynamic EPLB because expert weights and placement can change after the seed service starts. If `eplb_config.dynamic_eplb` or `eplb_config.expert_map_record_path` enables dynamic EPLB, RFork transfer is bypassed and the model is loaded through the default model loader.
+ - The example [`rfork_planner.py`](https://github.com/vllm-project/vllm-ascend/blob/main/examples/rfork/rfork_planner.py) is only a simple mock implementation. If you need stronger scheduling, capacity management, or production-grade availability behavior, implement your own planner based on the RFork seed protocol.
++- Each heartbeat verifies that the seed HTTP service remains alive. If the service exits, RFork stops heartbeats and
++  attempts to withdraw the advertisement while leaving the loaded model available for inference.
++- Temporary planner outages do not stop inference. Retryable initial advertisements and lease releases continue in the
++  background, while permanent planner rejections prevent seed promotion. Outage logs are limited to the first failure,
++  periodic summaries, and recovery events.
++- Validate transfer accuracy and the logical-payload contract for newly supported NPU formats on the intended NPU and
++  model combination; CPU tests cannot establish NPU storage correctness. This qualification is required when adding a
++  format, but it is not a runtime requirement to copy allocator or descriptor padding outside a tensor's declared payload.
+diff --git a/tests/ut/model_loader/rfork/test_identity_validation.py b/tests/ut/model_loader/rfork/test_identity_validation.py
+index e9d209f92..b8999eadf 100644
+--- a/tests/ut/model_loader/rfork/test_identity_validation.py
++++ b/tests/ut/model_loader/rfork/test_identity_validation.py
+@@ -21,7 +21,7 @@ def identity_module(monkeypatch):
+     _stub(
+         monkeypatch,
+         "vllm_ascend.device.hardware_profile",
+-        get_current_hardware_profile=lambda: SimpleNamespace(weight_layout_policy=None),
++        get_current_hardware_profile=lambda: SimpleNamespace(weight_layout_policy=None, _device_type="A2"),
+     )
+     return _load_module(monkeypatch, "rfork_test_identity", "identity.py")
+ 
+@@ -67,6 +67,16 @@ def planner_module(monkeypatch):
+         RETRYABLE = auto()
+         REJECTED = auto()
+ 
++    class SeedReportStatus(Enum):
++        ACCEPTED = auto()
++        RETRYABLE = auto()
++        REJECTED = auto()
++
++    @dataclass(frozen=True)
++    class SeedReportResult:
++        status: SeedReportStatus
++        reason: str = ""
++
+     @dataclass(frozen=True)
+     class SeedLease:
+         seed_ip: str
+@@ -83,15 +93,38 @@ def planner_module(monkeypatch):
+         SeedLease=SeedLease,
+         RForkIdentity=object,
+         SeedAdvertisement=object,
++        SeedReportResult=SeedReportResult,
++        SeedReportStatus=SeedReportStatus,
+     )
+     return _load_module(monkeypatch, "rfork_test_planner_client", "planner_client.py")
+ 
+ 
+-def _model_config(*, dtype=torch.float32, quantization=None, revision="rev-a"):
++def _model_config(
++    *,
++    dtype=torch.float32,
++    quantization=None,
++    revision="rev-a",
++    max_model_len=8192,
++    max_seq_len_to_capture=8192,
++    runner_type="generate",
++    task="generate",
++    convert="auto",
++    use_mla=False,
++    enforce_eager=False,
++    multimodal_config=None,
++):
+     return SimpleNamespace(
+         dtype=dtype,
+         quantization=quantization,
+         revision=revision,
++        max_model_len=max_model_len,
++        max_seq_len_to_capture=max_seq_len_to_capture,
++        runner_type=runner_type,
++        task=task,
++        convert=convert,
++        use_mla=use_mla,
++        enforce_eager=enforce_eager,
++        multimodal_config=multimodal_config,
+         hf_config=SimpleNamespace(
+             model_type="test-model",
+             architectures=["TestModel"],
+@@ -100,8 +133,59 @@ def _model_config(*, dtype=torch.float32, quantization=None, revision="rev-a"):
+     )
+ 
+ 
+-def _vllm_config(tp_size=1):
++def _vllm_config(
++    tp_size=1,
++    *,
++    kv_role=None,
++    max_num_batched_tokens=4096,
++    max_num_seqs=8,
++    cache_block_size=128,
++    cache_dtype="auto",
++    mamba_cache_dtype="auto",
++    speculative_config=None,
++    quant_config=None,
++    compilation_config=None,
++    lora_config=None,
++    prompt_adapter_config=None,
++    pooler_config=None,
++    use_v2_model_runner=False,
++    prefill_context_parallel_size=1,
++    decode_context_parallel_size=1,
++    use_sequence_parallel_moe=False,
++    cp_kv_cache_interleave_size=1,
++    data_parallel_rank=0,
++):
++    kv_transfer_config = None
++    if kv_role is not None:
++        kv_transfer_config = SimpleNamespace(
++            kv_role=kv_role,
++            is_kv_producer=kv_role in ("kv_producer", "kv_both"),
++            is_kv_consumer=kv_role in ("kv_consumer", "kv_both"),
++        )
++    if compilation_config is None:
++        compilation_config = SimpleNamespace(
++            cudagraph_mode="NONE",
++            cudagraph_capture_sizes=[],
++            max_cudagraph_capture_size=0,
++        )
+     return SimpleNamespace(
++        kv_transfer_config=kv_transfer_config,
++        scheduler_config=SimpleNamespace(
++            max_num_batched_tokens=max_num_batched_tokens,
++            max_num_seqs=max_num_seqs,
++        ),
++        cache_config=SimpleNamespace(
++            block_size=cache_block_size,
++            cache_dtype=cache_dtype,
++            mamba_cache_dtype=mamba_cache_dtype,
++        ),
++        speculative_config=speculative_config,
++        quant_config=quant_config,
++        compilation_config=compilation_config,
++        lora_config=lora_config,
++        prompt_adapter_config=prompt_adapter_config,
++        pooler_config=pooler_config,
++        use_v2_model_runner=use_v2_model_runner,
+         parallel_config=SimpleNamespace(
+             tensor_parallel_size=tp_size,
+             pipeline_parallel_size=1,
+@@ -109,13 +193,31 @@ def _vllm_config(tp_size=1):
+             data_parallel_size=None,
+             enable_expert_parallel=False,
+             is_moe_model=False,
+-        )
++            prefill_context_parallel_size=prefill_context_parallel_size,
++            decode_context_parallel_size=decode_context_parallel_size,
++            use_sequence_parallel_moe=use_sequence_parallel_moe,
++            cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
++            data_parallel_rank=data_parallel_rank,
++        ),
+     )
+ 
+ 
+-def _build_fingerprint(identity_module, model_config, *, tp_size=1):
++def _build_fingerprint(
++    identity_module,
++    model_config,
++    *,
++    tp_size=1,
++    kv_role=None,
++    max_num_batched_tokens=4096,
++    **vllm_config_kwargs,
++):
+     return identity_module.build_compatibility_fingerprint(
+-        _vllm_config(tp_size),
++        _vllm_config(
++            tp_size,
++            kv_role=kv_role,
++            max_num_batched_tokens=max_num_batched_tokens,
++            **vllm_config_kwargs,
++        ),
+         model_config,
+         model_url="model",
+         model_deploy_strategy_name="strategy",
+@@ -130,6 +232,38 @@ def _fingerprint(identity_module, *, dtype=torch.float32, quantization=None, rev
+     )
+ 
+ 
++def _ascend_config(**overrides):
++    values = {
++        "weight_nz_mode": 1,
++        "enable_kv_nz": False,
++        "enable_transpose_kv_cache_by_block": True,
++        "enable_fused_mc2": 0,
++        "enable_mlapo": True,
++        "mlapo_keep_prefill_weights": False,
++        "enable_sparse_sfa_c8": False,
++        "enable_sparse_li_c8": False,
++        "c8_reshape_optim_enabled": False,
++        "enable_dsa_cp": False,
++        "mix_placement": False,
++        "enable_shared_expert_dp": False,
++        "enable_sp_by_pass": False,
++        "pd_tp_ratio": 1,
++        "pd_head_ratio": 1,
++        "num_head_replica": 1,
++        "draft_window_size": None,
++        "finegrained_tp_config": SimpleNamespace(
++            oproj_tensor_parallel_size=0,
++            lmhead_tensor_parallel_size=0,
++            embedding_tensor_parallel_size=0,
++            mlp_tensor_parallel_size=0,
++            olora_tensor_parallel_size=0,
++        ),
++        "dynamic_spec_config": SimpleNamespace(method=None, method_params={}),
++    }
++    values.update(overrides)
++    return SimpleNamespace(**values)
++
++
+ def test_canonicalization_is_deterministic_for_dicts_sets_and_dtype(identity_module):
+     first = {"set": {3, 1, 2}, "mapping": {"b": 2, "a": 1}, "dtype": torch.float16}
+     second = {"dtype": torch.float16, "mapping": {"a": 1, "b": 2}, "set": {2, 3, 1}}
+@@ -174,6 +308,21 @@ def test_fingerprint_quantization_config_changes(identity_module):
+     assert _build_fingerprint(identity_module, base_config) != _build_fingerprint(identity_module, changed_config)
+ 
+ 
++def test_effective_quantization_description_isolates_weight_scheme(identity_module):
++    base_model = _model_config(quantization="ascend")
++    producer = SimpleNamespace(
++        get_name=lambda: "ascend",
++        quant_description={"group_size": 32, "model.layers.0.self_attn.q_proj.weight": "W4A8"},
++    )
++    consumer = SimpleNamespace(
++        get_name=lambda: "ascend",
++        quant_description={"group_size": 128, "model.layers.0.self_attn.q_proj.weight": "W4A8"},
++    )
++    assert _build_fingerprint(identity_module, base_model, quant_config=producer) != _build_fingerprint(
++        identity_module, base_model, quant_config=consumer
++    )
++
++
+ def test_fingerprint_changes_for_other_hf_behavior_fields(identity_module):
+     first = _model_config()
+     second = _model_config()
+@@ -282,6 +431,407 @@ def test_unresolved_revision_keeps_explicit_version_fallback(identity_module):
+     assert identity_module._get_model_revision(config) is None
+ 
+ 
++@pytest.mark.parametrize("quantization", [None, "ascend"])
++def test_fingerprint_changes_when_kv_role_changes(identity_module, quantization):
++    # Role isolation is unconditional, including checkpoint-layout transfer.
++    model_config = _model_config(quantization=quantization)
++    producer = _build_fingerprint(identity_module, model_config, kv_role="kv_producer")
++    consumer = _build_fingerprint(identity_module, model_config, kv_role="kv_consumer")
++    assert producer != consumer
++
++
++def test_effective_kv_role_supports_legacy_boolean_flags(identity_module):
++    producer_config = _vllm_config()
++    producer_config.kv_transfer_config = SimpleNamespace(is_kv_producer=True, is_kv_consumer=False)
++    consumer_config = _vllm_config()
++    consumer_config.kv_transfer_config = SimpleNamespace(is_kv_producer=False, is_kv_consumer=True)
++
++    assert identity_module._get_effective_kv_role(producer_config) == "kv_producer"
++    assert identity_module._get_effective_kv_role(consumer_config) == "kv_consumer"
++
++
++@pytest.mark.parametrize(
++    ("field", "base_value", "changed_value"),
++    [
++        ("enable_mlapo", False, True),
++        ("mlapo_keep_prefill_weights", False, True),
++        ("enable_sparse_sfa_c8", False, True),
++        ("enable_sparse_li_c8", False, True),
++        ("c8_reshape_optim_enabled", False, True),
++        ("enable_dsa_cp", False, True),
++        ("mix_placement", False, True),
++        ("enable_shared_expert_dp", False, True),
++        ("enable_sp_by_pass", False, True),
++        ("pd_tp_ratio", 1, 2),
++        ("pd_head_ratio", 1, 2),
++        ("num_head_replica", 1, 2),
++        ("draft_window_size", None, 8),
++    ],
++)
++def test_fingerprint_changes_when_ascend_layout_config_changes(
++    identity_module, monkeypatch, field, base_value, changed_value
++):
++    monkeypatch.setattr(identity_module, "get_ascend_config", lambda: _ascend_config(**{field: base_value}))
++    base = _fingerprint(identity_module)
++    monkeypatch.setattr(identity_module, "get_ascend_config", lambda: _ascend_config(**{field: changed_value}))
++    assert _fingerprint(identity_module) != base
++
++
++def test_fingerprint_changes_when_max_num_batched_tokens_changes(identity_module):
++    model_config = _model_config(quantization="ascend")
++    small_batch = _build_fingerprint(identity_module, model_config, max_num_batched_tokens=1024)
++    large_batch = _build_fingerprint(identity_module, model_config, max_num_batched_tokens=4096)
++    assert small_batch != large_batch
++
++
++@pytest.mark.parametrize(
++    ("config_kwargs", "model_kwargs"),
++    [
++        ({"cache_block_size": 64}, {}),
++        ({"cache_dtype": "int8"}, {}),
++        ({"mamba_cache_dtype": "float32"}, {}),
++        ({"use_v2_model_runner": True}, {}),
++        ({"prefill_context_parallel_size": 2}, {}),
++        ({"decode_context_parallel_size": 2}, {}),
++        ({"use_sequence_parallel_moe": True}, {}),
++        ({}, {"max_model_len": 16384}),
++        ({}, {"runner_type": "draft"}),
++        ({}, {"task": "embed"}),
++        ({}, {"convert": "embed"}),
++        ({}, {"use_mla": True}),
++        ({}, {"enforce_eager": True}),
++    ],
++)
++def test_fingerprint_changes_when_runtime_tensor_layout_changes(identity_module, config_kwargs, model_kwargs):
++    base = _build_fingerprint(identity_module, _model_config())
++    changed = _build_fingerprint(identity_module, _model_config(**model_kwargs), **config_kwargs)
++    assert changed != base
++
++
++@pytest.mark.parametrize(
++    ("config_kwargs", "model_kwargs"),
++    [
++        ({"max_num_seqs": 16}, {}),
++        ({"cp_kv_cache_interleave_size": 2}, {}),
++        ({}, {"max_seq_len_to_capture": 16384}),
++    ],
++)
++def test_runtime_sizing_does_not_partition_weight_seeds(identity_module, config_kwargs, model_kwargs):
++    base = _build_fingerprint(identity_module, _model_config())
++    changed = _build_fingerprint(identity_module, _model_config(**model_kwargs), **config_kwargs)
++    assert changed == base
++
++
++@pytest.mark.parametrize(
++    ("field", "changed_value"),
++    [
++        ("enable_kv_nz", True),
++        ("enable_transpose_kv_cache_by_block", False),
++    ],
++)
++def test_kv_cache_layout_does_not_partition_weight_seeds(identity_module, monkeypatch, field, changed_value):
++    monkeypatch.setattr(identity_module, "get_ascend_config", lambda: _ascend_config())
++    base = _fingerprint(identity_module)
++    monkeypatch.setattr(identity_module, "get_ascend_config", lambda: _ascend_config(**{field: changed_value}))
++    assert _fingerprint(identity_module) == base
++
++
++@pytest.mark.parametrize(
++    "field_name",
++    [
++        "oproj_tensor_parallel_size",
++        "lmhead_tensor_parallel_size",
++        "embedding_tensor_parallel_size",
++        "mlp_tensor_parallel_size",
++        "olora_tensor_parallel_size",
++    ],
++)
++def test_fingerprint_changes_for_every_finegrained_tp_size(identity_module, monkeypatch, field_name):
++    monkeypatch.setattr(identity_module, "get_ascend_config", lambda: _ascend_config())
++    base = _fingerprint(identity_module)
++
++    finegrained_values = {
++        name: (2 if name == field_name else 0) for name in identity_module._FINEGRAINED_TP_LAYOUT_FIELDS
++    }
++    monkeypatch.setattr(
++        identity_module,
++        "get_ascend_config",
++        lambda: _ascend_config(finegrained_tp_config=SimpleNamespace(**finegrained_values)),
++    )
++    assert _fingerprint(identity_module) != base
++
++
++def test_finegrained_tp_isolates_data_parallel_layout_rank(identity_module, monkeypatch):
++    finegrained = SimpleNamespace(
++        oproj_tensor_parallel_size=2,
++        lmhead_tensor_parallel_size=0,
++        embedding_tensor_parallel_size=0,
++        mlp_tensor_parallel_size=0,
++        olora_tensor_parallel_size=0,
++    )
++    monkeypatch.setattr(
++        identity_module,
++        "get_ascend_config",
++        lambda: _ascend_config(finegrained_tp_config=finegrained),
++    )
++    model_config = _model_config()
++    first_rank = _build_fingerprint(identity_module, model_config, data_parallel_rank=0)
++    second_rank = _build_fingerprint(identity_module, model_config, data_parallel_rank=1)
++    assert first_rank != second_rank
++
++
++def test_replicated_data_parallel_ranks_keep_sharing_fingerprint(identity_module, monkeypatch):
++    monkeypatch.setattr(identity_module, "get_ascend_config", lambda: _ascend_config())
++    model_config = _model_config()
++    first_rank = _build_fingerprint(identity_module, model_config, data_parallel_rank=0)
++    second_rank = _build_fingerprint(identity_module, model_config, data_parallel_rank=1)
++    assert first_rank == second_rank
++
++
++@pytest.mark.parametrize(
++    ("field", "changed_value"),
++    [
++        ("method", "eagle3"),
++        ("num_speculative_tokens", 3),
++        ("num_speculative_tokens_per_batch_size", {1: 3, 8: 1}),
++        ("draft_tensor_parallel_size", 2),
++        ("parallel_drafting", True),
++        ("disable_padded_drafter_batch", True),
++        ("enforce_eager", True),
++        ("draft_sample_method", "probabilistic"),
++        ("speculative_token_tree", "[(0,), (0, 0)]"),
++        ("quantization", "ascend"),
++        ("use_local_argmax_reduction", True),
++    ],
++)
++def test_fingerprint_changes_when_speculative_layout_changes(identity_module, field, changed_value):
++    base = _build_fingerprint(identity_module, _model_config())
++    speculative_config = SimpleNamespace(**{field: changed_value})
++    changed = _build_fingerprint(identity_module, _model_config(), speculative_config=speculative_config)
++    assert changed != base
++
++
++def test_fingerprint_changes_when_draft_model_or_parallel_layout_changes(identity_module):
++    base_draft = _model_config()
++    base_draft.hf_config.hidden_size = 1024
++    changed_draft = _model_config()
++    changed_draft.hf_config.hidden_size = 2048
++    base_spec = SimpleNamespace(
++        method="eagle3",
++        draft_model_config=base_draft,
++        draft_parallel_config=SimpleNamespace(tensor_parallel_size=1),
++    )
++    changed_model_spec = SimpleNamespace(
++        method="eagle3",
++        draft_model_config=changed_draft,
++        draft_parallel_config=SimpleNamespace(tensor_parallel_size=1),
++    )
++    changed_parallel_spec = SimpleNamespace(
++        method="eagle3",
++        draft_model_config=base_draft,
++        draft_parallel_config=SimpleNamespace(tensor_parallel_size=2),
++    )
++
++    base = _build_fingerprint(identity_module, _model_config(), speculative_config=base_spec)
++    model_changed = _build_fingerprint(identity_module, _model_config(), speculative_config=changed_model_spec)
++    parallel_changed = _build_fingerprint(identity_module, _model_config(), speculative_config=changed_parallel_spec)
++    assert model_changed != base
++    assert parallel_changed != base
++
++
++def test_fingerprint_changes_when_dynamic_spec_layout_changes(identity_module, monkeypatch):
++    monkeypatch.setattr(identity_module, "get_ascend_config", lambda: _ascend_config())
++    base = _fingerprint(identity_module)
++    monkeypatch.setattr(
++        identity_module,
++        "get_ascend_config",
++        lambda: _ascend_config(dynamic_spec_config=SimpleNamespace(method="mtp", method_params={"window": 4})),
++    )
++    assert _fingerprint(identity_module) != base
++
++
++def test_fingerprint_changes_when_hardware_device_type_changes(identity_module, monkeypatch):
++    monkeypatch.setattr(
++        identity_module,
++        "get_current_hardware_profile",
++        lambda: SimpleNamespace(weight_layout_policy="CONFIGURABLE", _device_type="A2"),
++    )
++    a2_fingerprint = _fingerprint(identity_module)
++    monkeypatch.setattr(
++        identity_module,
++        "get_current_hardware_profile",
++        lambda: SimpleNamespace(weight_layout_policy="CONFIGURABLE", _device_type="A5"),
++    )
++    assert _fingerprint(identity_module) != a2_fingerprint
++
++
++@pytest.mark.parametrize(
++    ("field", "changed_value"),
++    [
++        ("cudagraph_mode", "FULL"),
++        ("cudagraph_capture_sizes", [1, 2, 16]),
++        ("max_cudagraph_capture_size", 16),
++    ],
++)
++def test_compilation_capture_sizes_do_not_partition_weight_seeds(identity_module, field, changed_value):
++    base = _build_fingerprint(identity_module, _model_config())
++    values = {
++        "cudagraph_mode": "NONE",
++        "cudagraph_capture_sizes": [],
++        "max_cudagraph_capture_size": 0,
++    }
++    values[field] = changed_value
++    changed = _build_fingerprint(
++        identity_module,
++        _model_config(),
++        compilation_config=SimpleNamespace(**values),
++    )
++    assert changed == base
++
++
++def test_compilation_runtime_registry_is_not_part_of_fingerprint(identity_module):
++    base = _build_fingerprint(identity_module, _model_config())
++    compilation_config = SimpleNamespace(
++        cudagraph_mode="NONE",
++        cudagraph_capture_sizes=[],
++        max_cudagraph_capture_size=0,
++        static_forward_context={"current": object()},
++    )
++    assert _build_fingerprint(identity_module, _model_config(), compilation_config=compilation_config) == base
++
++
++@pytest.mark.parametrize(
++    ("field", "changed_value"),
++    [
++        ("limit_per_prompt", {"image": 0}),
++        ("mm_encoder_tp_mode", "data"),
++        ("enable_multimodal_pruning", True),
++    ],
++)
++def test_multimodal_layout_isolates_tower_and_shard_choices(identity_module, field, changed_value):
++    base = _build_fingerprint(identity_module, _model_config())
++    multimodal_config = SimpleNamespace(**{field: changed_value})
++    changed = _build_fingerprint(identity_module, _model_config(multimodal_config=multimodal_config))
++    assert changed != base
++
++
++def test_multimodal_processor_kwargs_do_not_partition_weight_seeds(identity_module):
++    base_multimodal = SimpleNamespace(limit_per_prompt={"image": 1}, mm_encoder_tp_mode="tensor")
++    runtime_multimodal = SimpleNamespace(
++        limit_per_prompt={"image": 1},
++        mm_encoder_tp_mode="tensor",
++        mm_processor_kwargs={"resize": 1024},
++    )
++    base = _build_fingerprint(identity_module, _model_config(multimodal_config=base_multimodal))
++    changed = _build_fingerprint(identity_module, _model_config(multimodal_config=runtime_multimodal))
++    assert changed == base
++
++
++def test_effective_multimodal_limit_and_pruning_isolate_model_layout(identity_module):
++    class MultimodalConfig:
++        limit_per_prompt = {"image": 1}
++        mm_encoder_tp_mode = "tensor"
++
++        def __init__(self, image_limit, pruning):
++            self.image_limit = image_limit
++            self.pruning = pruning
++
++        def get_limit_per_prompt(self, modality):
++            return self.image_limit if modality == "image" else 0
++
++        def is_multimodal_pruning_enabled(self):
++            return self.pruning
++
++    base = _build_fingerprint(identity_module, _model_config(multimodal_config=MultimodalConfig(1, False)))
++    limit_changed = _build_fingerprint(identity_module, _model_config(multimodal_config=MultimodalConfig(0, False)))
++    pruning_changed = _build_fingerprint(identity_module, _model_config(multimodal_config=MultimodalConfig(1, True)))
++    assert limit_changed != base
++    assert pruning_changed != base
++
++
++@pytest.mark.parametrize(
++    ("feature", "field", "value"),
++    [
++        ("lora_config", "max_lora_rank", 128),
++        ("prompt_adapter_config", "max_prompt_adapter_token", 16),
++        ("pooler_config", "pooling_type", "LAST"),
++    ],
++)
++def test_optional_model_features_isolate_tensor_layout(identity_module, feature, field, value):
++    base = _build_fingerprint(identity_module, _model_config())
++    changed = _build_fingerprint(
++        identity_module,
++        _model_config(),
++        **{feature: SimpleNamespace(**{field: value})},
++    )
++    assert changed != base
++
++
++@pytest.mark.parametrize(
++    ("feature", "layout_field", "runtime_field", "runtime_value"),
++    [
++        ("lora_config", "max_lora_rank", "max_cpu_loras", 8),
++        ("prompt_adapter_config", "max_prompt_adapter_token", "max_prompt_adapters", 8),
++        ("pooler_config", "pooling_type", "normalize", True),
++    ],
++)
++def test_optional_runtime_fields_do_not_partition_weight_seeds(
++    identity_module, feature, layout_field, runtime_field, runtime_value
++):
++    base_feature = SimpleNamespace(**{layout_field: 16})
++    changed_feature = SimpleNamespace(**{layout_field: 16, runtime_field: runtime_value})
++    base = _build_fingerprint(identity_module, _model_config(), **{feature: base_feature})
++    changed = _build_fingerprint(identity_module, _model_config(), **{feature: changed_feature})
++    assert changed == base
++
++
++@pytest.mark.parametrize(
++    "field",
++    [
++        "attention_backend_family",
++        "device_adaptor_family",
++        "moe_comm_policy",
++        "quantization_backend_family",
++        "capabilities",
++    ],
++)
++def test_derived_hardware_capabilities_do_not_partition_weight_seeds(identity_module, monkeypatch, field):
++    base_profile = SimpleNamespace(weight_layout_policy="CONFIGURABLE", _device_type="A2")
++    monkeypatch.setattr(identity_module, "get_current_hardware_profile", lambda: base_profile)
++    base = _fingerprint(identity_module)
++    setattr(base_profile, field, {"MLAPO_NATIVE_WEIGHTS"} if field == "capabilities" else "COMPATIBILITY")
++    assert _fingerprint(identity_module) == base
++
++
++def test_hardware_weight_policy_still_isolates_layout(identity_module, monkeypatch):
++    profile = SimpleNamespace(weight_layout_policy="CONFIGURABLE", _device_type="A2")
++    monkeypatch.setattr(identity_module, "get_current_hardware_profile", lambda: profile)
++    base = _fingerprint(identity_module)
++    profile.weight_layout_policy = "FORCE_NZ"
++    assert _fingerprint(identity_module) != base
++
++
++def test_multimodal_layout_descriptor_reads_dataclass_fields(identity_module):
++    @dataclass(slots=True)
++    class MultimodalConfig:
++        limit_per_prompt: dict[str, int]
++        mm_encoder_tp_mode: str
++
++    producer = _model_config(multimodal_config=MultimodalConfig({"image": 0}, "data"))
++    consumer = _model_config(multimodal_config=MultimodalConfig({"image": 1}, "data"))
++    assert _build_fingerprint(identity_module, producer) != _build_fingerprint(identity_module, consumer)
++
++
++def test_compatibility_fingerprint_length_remains_fixed(identity_module):
++    base = _build_fingerprint(identity_module, _model_config())
++    expanded = _build_fingerprint(
++        identity_module,
++        _model_config(multimodal_config=SimpleNamespace(limit_per_prompt={"image": 1})),
++        lora_config=SimpleNamespace(max_lora_rank=128),
++    )
++    assert len(base) == len(expanded) == 64
++
++
+ def test_recursive_fingerprint_values_fail_with_actionable_error(identity_module):
+     recursive_dict = {}
+     recursive_dict["self"] = recursive_dict
+diff --git a/tests/ut/model_loader/rfork/test_lease_release.py b/tests/ut/model_loader/rfork/test_lease_release.py
+index 33eacaf6a..7e7802da2 100644
+--- a/tests/ut/model_loader/rfork/test_lease_release.py
++++ b/tests/ut/model_loader/rfork/test_lease_release.py
+@@ -2,6 +2,7 @@
+ # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+ 
+ import threading
++from dataclasses import replace
+ from types import SimpleNamespace
+ from unittest.mock import Mock
+ 
+@@ -10,6 +11,18 @@ import pytest
+ from tests.ut.model_loader.rfork.session_test_utils import make_session, run_and_join
+ 
+ 
++@pytest.mark.parametrize("tp_rank", [0, 2])
++def test_session_passes_tp_rank_to_transfer_backend(runtime, monkeypatch, tp_rank):
++    backend_factory = Mock()
++    monkeypatch.setattr(runtime.session, "RForkTransferBackend", backend_factory)
++    identity = replace(runtime.identity, tp_rank=tp_rank)
++
++    session = runtime.session.RForkSession(runtime.config, identity)
++
++    backend_factory.assert_called_once_with(tp_rank=tp_rank)
++    assert session.transfer_backend is backend_factory.return_value
++
++
+ @pytest.mark.parametrize(
+     ("status", "expected"),
+     [(200, "RELEASED"), (404, "RELEASED"), (400, "REJECTED"), (408, "RETRYABLE"), (503, "RETRYABLE")],
+@@ -28,6 +41,58 @@ def test_release_classifies_response_without_changing_wire_protocol(runtime, mon
+     )
+ 
+ 
++@pytest.mark.parametrize(
++    ("status", "expected"),
++    [(200, "ACCEPTED"), (400, "REJECTED"), (408, "RETRYABLE"), (429, "RETRYABLE"), (503, "RETRYABLE")],
++)
++def test_seed_report_classifies_response_without_changing_wire_protocol(runtime, monkeypatch, status, expected):
++    post = Mock(return_value=SimpleNamespace(status_code=status))
++    monkeypatch.setattr(runtime.client.requests, "post", post)
++    client = runtime.client.RForkPlannerClient(runtime.config, runtime.identity)
++
++    assert client.report_seed_once(1234, seed_ip="127.0.0.1").status.name == expected
++    post.assert_called_once_with(
++        "http://planner/add_seed",
++        headers={
++            "SEED_KEY": client.seed_key,
++            "SEED_IP": "127.0.0.1",
++            "SEED_PORT": "1234",
++            "SEED_RANK": "0",
++            "SEED_REFCNT": "0",
++        },
++        timeout=0.1,
++        allow_redirects=False,
++    )
++
++
++def test_acquire_seed_does_not_swallow_programming_errors(runtime, monkeypatch):
++    monkeypatch.setattr(runtime.client.requests, "get", Mock(side_effect=AttributeError("unexpected bug")))
++    client = runtime.client.RForkPlannerClient(runtime.config, runtime.identity)
++
++    with pytest.raises(AttributeError, match="unexpected bug"):
++        client.acquire_seed()
++
++
++def test_shutdown_is_reentrant_safe_and_unregisters_atexit(runtime, monkeypatch):
++    session = runtime.session.RForkSession(runtime.config, runtime.identity)
++    unregister = Mock()
++    monkeypatch.setattr(runtime.session.atexit, "unregister", unregister)
++    monkeypatch.setattr(session, "_stop_seed_service", Mock(return_value=True))
++    nested_results = []
++
++    def finalize():
++        nested_results.append(session.shutdown())
++        return True
++
++    session.transfer_backend.finalize_transfer_engine.side_effect = finalize
++
++    assert session.shutdown()
++    assert session.shutdown()
++    assert nested_results == [False]
++    session.transfer_backend.finalize_transfer_engine.assert_called_once_with()
++    unregister.assert_called_once_with(session._atexit_callback)
++
++
+ def test_blocked_release_does_not_block_inference_or_shutdown(runtime, monkeypatch):
+     session = make_session(runtime)
+     entered, resume, startup_done = threading.Event(), threading.Event(), threading.Event()
+@@ -38,7 +103,11 @@ def test_blocked_release_does_not_block_inference_or_shutdown(runtime, monkeypat
+         return runtime.types.LeaseReleaseResult.RELEASED
+ 
+     session.planner.release_seed_once.side_effect = release
+-    monkeypatch.setattr(runtime.session, "fetch_seed_transfer_info", lambda *args: object())
++    monkeypatch.setattr(
++        runtime.session,
++        "fetch_seed_transfer_info",
++        lambda *args: SimpleNamespace(session_id="seed-session"),
++    )
+     results = []
+ 
+     def startup():
+@@ -83,20 +152,40 @@ def test_retry_acknowledgement_promotes_the_model_once(runtime, monkeypatch):
+     assert session.planner.release_seed_once.call_count == 2
+ 
+ 
+-@pytest.mark.parametrize(("result", "attempts"), [("REJECTED", 1), ("RETRYABLE", 3)])
+-def test_release_failure_budget_preserves_the_unresolved_lease(runtime, result, attempts):
++def test_permanent_release_rejection_preserves_the_unresolved_lease(runtime):
+     session = make_session(runtime)
+-    session.planner.release_seed_once.return_value = getattr(runtime.types.LeaseReleaseResult, result)
++    session.planner.release_seed_once.return_value = runtime.types.LeaseReleaseResult.REJECTED
+ 
+     run_and_join(session)
+ 
+     assert session.seed_lease is runtime.lease
+     assert session._lease_release_exhausted
+-    assert session.planner.release_seed_once.call_count == attempts
++    assert session.planner.release_seed_once.call_count == 1
+     assert session.start_seed_service(object(), True) is runtime.types.RForkSeedServiceStartResult.FAILED
+     assert session.shutdown() is False
+ 
+ 
++def test_transient_release_recovers_after_fast_attempt_budget(runtime, monkeypatch):
++    session = make_session(runtime)
++    session.config = replace(session.config, lease_release_max_attempts=2, lease_release_retry_interval_sec=0.01)
++    monkeypatch.setattr(runtime.session, "LEASE_RELEASE_DEGRADED_RETRY_INTERVAL_SEC", 0.02)
++    session.state = runtime.types.RForkLifecycleState.READY
++    session.planner.release_seed_once.side_effect = [
++        *[runtime.types.LeaseReleaseResult.RETRYABLE] * 4,
++        runtime.types.LeaseReleaseResult.RELEASED,
++    ]
++    promote = Mock(return_value=True)
++    monkeypatch.setattr(session, "_start_seed_service", promote)
++
++    assert session.start_seed_service(object(), True) is runtime.types.RForkSeedServiceStartResult.DEFERRED
++    session.lease_release_thread.join(2)
++
++    assert session.seed_lease is None
++    assert not session._lease_release_exhausted
++    assert session.planner.release_seed_once.call_count == 5
++    promote.assert_called_once()
++
++
+ @pytest.mark.parametrize("failure", ["metadata", "read"])
+ def test_transfer_failure_requires_cleanup_before_publication(runtime, monkeypatch, failure):
+     session = make_session(runtime)
+diff --git a/tests/ut/model_loader/rfork/test_registration_cache_isolated.py b/tests/ut/model_loader/rfork/test_registration_cache_isolated.py
+new file mode 100644
+index 000000000..a61d6ceec
+--- /dev/null
++++ b/tests/ut/model_loader/rfork/test_registration_cache_isolated.py
+@@ -0,0 +1,137 @@
++# SPDX-License-Identifier: Apache-2.0
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
++
++import logging
++import sys
++from types import SimpleNamespace
++from unittest.mock import Mock
++
++import regex as re
++import torch
++
++
++def test_tensor_collection_deduplicates_exact_impl_alias_but_keeps_distinct_view(tensor_runtime, monkeypatch):
++    tensor_layout = tensor_runtime.tensor_layout
++    weight = torch.nn.Parameter(torch.arange(4, dtype=torch.float32))
++    model = torch.nn.Module()
++    model.register_parameter("weight", weight)
++    model.impl = SimpleNamespace(weight=weight, view=weight[:2])
++    monkeypatch.setattr(tensor_layout, "is_transferable_tensor", lambda _tensor: True)
++
++    collected = tensor_layout.collect_transferable_tensors(model, processed_layout=True)
++
++    assert [(name, tensor.numel()) for name, tensor in collected] == [("weight", 4), ("impl.view", 2)]
++
++
++def test_read_rejects_missing_registration_cache_without_rescanning_or_reading(tensor_runtime, monkeypatch):
++    transfer_backend = tensor_runtime.transfer_backend
++    backend = tensor_runtime.RForkTransferBackend()
++    read = Mock()
++    rescan = Mock(side_effect=AssertionError("destination tensors were not registered"))
++    backend.transfer_engine = SimpleNamespace(batch_transfer_sync_read=read)
++    monkeypatch.setattr(transfer_backend, "collect_transferable_tensors", rescan)
++    seed_info = tensor_runtime.SeedTransferInfo("seed-session", {"weight": (1234, 4, 4, [4], "float32")})
++
++    assert not backend.read_weights_from_seed(object(), seed_info, True)
++    rescan.assert_not_called()
++    read.assert_not_called()
++
++
++def test_layout_summary_is_one_bounded_info_record_with_fixed_digests(tensor_runtime, caplog):
++    tensors = [(f"weight_{index}", torch.arange(4, dtype=torch.float32)) for index in range(6)]
++    formats = {name: 29 for name, _ in tensors}
++
++    with caplog.at_level(logging.INFO, logger=tensor_runtime.tensor_layout.logger.name):
++        tensor_runtime.tensor_layout.log_tensor_layout_summary(
++            tensors,
++            stage="receiver_before_read",
++            session_id="receiver-session",
++            peer_session_id="seed-session",
++            processed_layout=True,
++            known_formats=formats,
++        )
++
++    records = [record.getMessage() for record in caplog.records if "RFork tensor layout summary" in record.getMessage()]
++    assert len(records) == 1
++    message = records[0]
++    assert "tensors=6" in message
++    assert "session=receiver-session peer_session=seed-session" in message
++    assert len(re.findall(r"(?:semantic|physical)_digest=[0-9a-f]{64}", message)) == 2
++    assert "weight_0" in message and "weight_2" in message
++    assert "weight_3" not in message and "weight_5" not in message
++
++
++def test_layout_summary_includes_npu_format_and_physical_size(tensor_runtime, monkeypatch, caplog):
++    class _NPUTensorProxy:
++        device = SimpleNamespace(type="npu")
++
++        def __init__(self, tensor):
++            self._tensor = tensor
++
++        def __getattr__(self, name):
++            return getattr(self._tensor, name)
++
++    monkeypatch.setitem(
++        sys.modules,
++        "torch_npu",
++        SimpleNamespace(
++            get_npu_format=lambda tensor: 29,
++            get_storage_size=lambda tensor: tensor.numel() + 8,
++        ),
++    )
++    tensor = _NPUTensorProxy(torch.arange(4, dtype=torch.float32))
++
++    with caplog.at_level(logging.INFO, logger=tensor_runtime.tensor_layout.logger.name):
++        tensor_runtime.tensor_layout.log_tensor_layout_summary(
++            [("weight", tensor)],
++            stage="registered",
++            session_id="seed-session",
++            processed_layout=True,
++        )
++
++    message = next(
++        record.getMessage() for record in caplog.records if "RFork tensor layout summary" in record.getMessage()
++    )
++    assert "physical_nonlogical_tensors=1" in message
++    assert "formats={'29': 1}" in message
++    assert "'npu_format': 29" in message
++    assert "'npu_storage_numel': 12" in message
++
++
++def test_post_load_layout_summary_is_observational(tensor_runtime, monkeypatch, caplog):
++    tensor_layout = tensor_runtime.tensor_layout
++    monkeypatch.setattr(tensor_layout, "is_tensor_on_transfer_device", lambda tensor: True)
++    model = torch.nn.Module()
++    model.weight = torch.nn.Parameter(torch.arange(4, dtype=torch.float32))
++    original = model.weight.detach().clone()
++    backend = tensor_runtime.RForkTransferBackend()
++    backend.transfer_session_id = "receiver-session"
++
++    with caplog.at_level(logging.INFO, logger=tensor_layout.logger.name):
++        backend.log_model_layout_summary(
++            model,
++            False,
++            stage="receiver_after_post_load",
++            peer_session_id="seed-session",
++        )
++
++    message = next(record.getMessage() for record in caplog.records if "RFork tensor layout summary" in record.message)
++    assert "stage=receiver_after_post_load" in message
++    assert "session=receiver-session peer_session=seed-session" in message
++    assert "tensors=1" in message
++    torch.testing.assert_close(model.weight, original)
++
++
++def test_post_load_layout_diagnostic_failure_does_not_escape(tensor_runtime, monkeypatch, caplog):
++    transfer_backend = tensor_runtime.transfer_backend
++    monkeypatch.setattr(
++        transfer_backend,
++        "collect_transferable_tensors",
++        Mock(side_effect=RuntimeError("inspection failed")),
++    )
++    backend = tensor_runtime.RForkTransferBackend()
++
++    with caplog.at_level(logging.INFO, logger=transfer_backend.logger.name):
++        backend.log_model_layout_summary(object(), False, stage="receiver_after_post_load")
++
++    assert "unavailable=RuntimeError:inspection failed" in caplog.text
+diff --git a/tests/ut/model_loader/rfork/test_rfork_loader.py b/tests/ut/model_loader/rfork/test_rfork_loader.py
+index 925c4d5a2..73a43821f 100644
+--- a/tests/ut/model_loader/rfork/test_rfork_loader.py
++++ b/tests/ut/model_loader/rfork/test_rfork_loader.py
+@@ -327,6 +327,9 @@ def test_rfork_draft_load_passes_target_registered_blocks_to_session(monkeypatch
+             events.append("transfer")
+             return True
+ 
++        def log_transferred_model_layout(self, model, processed_layout):
++            events.append("layout_summary")
++
+         def start_seed_service(self, model, processed_layout, exclude_blocks=None):
+             events.append("start_seed_service")
+             captured_blocks.append(list(exclude_blocks or []))
+@@ -401,6 +404,9 @@ def test_rfork_acquires_seed_after_model_preparation(monkeypatch, processed_layo
+             events.append("transfer")
+             return True
+ 
++        def log_transferred_model_layout(self, model, processed_layout):
++            events.append("layout_summary")
++
+         def start_seed_service(self, model, processed_layout, exclude_blocks=None):
+             events.append("start_seed_service")
+             return True
+@@ -434,9 +440,9 @@ def test_rfork_acquires_seed_after_model_preparation(monkeypatch, processed_layo
+     assert loader.load_model(vllm_config=vllm_config, model_config=model_config) is model
+ 
+     if processed_layout:
+-        assert events[:5] == ["initialize", "layout", "synchronize", "acquire", "transfer"]
++        assert events[:6] == ["initialize", "layout", "synchronize", "acquire", "transfer", "layout_summary"]
+     else:
+-        assert events[:4] == ["initialize", "acquire", "transfer", "post_load"]
++        assert events[:5] == ["initialize", "acquire", "transfer", "post_load", "layout_summary"]
+ 
+ 
+ @pytest.mark.parametrize("failure_stage", ["initialize", "layout"])
+@@ -738,6 +744,9 @@ def test_rfork_seed_start_failure_returns_valid_model_without_disk_reload(monkey
+             events.append("transfer")
+             return True
+ 
++        def log_transferred_model_layout(self, model, processed_layout):
++            events.append("layout_summary")
++
+         def start_seed_service(self, model, processed_layout, exclude_blocks=None):
+             events.append("start_seed_service")
+             return RForkSeedServiceStartResult.FAILED
+diff --git a/tests/ut/model_loader/rfork/test_session_server_integration.py b/tests/ut/model_loader/rfork/test_session_server_integration.py
+index dc2c46954..a03699635 100644
+--- a/tests/ut/model_loader/rfork/test_session_server_integration.py
++++ b/tests/ut/model_loader/rfork/test_session_server_integration.py
+@@ -82,7 +82,9 @@ def test_session_serves_real_metadata_and_closes_listener(live_session):
+ 
+ def test_rejected_advertisement_cleans_real_server_before_unregister(live_session):
+     r = live_session
+-    r.session.planner.report_seed_once.return_value = False
++    r.session.planner.report_seed_once.return_value = r.runtime.types.SeedReportResult(
++        r.runtime.types.SeedReportStatus.REJECTED, "status=400"
++    )
+ 
+     def unregister():
+         assert r.handles and not r.handles[0].is_alive
+@@ -95,6 +97,29 @@ def test_rejected_advertisement_cleans_real_server_before_unregister(live_sessio
+     r.session.transfer_backend.unregister_memory_region.assert_called_once()
+ 
+ 
++def test_transient_initial_advertisement_recovers_without_restarting_instance(live_session):
++    r = live_session
++    r.session.config = replace(r.session.config, heartbeat_interval_sec=0.02)
++    recovered = threading.Event()
++    retryable = r.runtime.types.SeedReportResult(r.runtime.types.SeedReportStatus.RETRYABLE, "ConnectTimeout")
++    accepted = r.runtime.types.SeedReportResult(r.runtime.types.SeedReportStatus.ACCEPTED)
++
++    def report(*_args, **_kwargs):
++        if r.session.planner.report_seed_once.call_count == 1:
++            return retryable
++        recovered.set()
++        return accepted
++
++    r.session.planner.report_seed_once.side_effect = report
++    assert r.session.start_seed_service(object(), True) is r.runtime.types.RForkSeedServiceStartResult.STARTED
++    handle = r.session.seed_server
++    assert handle.is_alive
++    assert recovered.wait(2)
++    assert r.session.state is r.runtime.types.RForkLifecycleState.SERVING
++    assert r.session.shutdown()
++    assert not handle.is_alive
++
++
+ def test_failed_removal_keeps_live_seed_until_retry(live_session):
+     r = live_session
+     assert r.session.start_seed_service(object(), True) is r.runtime.types.RForkSeedServiceStartResult.STARTED
+@@ -134,14 +159,16 @@ def test_lost_publish_response_cleans_or_retains_live_resources(live_session, mo
+         return SimpleNamespace(status_code=200)
+ 
+     monkeypatch.setattr(requests, "post", post)
+-    assert r.session.start_seed_service(object(), True) is r.runtime.types.RForkSeedServiceStartResult.FAILED
++    assert r.session.start_seed_service(object(), True) is r.runtime.types.RForkSeedServiceStartResult.STARTED
++    assert planner.last_advertisement is not None
++    assert remote_seeds and r.session.seed_server.is_alive
++    r.session.transfer_backend.unregister_memory_region.assert_not_called()
+     if removal_fails:
+-        assert planner.last_advertisement is not None
+-        assert remote_seeds and r.session.seed_server.is_alive
+-        r.session.transfer_backend.unregister_memory_region.assert_not_called()
++        assert not r.session.prepare_for_fallback().can_schedule_seed
++        assert r.session.seed_server.is_alive
+         # A later acknowledged removal releases the resources in order.
+         removal_fails = False
+-        assert r.session.prepare_for_fallback().can_schedule_seed
++    assert r.session.prepare_for_fallback().can_schedule_seed
+     assert not remote_seeds
+     assert planner.last_advertisement is None
+     assert r.session.seed_server is None
+diff --git a/tests/ut/model_loader/rfork/test_transfer_backend.py b/tests/ut/model_loader/rfork/test_transfer_backend.py
+index ca68966ef..48f229e26 100644
+--- a/tests/ut/model_loader/rfork/test_transfer_backend.py
++++ b/tests/ut/model_loader/rfork/test_transfer_backend.py
+@@ -717,25 +717,21 @@ def test_register_memory_region_skips_empty_batch_after_excluding_all_weights(mo
+     assert registrations == []
+ 
+ 
+-def test_read_weights_from_seed_defensively_skips_pre_registered_weights(monkeypatch):
++def test_read_weights_from_seed_rejects_missing_registration_cache(monkeypatch):
+     storage = torch.arange(100, dtype=torch.float32)
+-    shared_weight = storage[:10]
+     own_weight = storage[20:32]
+     backend = RForkTransferBackend()
++    reads = []
+     backend.transfer_engine = SimpleNamespace(
+-        batch_transfer_sync_read=lambda *args: SimpleNamespace(is_error=lambda: False)
++        batch_transfer_sync_read=lambda *args: _append_and_return(reads, args, SimpleNamespace(is_error=lambda: False))
+     )
+     backend.excluded_weight_blocks = [(storage.data_ptr(), 40)]
+     backend._registered_transferable_tensors = None
+ 
+-    monkeypatch.setattr(
+-        transfer_backend,
+-        "collect_transferable_tensors",
+-        lambda model, processed_layout: [
+-            ("model.embed_tokens.weight", shared_weight),
+-            ("layers.0.fc.weight", own_weight),
+-        ],
+-    )
++    def fail_if_rescanned(*_args):
++        raise AssertionError("RFork must not rescan tensors after registration is lost")
++
++    monkeypatch.setattr(transfer_backend, "collect_transferable_tensors", fail_if_rescanned)
+ 
+     seed_info = SeedTransferInfo(
+         "seed-session",
+@@ -751,7 +747,8 @@ def test_read_weights_from_seed_defensively_skips_pre_registered_weights(monkeyp
+         formats={"layers.0.fc.weight": 0},
+     )
+ 
+-    assert backend.read_weights_from_seed(object(), seed_info, True)
++    assert not backend.read_weights_from_seed(object(), seed_info, True)
++    assert reads == []
+ 
+ 
+ def test_read_weights_from_seed_fails_for_unknown_weight_outside_shared_blocks(monkeypatch):
+diff --git a/tests/ut/model_loader/rfork/test_transfer_timing_isolated.py b/tests/ut/model_loader/rfork/test_transfer_timing_isolated.py
+new file mode 100644
+index 000000000..c12d76fd5
+--- /dev/null
++++ b/tests/ut/model_loader/rfork/test_transfer_timing_isolated.py
+@@ -0,0 +1,66 @@
++# SPDX-License-Identifier: Apache-2.0
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
++
++import logging
++import sys
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++
++@pytest.mark.parametrize(("tp_rank", "expected_level"), [(0, logging.INFO), (2, logging.DEBUG)])
++def test_weight_transfer_completion_is_info_only_for_tp0(tensor_runtime, monkeypatch, caplog, tp_rank, expected_level):
++    transfer_backend = tensor_runtime.transfer_backend
++    manifest = sys.modules["vllm_ascend.model_loader.rfork.manifest"]
++    monkeypatch.setattr(manifest, "read_npu_format", lambda tensor: 0)
++    monkeypatch.setattr(transfer_backend, "read_npu_format", lambda tensor: 0)
++
++    tensor = torch.arange(4, dtype=torch.float32)
++    backend = tensor_runtime.RForkTransferBackend(tp_rank=tp_rank)
++    backend.transfer_engine = SimpleNamespace(
++        batch_transfer_sync_read=lambda *args: SimpleNamespace(is_error=lambda: False)
++    )
++    backend._registered_transferable_tensors = [("weight", tensor)]
++    seed_info = tensor_runtime.SeedTransferInfo(
++        "seed-session",
++        {"weight": (1234, 4, 4, [4], "float32")},
++        formats={"weight": 0},
++    )
++
++    with caplog.at_level(logging.DEBUG, logger=transfer_backend.logger.name):
++        assert backend.read_weights_from_seed(object(), seed_info, True)
++
++    completion = [record for record in caplog.records if "RFork weight transfer completed" in record.message]
++    assert len(completion) == 1
++    assert completion[0].levelno == expected_level
++    assert f"tp_rank={tp_rank}" in completion[0].message
++    assert "elapsed=" in completion[0].message
++    assert "throughput=" in completion[0].message
++
++
++def test_failed_transfer_does_not_log_successful_completion(tensor_runtime, monkeypatch, caplog):
++    transfer_backend = tensor_runtime.transfer_backend
++    manifest = sys.modules["vllm_ascend.model_loader.rfork.manifest"]
++    monkeypatch.setattr(manifest, "read_npu_format", lambda tensor: 0)
++    monkeypatch.setattr(transfer_backend, "read_npu_format", lambda tensor: 0)
++
++    tensor = torch.arange(4, dtype=torch.float32)
++    backend = tensor_runtime.RForkTransferBackend(tp_rank=0)
++    backend.transfer_engine = SimpleNamespace(
++        batch_transfer_sync_read=lambda *args: SimpleNamespace(
++            is_error=lambda: True,
++            to_string=lambda: "transfer failed",
++        )
++    )
++    backend._registered_transferable_tensors = [("weight", tensor)]
++    seed_info = tensor_runtime.SeedTransferInfo(
++        "seed-session",
++        {"weight": (1234, 4, 4, [4], "float32")},
++        formats={"weight": 0},
++    )
++
++    with caplog.at_level(logging.INFO, logger=transfer_backend.logger.name):
++        assert not backend.read_weights_from_seed(object(), seed_info, True)
++
++    assert not any("RFork weight transfer completed" in record.message for record in caplog.records)
+diff --git a/vllm_ascend/model_loader/rfork/identity.py b/vllm_ascend/model_loader/rfork/identity.py
+index f0fb351a3..6e8dacdff 100644
+--- a/vllm_ascend/model_loader/rfork/identity.py
++++ b/vllm_ascend/model_loader/rfork/identity.py
+@@ -30,6 +30,55 @@ from vllm_ascend.ascend_config import get_ascend_config
+ from vllm_ascend.device.hardware_profile import get_current_hardware_profile
+ from vllm_ascend.model_loader.rfork.types import RFORK_PROTOCOL_VERSION
+ 
++_FINEGRAINED_TP_LAYOUT_FIELDS = (
++    "oproj_tensor_parallel_size",
++    "lmhead_tensor_parallel_size",
++    "embedding_tensor_parallel_size",
++    "mlp_tensor_parallel_size",
++    "olora_tensor_parallel_size",
++)
++_MULTIMODAL_LAYOUT_FIELDS = (
++    "limit_per_prompt",
++    "mm_encoder_tp_mode",
++    "enable_multimodal_pruning",
++)
++_LORA_LAYOUT_FIELDS = (
++    "max_lora_rank",
++    "lora_dtype",
++    "fully_sharded_loras",
++    "lora_extra_vocab_size",
++    "bias_enabled",
++)
++_PROMPT_ADAPTER_LAYOUT_FIELDS = (
++    "max_prompt_adapter_token",
++    "prompt_adapter_dtype",
++)
++_POOLER_LAYOUT_FIELDS = ("pooling_type",)
++_QUANTIZATION_LAYOUT_FIELDS = (
++    "quant_description",
++    "model_type",
++    "packed_modules_mapping",
++    "enable_fa_quant",
++    "enable_indexer_quant",
++    "enable_c8_quant",
++    "kvcache_quant_layers",
++    "indexer_quant_layers",
++    "c8_quant_layers",
++)
++_SPECULATIVE_LAYOUT_FIELDS = (
++    "method",
++    "num_speculative_tokens",
++    "num_speculative_tokens_per_batch_size",
++    "draft_tensor_parallel_size",
++    "parallel_drafting",
++    "disable_padded_drafter_batch",
++    "enforce_eager",
++    "draft_sample_method",
++    "speculative_token_tree",
++    "quantization",
++    "use_local_argmax_reduction",
++)
++
+ 
+ def _canonicalize_fingerprint_value(value: Any, *, _active_ids: set[int] | None = None) -> Any:
+     """Convert config values to deterministic JSON data and reject cycles."""
+@@ -201,6 +250,62 @@ def _get_parallel_world_size(parallel_config: object | None, *attrs: str, defaul
+     return default
+ 
+ 
++def _get_config_fields(config: object | None, fields: tuple[str, ...]) -> dict[str, Any]:
++    return {field: _canonicalize_fingerprint_value(getattr(config, field, None)) for field in fields}
++
++
++def _get_feature_layout_descriptor(config: object | None, fields: tuple[str, ...]) -> dict[str, Any] | None:
++    """Describe only fields that can change a feature's model layout."""
++    if config is None:
++        return None
++    return {
++        "config_type": f"{type(config).__module__}.{type(config).__qualname__}",
++        "layout": _get_config_fields(config, fields),
++    }
++
++
++def _get_multimodal_layout_descriptor(model_config: ModelConfig) -> dict[str, Any] | None:
++    multimodal_config = getattr(model_config, "multimodal_config", None)
++    descriptor = _get_feature_layout_descriptor(multimodal_config, _MULTIMODAL_LAYOUT_FIELDS)
++    if descriptor is None:
++        return None
++
++    get_limit = getattr(multimodal_config, "get_limit_per_prompt", None)
++    if callable(get_limit):
++        effective_limits = {}
++        for modality in ("image", "video", "audio"):
++            try:
++                effective_limits[modality] = _canonicalize_fingerprint_value(get_limit(modality))
++            except Exception:  # pragma: no cover - unsupported modality or third-party config
++                effective_limits[modality] = None
++        descriptor["effective_limits"] = effective_limits
++    is_pruning_enabled = getattr(multimodal_config, "is_multimodal_pruning_enabled", None)
++    if callable(is_pruning_enabled):
++        descriptor["effective_pruning"] = bool(is_pruning_enabled())
++    return descriptor
++
++
++def _get_effective_kv_role(vllm_config: VllmConfig) -> str | None:
++    """Return a stable KV role across current and legacy vLLM configs."""
++    kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
++    if kv_transfer_config is None:
++        return None
++
++    kv_role = getattr(kv_transfer_config, "kv_role", None)
++    if kv_role is not None:
++        return str(kv_role)
++
++    is_kv_producer = bool(getattr(kv_transfer_config, "is_kv_producer", False))
++    is_kv_consumer = bool(getattr(kv_transfer_config, "is_kv_consumer", False))
++    if is_kv_producer and is_kv_consumer:
++        return "kv_both"
++    if is_kv_producer:
++        return "kv_producer"
++    if is_kv_consumer:
++        return "kv_consumer"
++    return None
++
++
+ def _get_quantization_config_digest(model_config: ModelConfig) -> str | None:
+     """Digest the effective quantization config so parameter changes re-key the fingerprint."""
+     quantization_config = None
+@@ -227,6 +332,61 @@ def _get_quantization_config_digest(model_config: ModelConfig) -> str | None:
+     return hashlib.sha256(canonical_json).hexdigest()
+ 
+ 
++def _get_effective_quantization_descriptor(vllm_config: VllmConfig) -> dict[str, Any] | None:
++    """Capture quantization settings used to construct per-layer NPU weights."""
++    quant_config = getattr(vllm_config, "quant_config", None)
++    if quant_config is None:
++        return None
++    get_name = getattr(quant_config, "get_name", None)
++    name = get_name() if callable(get_name) else None
++    return {
++        "config_type": f"{type(quant_config).__module__}.{type(quant_config).__qualname__}",
++        "name": _canonicalize_fingerprint_value(name),
++        "layout": _get_config_fields(quant_config, _QUANTIZATION_LAYOUT_FIELDS),
++    }
++
++
++def _get_model_layout_descriptor(model_config: ModelConfig | None) -> dict[str, Any] | None:
++    if model_config is None:
++        return None
++    return {
++        "revision": _get_model_revision(model_config),
++        "dtype": _canonicalize_fingerprint_value(getattr(model_config, "dtype", None)),
++        "quantization": _canonicalize_fingerprint_value(getattr(model_config, "quantization", None)),
++        "quantization_config": _get_quantization_config_digest(model_config),
++        "architecture": _get_hf_config_descriptor(model_config),
++        "max_model_len": _canonicalize_fingerprint_value(getattr(model_config, "max_model_len", None)),
++        "runner_type": _canonicalize_fingerprint_value(getattr(model_config, "runner_type", None)),
++        "task": _canonicalize_fingerprint_value(getattr(model_config, "task", None)),
++        "convert": _canonicalize_fingerprint_value(getattr(model_config, "convert", None)),
++        "use_mla": _canonicalize_fingerprint_value(getattr(model_config, "use_mla", None)),
++        "enforce_eager": bool(getattr(model_config, "enforce_eager", False)),
++        "multimodal": _get_multimodal_layout_descriptor(model_config),
++    }
++
++
++def _get_speculative_layout_descriptor(vllm_config: VllmConfig) -> dict[str, Any] | None:
++    speculative_config = getattr(vllm_config, "speculative_config", None)
++    if speculative_config is None:
++        return None
++
++    descriptor = _get_config_fields(speculative_config, _SPECULATIVE_LAYOUT_FIELDS)
++    descriptor["draft_model"] = _get_model_layout_descriptor(getattr(speculative_config, "draft_model_config", None))
++    descriptor["draft_parallel"] = _get_config_fields(
++        getattr(speculative_config, "draft_parallel_config", None),
++        (
++            "tensor_parallel_size",
++            "pipeline_parallel_size",
++            "expert_parallel_size",
++            "data_parallel_size",
++            "prefill_context_parallel_size",
++            "decode_context_parallel_size",
++            "use_sequence_parallel_moe",
++        ),
++    )
++    return descriptor
++
++
+ def build_compatibility_fingerprint(
+     vllm_config: VllmConfig,
+     model_config: ModelConfig,
+@@ -240,16 +400,29 @@ def build_compatibility_fingerprint(
+ 
+     try:
+         ascend_config = get_ascend_config()
+-        weight_nz_mode = getattr(ascend_config, "weight_nz_mode", None)
+-        enable_fused_mc2 = getattr(ascend_config, "enable_fused_mc2", None)
+     except Exception:  # pragma: no cover - only reached before Ascend config setup
+-        weight_nz_mode = None
+-        enable_fused_mc2 = None
++        ascend_config = None
+     try:
+         hardware_profile = get_current_hardware_profile()
+-        hardware_policy = getattr(hardware_profile, "weight_layout_policy", None)
++        hardware_layout = _get_config_fields(
++            hardware_profile,
++            (
++                "_device_type",
++                "weight_layout_policy",
++            ),
++        )
+     except Exception:  # pragma: no cover - only reached on unsupported test hardware
+-        hardware_policy = None
++        hardware_layout = {}
++
++    scheduler_config = getattr(vllm_config, "scheduler_config", None)
++    cache_config = getattr(vllm_config, "cache_config", None)
++    finegrained_tp_config = getattr(ascend_config, "finegrained_tp_config", None)
++    finegrained_tp_layout = _get_config_fields(finegrained_tp_config, _FINEGRAINED_TP_LAYOUT_FIELDS)
++    finegrained_tp_enabled = any(
++        isinstance(size, int) and not isinstance(size, bool) and size > 0 for size in finegrained_tp_layout.values()
++    )
++    dynamic_spec_config = getattr(ascend_config, "dynamic_spec_config", None)
++    multimodal_layout = _get_multimodal_layout_descriptor(model_config)
+ 
+     descriptor = {
+         "rfork_protocol_version": RFORK_PROTOCOL_VERSION,
+@@ -259,8 +432,37 @@ def build_compatibility_fingerprint(
+         "dtype": _canonicalize_fingerprint_value(getattr(model_config, "dtype", None)),
+         "quantization": _canonicalize_fingerprint_value(getattr(model_config, "quantization", None)),
+         "quantization_config": _get_quantization_config_digest(model_config),
++        "effective_quantization": _get_effective_quantization_descriptor(vllm_config),
+         "architecture": _get_hf_config_descriptor(model_config),
+         "rope": _get_rope_config_descriptor(model_config),
++        "model_runtime": {
++            "max_model_len": _canonicalize_fingerprint_value(getattr(model_config, "max_model_len", None)),
++            "runner_type": _canonicalize_fingerprint_value(getattr(model_config, "runner_type", None)),
++            "task": _canonicalize_fingerprint_value(getattr(model_config, "task", None)),
++            "convert": _canonicalize_fingerprint_value(getattr(model_config, "convert", None)),
++            "use_mla": _canonicalize_fingerprint_value(getattr(model_config, "use_mla", None)),
++            "enforce_eager": bool(getattr(model_config, "enforce_eager", False)),
++            "use_v2_model_runner": bool(getattr(vllm_config, "use_v2_model_runner", False)),
++        },
++        "multimodal_layout": multimodal_layout,
++        "optional_model_layout": {
++            "lora": _get_feature_layout_descriptor(getattr(vllm_config, "lora_config", None), _LORA_LAYOUT_FIELDS),
++            "prompt_adapter": _get_feature_layout_descriptor(
++                getattr(vllm_config, "prompt_adapter_config", None), _PROMPT_ADAPTER_LAYOUT_FIELDS
++            ),
++            "pooler": _get_feature_layout_descriptor(
++                getattr(vllm_config, "pooler_config", None), _POOLER_LAYOUT_FIELDS
++            ),
++        },
++        "scheduler_layout": _get_config_fields(
++            scheduler_config,
++            ("max_num_batched_tokens",),
++        ),
++        "cache_layout": _get_config_fields(
++            cache_config,
++            ("block_size", "cache_dtype", "mamba_cache_dtype"),
++        ),
++        "speculative_layout": _get_speculative_layout_descriptor(vllm_config),
+         "parallel": {
+             "tensor_world_size": _get_parallel_world_size(
+                 parallel_config, "tensor_parallel_size", "tp_size", default=1
+@@ -274,12 +476,52 @@ def build_compatibility_fingerprint(
+             "data_world_size": _get_parallel_world_size(parallel_config, "data_parallel_size", "dp_size", default=None),
+             "expert_parallel_enabled": bool(getattr(parallel_config, "enable_expert_parallel", False)),
+             "is_moe_model": _canonicalize_fingerprint_value(getattr(parallel_config, "is_moe_model", None)),
++            "prefill_context_world_size": _get_parallel_world_size(
++                parallel_config, "prefill_context_parallel_size", "pcp_size", default=1
++            ),
++            "decode_context_world_size": _get_parallel_world_size(
++                parallel_config, "decode_context_parallel_size", "dcp_size", default=1
++            ),
++            "sequence_parallel_moe": bool(getattr(parallel_config, "use_sequence_parallel_moe", False)),
++            # Fine-grained TP shards modules across the DP dimension. Include
++            # the DP layout position only when those shards are active so
++            # ordinary replicated DP ranks can continue sharing seeds.
++            "finegrained_data_parallel_rank": (
++                _canonicalize_fingerprint_value(getattr(parallel_config, "data_parallel_rank", None))
++                if finegrained_tp_enabled
++                else None
++            ),
+         },
+         "weight_layout": {
+-            "weight_nz_mode": _canonicalize_fingerprint_value(weight_nz_mode),
+-            "hardware_policy": _canonicalize_fingerprint_value(hardware_policy),
++            # P/D roles can materialize different SFA/MLA inference tensors.
++            "kv_role": _get_effective_kv_role(vllm_config),
++            "hardware": hardware_layout,
++            "weight_nz_mode": _canonicalize_fingerprint_value(getattr(ascend_config, "weight_nz_mode", None)),
+             # Fused MC2 rewrites MoE storage, so differently configured instances cannot share seeds.
+-            "enable_fused_mc2": _canonicalize_fingerprint_value(enable_fused_mc2),
++            "enable_fused_mc2": _canonicalize_fingerprint_value(getattr(ascend_config, "enable_fused_mc2", None)),
++            "enable_mlapo": _canonicalize_fingerprint_value(getattr(ascend_config, "enable_mlapo", None)),
++            "mlapo_keep_prefill_weights": _canonicalize_fingerprint_value(
++                getattr(ascend_config, "mlapo_keep_prefill_weights", None)
++            ),
++            "enable_sparse_sfa_c8": _canonicalize_fingerprint_value(
++                getattr(ascend_config, "enable_sparse_sfa_c8", None)
++            ),
++            "enable_sparse_li_c8": _canonicalize_fingerprint_value(getattr(ascend_config, "enable_sparse_li_c8", None)),
++            "c8_reshape_optim_enabled": _canonicalize_fingerprint_value(
++                getattr(ascend_config, "c8_reshape_optim_enabled", None)
++            ),
++            "enable_dsa_cp": _canonicalize_fingerprint_value(getattr(ascend_config, "enable_dsa_cp", None)),
++            "mix_placement": _canonicalize_fingerprint_value(getattr(ascend_config, "mix_placement", None)),
++            "enable_shared_expert_dp": _canonicalize_fingerprint_value(
++                getattr(ascend_config, "enable_shared_expert_dp", None)
++            ),
++            "enable_sp_by_pass": _canonicalize_fingerprint_value(getattr(ascend_config, "enable_sp_by_pass", None)),
++            "pd_tp_ratio": _canonicalize_fingerprint_value(getattr(ascend_config, "pd_tp_ratio", None)),
++            "pd_head_ratio": _canonicalize_fingerprint_value(getattr(ascend_config, "pd_head_ratio", None)),
++            "num_head_replica": _canonicalize_fingerprint_value(getattr(ascend_config, "num_head_replica", None)),
++            "finegrained_tp": finegrained_tp_layout,
++            "draft_window_size": _canonicalize_fingerprint_value(getattr(ascend_config, "draft_window_size", None)),
++            "dynamic_spec": _get_config_fields(dynamic_spec_config, ("method", "method_params")),
+         },
+     }
+     canonical_json = json.dumps(
+diff --git a/vllm_ascend/model_loader/rfork/planner_client.py b/vllm_ascend/model_loader/rfork/planner_client.py
+index f6fc7d3b7..3e65d6b60 100644
+--- a/vllm_ascend/model_loader/rfork/planner_client.py
++++ b/vllm_ascend/model_loader/rfork/planner_client.py
+@@ -14,7 +14,14 @@ from vllm.utils.network_utils import get_ip
+ 
+ from vllm_ascend.model_loader.rfork.config import RForkConfig
+ from vllm_ascend.model_loader.rfork.identity import build_seed_key
+-from vllm_ascend.model_loader.rfork.types import LeaseReleaseResult, RForkIdentity, SeedAdvertisement, SeedLease
++from vllm_ascend.model_loader.rfork.types import (
++    LeaseReleaseResult,
++    RForkIdentity,
++    SeedAdvertisement,
++    SeedLease,
++    SeedReportResult,
++    SeedReportStatus,
++)
+ 
+ HEARTBEAT_LOG_EVERY_N = 4
+ SEED_REMOVAL_MAX_ATTEMPTS = 3
+@@ -115,7 +122,7 @@ class RForkPlannerClient:
+                 seed_key=self.seed_key,
+                 lease_ttl_sec=parsed_lease_ttl_sec,
+             )
+-        except Exception as exc:
++        except (requests.RequestException, RuntimeError, ValueError) as exc:
+             logger.warning("RFork planner seed acquisition failed: %s", exc)
+             return None
+ 
+@@ -151,17 +158,19 @@ class RForkPlannerClient:
+                 return LeaseReleaseResult.RELEASED
+             body = response.text.replace(lease.user_id, "<lease-id>") if lease.user_id else response.text
+             body = "".join(char if char.isprintable() else " " for char in body[:RESPONSE_LOG_MAX_CHARS])
+-            logger.warning(
++            retryable = response.status_code in (408, 429) or 500 <= response.status_code < 600
++            log_failure = logger.debug if retryable else logger.warning
++            log_failure(
+                 "RFork planner lease release rejected: lease=%s status=%s response=%r",
+                 lease_log_id(lease),
+                 response.status_code,
+                 body,
+             )
+-            if response.status_code in (408, 429) or 500 <= response.status_code < 600:
++            if retryable:
+                 return LeaseReleaseResult.RETRYABLE
+             return LeaseReleaseResult.REJECTED
+         except requests.RequestException as exc:
+-            logger.warning(
++            logger.debug(
+                 "RFork lease release request failed: lease=%s error=%s", lease_log_id(lease), type(exc).__name__
+             )
+             return LeaseReleaseResult.RETRYABLE
+@@ -187,7 +196,7 @@ class RForkPlannerClient:
+                 lease_log_id(lease),
+                 response.status_code,
+             )
+-        except Exception as exc:
++        except (requests.RequestException, RuntimeError) as exc:
+             logger.warning(
+                 "RFork planner lease renewal failed: lease=%s error=%s",
+                 lease_log_id(lease),
+@@ -198,7 +207,7 @@ class RForkPlannerClient:
+     def remove_seed(self, advertisement: SeedAdvertisement | None = None) -> bool:
+         try:
+             self._require_planner()
+-        except Exception as exc:
++        except RuntimeError as exc:
+             logger.warning("RFork planner seed removal setup failed: %s", exc)
+             return False
+ 
+@@ -231,7 +240,7 @@ class RForkPlannerClient:
+                     SEED_REMOVAL_MAX_ATTEMPTS,
+                     response.status_code,
+                 )
+-            except Exception as exc:
++            except requests.RequestException as exc:
+                 logger.warning(
+                     "RFork planner seed removal attempt %d/%d failed: %s",
+                     attempt + 1,
+@@ -242,7 +251,7 @@ class RForkPlannerClient:
+                 time.sleep(SEED_REMOVAL_RETRY_BACKOFF_SEC * (attempt + 1))
+         return False
+ 
+-    def report_seed_once(self, port: int, seed_ip: str | None = None) -> bool:
++    def report_seed_once(self, port: int, seed_ip: str | None = None) -> SeedReportResult:
+         try:
+             self._require_planner()
+             advertisement = SeedAdvertisement(seed_ip or get_ip(), port, self.tp_rank)
+@@ -259,14 +268,17 @@ class RForkPlannerClient:
+                     "SEED_REFCNT": "0",
+                 },
+                 timeout=self.request_timeout_sec,
++                allow_redirects=False,
+             )
+-            if response.status_code != 200:
+-                logger.warning("RFork planner seed report returned status=%s", response.status_code)
+-                return False
+-            return True
+-        except Exception as exc:
+-            logger.warning("RFork planner seed report failed: %s", exc)
+-            return False
++            if response.status_code == 200:
++                return SeedReportResult(SeedReportStatus.ACCEPTED)
++            if response.status_code in (408, 429) or 500 <= response.status_code < 600:
++                return SeedReportResult(SeedReportStatus.RETRYABLE, f"status={response.status_code}")
++            return SeedReportResult(SeedReportStatus.REJECTED, f"status={response.status_code}")
++        except requests.RequestException as exc:
++            return SeedReportResult(SeedReportStatus.RETRYABLE, type(exc).__name__)
++        except (RuntimeError, ValueError, OSError) as exc:
++            return SeedReportResult(SeedReportStatus.REJECTED, type(exc).__name__)
+ 
+     def run_seed_heartbeat(
+         self,
+diff --git a/vllm_ascend/model_loader/rfork/rfork_loader.py b/vllm_ascend/model_loader/rfork/rfork_loader.py
+index afab45431..6afd3d997 100644
+--- a/vllm_ascend/model_loader/rfork/rfork_loader.py
++++ b/vllm_ascend/model_loader/rfork/rfork_loader.py
+@@ -57,6 +57,7 @@ class _RForkSeedUnavailable(RuntimeError):
+ 
+ FALLBACK_CLEANUP_MAX_ATTEMPTS = 2
+ FALLBACK_MEMORY_RECLAIM_PASSES = 4
++RFORK_FALLBACK_EXCEPTIONS = (ImportError, OSError, RuntimeError, ValueError)
+ 
+ 
+ @dataclass
+@@ -591,6 +592,8 @@ class RForkModelLoader(BaseModelLoader):
+                     with _rfork_skip_unquantized_moe_post_load_processing(model):
+                         process_weights_after_loading(model, model_config, target_device)
+ 
++                session.log_transferred_model_layout(model, processed_layout_transfer)
++
+                 # Advertise only after post-load and eval; the session owns failure cleanup.
+                 model = model.eval()
+                 _start_rfork_seed_service(
+@@ -611,7 +614,7 @@ class RForkModelLoader(BaseModelLoader):
+                     "RFork %s seed acquisition was unsuccessful; loading locally.",
+                     _rfork_model_kind(session),
+                 )
+-            except Exception as e:
++            except RFORK_FALLBACK_EXCEPTIONS as e:
+                 fallback_source = "fallback"
+                 logger.warning("RFork transfer failed: %s, clean up and fall back to default loader", e)
+ 
+diff --git a/vllm_ascend/model_loader/rfork/session.py b/vllm_ascend/model_loader/rfork/session.py
+index dc435fcdd..c5e3414da 100644
+--- a/vllm_ascend/model_loader/rfork/session.py
++++ b/vllm_ascend/model_loader/rfork/session.py
+@@ -26,12 +26,17 @@ from vllm_ascend.model_loader.rfork.types import (
+     RForkLifecycleState,
+     RForkSeedServiceStartResult,
+     SeedLease,
++    SeedReportStatus,
+     SeedTransferInfo,
+ )
+ 
+ HEARTBEAT_STOP_GRACE_SEC = 1.0
++HEARTBEAT_LOG_EVERY_N = 4
++HEARTBEAT_FAILURE_LOG_EVERY_N = 20
+ LEASE_RENEW_MIN_INTERVAL_SEC = 0.1
+ LEASE_RENEW_MAX_INTERVAL_SEC = 30.0
++LEASE_RELEASE_DEGRADED_RETRY_INTERVAL_SEC = 60.0
++LEASE_RELEASE_DEGRADED_LOG_EVERY_N = 10
+ 
+ 
+ class RForkSession:
+@@ -48,7 +53,7 @@ class RForkSession:
+         self.config = config
+         self.identity = identity
+         self.planner = RForkPlannerClient(config, identity)
+-        self.transfer_backend = RForkTransferBackend()
++        self.transfer_backend = RForkTransferBackend(tp_rank=identity.tp_rank)
+         self.state = RForkLifecycleState.INITIALIZED
+         self.seed_lease: SeedLease | None = None
+         self.seed_server: RForkSeedServerHandle | None = None
+@@ -62,11 +67,14 @@ class RForkSession:
+         self._lease_release_exhausted = False
+         self._lease_acquired_at: float | None = None
+         self._registration_elapsed = 0.0
++        self._source_transfer_session_id: str | None = None
+         self._deferred_seed_start: tuple[Any, bool, list[tuple[int, int]] | None] | None = None
+         self._lock = threading.RLock()
+         # Acquire before _lock; release responses must not wait on removal I/O.
+         self._seed_lifecycle_lock = threading.RLock()
+-        atexit.register(self.shutdown)
++        self._shutdown_in_progress = False
++        self._atexit_callback = self.shutdown
++        atexit.register(self._atexit_callback)
+ 
+     def register_destination(
+         self, model, processed_layout: bool, exclude_blocks: list[tuple[int, int]] | None = None
+@@ -80,6 +88,7 @@ class RForkSession:
+             ):
+                 return False
+             self.state = RForkLifecycleState.CLEANUP_REQUIRED
++            self._source_transfer_session_id = None
+             started_at = time.monotonic()
+             if not self.transfer_backend.register_memory_region(model, processed_layout, exclude_blocks):
+                 return False
+@@ -193,6 +202,7 @@ class RForkSession:
+                 processed_layout=processed_layout,
+             ):
+                 return False
++            self._source_transfer_session_id = seed_info.session_id
+             self.state = RForkLifecycleState.TRANSFERRED
+             logger.debug(
+                 "RFork transfer stages: lease=%s global_rank=%s registration=%.3fs metadata=%.3fs read=%.3fs",
+@@ -206,6 +216,17 @@ class RForkSession:
+             self._ensure_lease_release_retry_locked()
+             return True
+ 
++    def log_transferred_model_layout(self, model, processed_layout: bool) -> None:
++        """Log the final receiver layout without affecting transfer state."""
++        with self._lock:
++            peer_session_id = self._source_transfer_session_id
++        self.transfer_backend.log_model_layout_summary(
++            model,
++            processed_layout,
++            stage=("receiver_after_transfer_finalize" if processed_layout else "receiver_after_post_load"),
++            peer_session_id=peer_session_id,
++        )
++
+     def _ensure_lease_release_retry_locked(self) -> None:
+         self._stop_lease_renewal_locked()
+         if (
+@@ -231,9 +252,10 @@ class RForkSession:
+         try:
+             while not self.lease_release_stop_event.is_set():
+                 # Wait only between attempts, never before the initial release.
+-                if self._lease_release_attempts and self.lease_release_stop_event.wait(
+-                    self.config.lease_release_retry_interval_sec
+-                ):
++                retry_interval = self.config.lease_release_retry_interval_sec
++                if self._lease_release_attempts >= self.config.lease_release_max_attempts:
++                    retry_interval = max(retry_interval, LEASE_RELEASE_DEGRADED_RETRY_INTERVAL_SEC)
++                if self._lease_release_attempts and self.lease_release_stop_event.wait(retry_interval):
+                     return
+                 with self._lock:
+                     if self.state is RForkLifecycleState.FINALIZED or self.seed_lease is None:
+@@ -271,15 +293,18 @@ class RForkSession:
+             time.monotonic() - acquired_at if acquired_at is not None else 0.0,
+         )
+         if result is LeaseReleaseResult.RELEASED:
++            if self._lease_release_attempts > 1:
++                logger.info(
++                    "RFork planner lease release recovered: lease=%s attempts=%d",
++                    lease_log_id(lease),
++                    self._lease_release_attempts,
++                )
+             self.seed_lease = None
+             self._lease_acquired_at = None
+             if self.state is RForkLifecycleState.LEASED:
+                 self.state = RForkLifecycleState.REGISTERED
+             return True
+-        if (
+-            result is LeaseReleaseResult.REJECTED
+-            or self._lease_release_attempts >= self.config.lease_release_max_attempts
+-        ):
++        if result is LeaseReleaseResult.REJECTED:
+             self._lease_release_exhausted = True
+             self._deferred_seed_start = None
+             logger.error(
+@@ -289,6 +314,22 @@ class RForkSession:
+                 self._lease_release_attempts,
+             )
+             return True
++        if (
++            self._lease_release_attempts == 1
++            or self._lease_release_attempts == self.config.lease_release_max_attempts
++            or (
++                self._lease_release_attempts > self.config.lease_release_max_attempts
++                and (self._lease_release_attempts - self.config.lease_release_max_attempts)
++                % LEASE_RELEASE_DEGRADED_LOG_EVERY_N
++                == 0
++            )
++        ):
++            logger.warning(
++                "RFork planner lease release is temporarily unavailable: lease=%s attempts=%d; "
++                "background retries continue.",
++                lease_log_id(lease),
++                self._lease_release_attempts,
++            )
+         return False
+ 
+     def _release_seed_locked(self) -> bool:
+@@ -452,22 +493,23 @@ class RForkSession:
+                 self.seed_server = handle
+                 if self.lease_release_stop_event.is_set():
+                     raise RuntimeError("shutdown requested during seed server startup")
+-            if not self.planner.report_seed_once(handle.port, seed_ip=self.config.seed_advertise_host):
+-                raise RuntimeError("planner rejected the initial seed advertisement")
++            if not handle.is_alive:
++                raise RuntimeError("seed HTTP server exited before advertisement")
++            initial_report = self.planner.report_seed_once(handle.port, seed_ip=self.config.seed_advertise_host)
++            pending_report = not initial_report
++            if pending_report and getattr(initial_report, "status", None) is not SeedReportStatus.RETRYABLE:
++                raise RuntimeError(
++                    "planner rejected the initial seed advertisement: "
++                    f"{getattr(initial_report, 'reason', 'unknown error')}"
++                )
+ 
+             with self._lock:
+                 if self.lease_release_stop_event.is_set():
+                     raise RuntimeError("shutdown requested during seed advertisement")
+                 self.heartbeat_stop_event = threading.Event()
+                 self.heartbeat_thread = threading.Thread(
+-                    target=self.planner.run_seed_heartbeat,
+-                    args=(handle.port,),
+-                    kwargs={
+-                        "sleep_interval": self.config.heartbeat_interval_sec,
+-                        "stop_event": self.heartbeat_stop_event,
+-                        "seed_ip": self.config.seed_advertise_host,
+-                        "initial_delay": True,
+-                    },
++                    target=self._run_seed_heartbeat,
++                    args=(handle, self.heartbeat_stop_event, int(pending_report)),
+                     daemon=True,
+                     name="RForkHeartbeat",
+                 )
+@@ -482,6 +524,13 @@ class RForkSession:
+                 self.identity.global_rank,
+                 handle.port,
+             )
++            if pending_report:
++                logger.warning(
++                    "RFork seed service is running but planner advertisement is pending for seed_key=%s: %s; "
++                    "background heartbeats will retry.",
++                    self.planner.seed_key,
++                    initial_report.reason,
++                )
+             return True
+         except Exception as exc:
+             with self._lock:
+@@ -491,6 +540,66 @@ class RForkSession:
+             logger.warning("RFork seed service startup failed for global_rank=%s: %s", self.identity.global_rank, exc)
+             return False
+ 
++    def _run_seed_heartbeat(
++        self, handle: RForkSeedServerHandle, stop_event: threading.Event, report_failures: int = 0
++    ) -> None:
++        # Do not take _seed_lifecycle_lock: shutdown owns it while joining this thread; native cleanup stays elsewhere.
++        heartbeat_index = 0
++        withdrawal_reason = "seed service failure"
++        while not stop_event.wait(self.config.heartbeat_interval_sec):
++            if not handle.is_alive:
++                break
++            heartbeat_index += 1
++            try:
++                reported = self.planner.report_seed_once(handle.port, seed_ip=self.config.seed_advertise_host)
++            except Exception:
++                logger.exception("RFork heartbeat raised; withdrawing the seed.")
++                break
++            # Server may exit while add_seed is in flight; revoke that advertisement even if the report succeeded.
++            if not handle.is_alive:
++                break
++            if getattr(reported, "status", None) is SeedReportStatus.REJECTED:
++                withdrawal_reason = (
++                    f"planner rejected seed heartbeat for seed_key={self.planner.seed_key}: {reported.reason}"
++                )
++                break
++            if not reported:
++                report_failures += 1
++                if report_failures == 1 or report_failures % HEARTBEAT_FAILURE_LOG_EVERY_N == 0:
++                    logger.warning(
++                        "RFork planner seed heartbeat is temporarily unavailable for seed_key=%s: %s "
++                        "(consecutive failures=%d); background retries continue.",
++                        self.planner.seed_key,
++                        getattr(reported, "reason", "unknown error"),
++                        report_failures,
++                    )
++            elif heartbeat_index % HEARTBEAT_LOG_EVERY_N == 0:
++                logger.debug("RFork heartbeat accepted for seed_key=%s", self.planner.seed_key)
++            if reported and report_failures:
++                logger.info(
++                    "RFork planner seed heartbeat recovered for seed_key=%s after %d failed reports.",
++                    self.planner.seed_key,
++                    report_failures,
++                )
++                report_failures = 0
++        else:
++            return
++
++        with self._lock:
++            if stop_event.is_set() or self.seed_server is not handle:
++                return
++            stop_event.set()
++            self.state = RForkLifecycleState.CLEANUP_REQUIRED
++        logger.error("RFork seed heartbeat stopped after %s; inference can continue.", withdrawal_reason)
++        try:
++            removed = self.planner.remove_seed()
++        except Exception:
++            logger.exception("RFork failed to withdraw the seed after a service failure.")
++            removed = False
++        if not removed:
++            logger.warning("RFork seed removal remains pending; heartbeats stopped, retaining registered memory.")
++        # Retain the handle and registrations until normal cleanup; removal alone does not prove native reads finished.
++
+     def _cleanup_failed_seed_start(self) -> None:
+         # The caller owns _seed_lifecycle_lock, but must not hold _lock here.
+         service_ok = self._stop_seed_service()
+@@ -547,25 +656,36 @@ class RForkSession:
+             with self._lock:
+                 if self.state is RForkLifecycleState.FINALIZED:
+                     return True
++                if self._shutdown_in_progress:
++                    logger.debug("RFork shutdown is already in progress; skipping a reentrant cleanup request.")
++                    return False
++                self._shutdown_in_progress = True
+                 self._deferred_seed_start = None
+-            service_ok = self._stop_seed_service()
+-            with self._lock:
+-                release_ok = self.seed_lease is None
+-                finalize_ok = self.transfer_backend.finalize_transfer_engine() if service_ok and release_ok else False
+-                if finalize_ok:
+-                    self.state = RForkLifecycleState.FINALIZED
+-                elif not service_ok:
+-                    logger.warning(
+-                        "RFork shutdown retained registered memory because seed service cleanup is incomplete."
+-                    )
+-                elif not release_ok:
+-                    logger.warning(
+-                        "RFork shutdown retained TransferEngine state because the source lease is unresolved. "
+-                        "No new release retries will be started; an in-flight request may still acknowledge. "
+-                        "Otherwise lease recovery depends on the planner's expiry/reclamation policy."
+-                    )
+-                else:
+-                    logger.warning(
+-                        "RFork shutdown retained TransferEngine state because finalization did not complete."
++            try:
++                service_ok = self._stop_seed_service()
++                with self._lock:
++                    release_ok = self.seed_lease is None
++                    finalize_ok = (
++                        self.transfer_backend.finalize_transfer_engine() if service_ok and release_ok else False
+                     )
+-                return service_ok and release_ok and finalize_ok
++                    if finalize_ok:
++                        self.state = RForkLifecycleState.FINALIZED
++                        atexit.unregister(self._atexit_callback)
++                    elif not service_ok:
++                        logger.warning(
++                            "RFork shutdown retained registered memory because seed service cleanup is incomplete."
++                        )
++                    elif not release_ok:
++                        logger.warning(
++                            "RFork shutdown retained TransferEngine state because the source lease is unresolved. "
++                            "No new release retries will be started; an in-flight request may still acknowledge. "
++                            "Otherwise lease recovery depends on the planner's expiry/reclamation policy."
++                        )
++                    else:
++                        logger.warning(
++                            "RFork shutdown retained TransferEngine state because finalization did not complete."
++                        )
++                    return service_ok and release_ok and finalize_ok
++            finally:
++                with self._lock:
++                    self._shutdown_in_progress = False
+diff --git a/vllm_ascend/model_loader/rfork/tensor_layout.py b/vllm_ascend/model_loader/rfork/tensor_layout.py
+index 830908e53..863e96d3a 100644
+--- a/vllm_ascend/model_loader/rfork/tensor_layout.py
++++ b/vllm_ascend/model_loader/rfork/tensor_layout.py
+@@ -5,7 +5,10 @@
+ 
+ """Collect live model tensors and adapt their layout for RFork transfer."""
+ 
++import hashlib
+ import inspect
++import json
++import logging
+ from collections.abc import Iterator
+ from typing import Any
+ 
+@@ -15,6 +18,148 @@ from vllm.logger import logger
+ 
+ from vllm_ascend.model_loader.rfork.manifest import numel_from_shape
+ 
++TENSOR_LAYOUT_SAMPLE_LIMIT = 3
++
++
++def _layout_digest(records: list[dict[str, Any]]) -> str:
++    payload = json.dumps(records, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
++    return hashlib.sha256(payload.encode()).hexdigest()
++
++
++def log_tensor_layout_summary(
++    tensors: list[tuple[str, torch.Tensor]],
++    *,
++    stage: str,
++    session_id: str | None,
++    processed_layout: bool,
++    peer_session_id: str | None = None,
++    known_formats: dict[str, int] | None = None,
++) -> None:
++    """Log a bounded summary of logical and physical tensor layouts at INFO."""
++    if not logger.isEnabledFor(logging.INFO):
++        return
++
++    try:
++        import torch_npu
++    except Exception:
++        torch_npu = None
++
++    semantic_records: list[dict[str, Any]] = []
++    physical_records: list[dict[str, Any]] = []
++    samples: list[dict[str, Any]] = []
++    fallback_samples: list[dict[str, Any]] = []
++    format_counts: dict[str, int] = {}
++    error_counts: dict[str, int] = {}
++    logical_bytes_total = 0
++    unique_storage_bytes = 0
++    unique_storages: set[tuple[str, int]] = set()
++    storage_view_tensors = 0
++    physical_nonlogical_tensors = 0
++
++    def capture(read, field: str):
++        try:
++            return read()
++        except Exception as exc:
++            error_name = f"{field}:{type(exc).__name__}"
++            error_counts[error_name] = error_counts.get(error_name, 0) + 1
++            return "unavailable"
++
++    for name, tensor in sorted(tensors, key=lambda item: item[0]):
++        device = capture(lambda tensor=tensor: str(tensor.device), "device")
++        dtype = capture(lambda tensor=tensor: str(tensor.dtype), "dtype")
++        shape = capture(lambda tensor=tensor: tuple(int(value) for value in tensor.shape), "shape")
++        stride = capture(lambda tensor=tensor: tuple(int(value) for value in tensor.stride()), "stride")
++        numel = capture(lambda tensor=tensor: int(tensor.numel()), "numel")
++        element_size = capture(lambda tensor=tensor: int(tensor.element_size()), "element_size")
++        logical_bytes = (
++            numel * element_size if isinstance(numel, int) and isinstance(element_size, int) else "unavailable"
++        )
++        storage_offset = capture(lambda tensor=tensor: int(tensor.storage_offset()), "storage_offset")
++        storage_bytes = capture(lambda tensor=tensor: int(tensor.untyped_storage().nbytes()), "storage_bytes")
++        storage_ptr = capture(lambda tensor=tensor: int(tensor.untyped_storage().data_ptr()), "storage_ptr")
++        if known_formats is not None and name in known_formats:
++            npu_format: Any = known_formats[name]
++        elif getattr(getattr(tensor, "device", None), "type", None) == "npu" and torch_npu is not None:
++            npu_format = capture(
++                lambda tensor=tensor: int(torch_npu.get_npu_format(tensor)),
++                "npu_format",
++            )
++        else:
++            npu_format = "unavailable"
++        if getattr(getattr(tensor, "device", None), "type", None) == "npu" and torch_npu is not None:
++            npu_storage_numel: Any = capture(
++                lambda tensor=tensor: int(torch_npu.get_storage_size(tensor)),
++                "npu_storage_numel",
++            )
++        else:
++            npu_storage_numel = "unavailable"
++
++        if isinstance(logical_bytes, int):
++            logical_bytes_total += logical_bytes
++        if isinstance(storage_ptr, int) and isinstance(storage_bytes, int):
++            storage_key = (str(device), storage_ptr)
++            if storage_key not in unique_storages:
++                unique_storages.add(storage_key)
++                unique_storage_bytes += storage_bytes
++        is_storage_view = (
++            isinstance(storage_offset, int)
++            and isinstance(storage_bytes, int)
++            and isinstance(logical_bytes, int)
++            and (storage_offset != 0 or storage_bytes != logical_bytes)
++        )
++        is_physical_nonlogical = (
++            isinstance(npu_storage_numel, int) and isinstance(numel, int) and npu_storage_numel != numel
++        )
++        storage_view_tensors += int(is_storage_view)
++        physical_nonlogical_tensors += int(is_physical_nonlogical)
++
++        semantic = {
++            "name": name,
++            "dtype": dtype,
++            "shape": shape,
++            "stride": stride,
++            "logical_bytes": logical_bytes,
++            "npu_format": npu_format,
++        }
++        physical = {
++            "name": name,
++            "storage_offset": storage_offset,
++            "storage_bytes": storage_bytes,
++            "npu_storage_numel": npu_storage_numel,
++        }
++        semantic_records.append(semantic)
++        physical_records.append(physical)
++        sample = {**semantic, **physical, "device": device}
++        if len(fallback_samples) < TENSOR_LAYOUT_SAMPLE_LIMIT:
++            fallback_samples.append(sample)
++        if (is_storage_view or is_physical_nonlogical) and len(samples) < TENSOR_LAYOUT_SAMPLE_LIMIT:
++            samples.append(sample)
++
++        format_key = str(npu_format)
++        format_counts[format_key] = format_counts.get(format_key, 0) + 1
++
++    if not samples:
++        samples = fallback_samples
++    logger.info(
++        "RFork tensor layout summary: stage=%s session=%s peer_session=%s layout=%s tensors=%d "
++        "logical_bytes=%d unique_storage_bytes=%d storage_view_tensors=%d physical_nonlogical_tensors=%d "
++        "formats=%s semantic_digest=%s physical_digest=%s samples=%s errors=%s",
++        stage,
++        session_id,
++        peer_session_id,
++        "processed" if processed_layout else "checkpoint",
++        len(semantic_records),
++        logical_bytes_total,
++        unique_storage_bytes,
++        storage_view_tensors,
++        physical_nonlogical_tensors,
++        format_counts,
++        _layout_digest(semantic_records),
++        _layout_digest(physical_records),
++        samples,
++        error_counts,
++    )
++
+ 
+ def reshape_tensor_to_seed_shape(
+     name: str,
+@@ -132,42 +277,59 @@ def _try_collect(
+     name: str,
+     tensor: torch.Tensor,
+     seen_names: dict[str, int],
++    seen_tensors: dict[tuple[Any, ...], int],
+     collected: list[tuple[str, torch.Tensor]],
+ ) -> None:
+     if not is_transferable_tensor(tensor):
+         return
+     validate_transferable_tensor_layout(name, tensor)
+     data_ptr = tensor.data_ptr()
++    tensor_signature = (
++        data_ptr,
++        tensor.numel(),
++        tuple(tensor.shape),
++        tensor.dtype,
++        tensor.device,
++        tuple(tensor.stride()),
++    )
+     existing_index = seen_names.get(name)
+-    if existing_index is None:
+-        seen_names[name] = len(collected)
+-        collected.append((name, tensor))
+-        return
++    if existing_index is not None:
++        existing_tensor = collected[existing_index][1]
++        if existing_tensor is tensor or tensor_signature == (
++            existing_tensor.data_ptr(),
++            existing_tensor.numel(),
++            tuple(existing_tensor.shape),
++            existing_tensor.dtype,
++            existing_tensor.device,
++            tuple(existing_tensor.stride()),
++        ):
++            return
++        raise ValueError(
++            "RFork encountered conflicting tensor entries for logical name "
++            f"{name!r}; shape, dtype, stride, or storage differs."
++        )
+ 
+-    # Deduplicate a name only for the same tensor and exact layout; conflicting aliases desync manifests.
+-    existing_tensor = collected[existing_index][1]
+-    if existing_tensor is tensor or (
+-        existing_tensor.data_ptr() == data_ptr
+-        and existing_tensor.numel() == tensor.numel()
+-        and tuple(existing_tensor.shape) == tuple(tensor.shape)
+-        and existing_tensor.dtype == tensor.dtype
+-        and tuple(existing_tensor.stride()) == tuple(tensor.stride())
+-    ):
++    # Parameters and buffers are canonical. An implementation object may expose
++    # the exact same tensor under another public name; transferring that range
++    # twice only bloats the manifest. Distinct views retain separate entries.
++    existing_index = seen_tensors.get(tensor_signature)
++    if existing_index is not None:
++        seen_names[name] = existing_index
+         return
+ 
+-    raise ValueError(
+-        "RFork encountered conflicting tensor entries for logical name "
+-        f"{name!r}; shape, dtype, stride, or storage differs."
+-    )
++    seen_names[name] = len(collected)
++    seen_tensors[tensor_signature] = len(collected)
++    collected.append((name, tensor))
+ 
+ 
+ def collect_transferable_tensors(model: nn.Module, processed_layout: bool) -> list[tuple[str, torch.Tensor]]:
+     seen: dict[str, int] = {}
++    seen_tensors: dict[tuple[Any, ...], int] = {}
+     collected: list[tuple[str, torch.Tensor]] = []
+     for name, tensor in model.named_parameters():
+-        _try_collect(name, tensor, seen, collected)
++        _try_collect(name, tensor, seen, seen_tensors, collected)
+     for name, tensor in model.named_buffers():
+-        _try_collect(name, tensor, seen, collected)
++        _try_collect(name, tensor, seen, seen_tensors, collected)
+     for module_prefix, module in model.named_modules():
+         if processed_layout:
+             attributes = (
+@@ -187,7 +349,7 @@ def collect_transferable_tensors(model: nn.Module, processed_layout: bool) -> li
+                 scan_objects,
+             ):
+                 full_name = f"{module_prefix}.{tensor_name}" if module_prefix else tensor_name
+-                _try_collect(full_name, tensor, seen, collected)
++                _try_collect(full_name, tensor, seen, seen_tensors, collected)
+     return collected
+ 
+ 
+diff --git a/vllm_ascend/model_loader/rfork/transfer_backend.py b/vllm_ascend/model_loader/rfork/transfer_backend.py
+index d654628bd..21f14483a 100644
+--- a/vllm_ascend/model_loader/rfork/transfer_backend.py
++++ b/vllm_ascend/model_loader/rfork/transfer_backend.py
+@@ -26,6 +26,7 @@ from vllm_ascend.model_loader.rfork.tensor_layout import (
+     collect_transferable_tensors,
+     find_non_npu_state_tensors,
+     is_transferable_tensor,
++    log_tensor_layout_summary,
+     reshape_tensor_to_seed_shape,
+     validate_transferable_tensor_layout,
+ )
+@@ -36,6 +37,7 @@ MAX_TRANSFER_CHUNK_SEGMENTS = 512
+ MAX_MEMORY_REGISTRATION_BATCH_ITEMS = 4096
+ MAX_TRANSFER_ENGINE_FINALIZE_ATTEMPTS = 10
+ TRANSFER_ENGINE_FINALIZE_RETRY_INTERVAL_SEC = 1.0
++TENSOR_LAYOUT_ERROR_EXCERPT_CHARS = 256
+ 
+ 
+ def _select_weight_blocks(
+@@ -191,7 +193,8 @@ def _validate_transferable_tensor_layouts(transferable_tensors: list[tuple[str,
+ class RForkTransferBackend:
+     """Own one YuanRong TransferEngine and its registered model memory."""
+ 
+-    def __init__(self) -> None:
++    def __init__(self, tp_rank: int | None = None) -> None:
++        self.tp_rank = tp_rank
+         self.transfer_engine: Any | None = None
+         self.transfer_session_id: str | None = None
+         self.weight_manifest: dict[str, Any] | None = None
+@@ -255,6 +258,39 @@ class RForkTransferBackend:
+         with self._lifecycle_lock:
+             return list(self.registered_weight_blocks)
+ 
++    def log_model_layout_summary(
++        self,
++        model,
++        processed_layout: bool,
++        *,
++        stage: str,
++        peer_session_id: str | None = None,
++    ) -> None:
++        """Observe a live model layout without changing transfer acceptance."""
++        try:
++            with self._lifecycle_lock:
++                tensors = list(collect_transferable_tensors(model, processed_layout))
++                tensors, _ = _split_tensors_by_excluded_blocks(tensors, self.excluded_weight_blocks)
++                log_tensor_layout_summary(
++                    tensors,
++                    stage=stage,
++                    session_id=self.transfer_session_id,
++                    peer_session_id=peer_session_id,
++                    processed_layout=processed_layout,
++                )
++        except Exception as exc:
++            # Diagnostics must not turn an otherwise usable transferred model into a fallback.
++            error_excerpt = " ".join(str(exc).split())[:TENSOR_LAYOUT_ERROR_EXCERPT_CHARS]
++            logger.info(
++                "RFork tensor layout summary: stage=%s session=%s peer_session=%s layout=%s unavailable=%s:%s",
++                stage,
++                self.transfer_session_id,
++                peer_session_id,
++                "processed" if processed_layout else "checkpoint",
++                type(exc).__name__,
++                error_excerpt,
++            )
++
+     def register_memory_region(
+         self,
+         model,
+@@ -457,6 +493,13 @@ class RForkTransferBackend:
+             time.perf_counter() - start_reg_mr_time,
+             len(weight_mr_dict),
+         )
++        log_tensor_layout_summary(
++            transferable_tensors,
++            stage="registration",
++            session_id=self.transfer_session_id,
++            processed_layout=processed_layout,
++            known_formats=weight_format_dict,
++        )
+         return True
+ 
+     def _unregister_weight_blocks(self, transfer_engine: Any) -> bool:
+@@ -627,7 +670,8 @@ class RForkTransferBackend:
+ 
+         transferable_tensors = self._registered_transferable_tensors
+         if transferable_tensors is None:
+-            transferable_tensors = list(collect_transferable_tensors(model, processed_layout))
++            logger.error("RFork cannot read seed weights without a successful destination registration.")
++            return False
+         _validate_transferable_tensor_layouts(transferable_tensors)
+         if not transferable_tensors:
+             if self._all_transferable_tensors_excluded and self.weight_manifest == {} and not seed_info.weights:
+@@ -661,20 +705,12 @@ class RForkTransferBackend:
+         remote_only = remote_name_set - local_name_set
+         skipped_shared_names: set[str] = set()
+         if local_only:
+-            for name, tensor in transferable_tensors:
+-                if name in local_only and _is_tensor_in_blocks(tensor, excluded_blocks):
+-                    logger.debug(
+-                        "Skip RFork weight %s shared with the target model: not present in the seed manifest.",
+-                        name,
+-                    )
+-                    skipped_shared_names.add(name)
+-            if local_only - skipped_shared_names:
+-                logger.error(
+-                    "RFork manifest names differ: local_only=%s, remote_only=%s",
+-                    sorted(local_only - skipped_shared_names, key=str),
+-                    sorted(remote_only, key=str),
+-                )
+-                return False
++            logger.error(
++                "RFork manifest names differ: local_only=%s, remote_only=%s",
++                sorted(local_only, key=str),
++                sorted(remote_only, key=str),
++            )
++            return False
+         if remote_only:
+             full_model_transferable_tensors = list(collect_transferable_tensors(model, processed_layout))
+             _validate_transferable_tensor_layouts(full_model_transferable_tensors)
+@@ -723,6 +759,15 @@ class RForkTransferBackend:
+             client_ptr_list.append(tensor.data_ptr())
+             client_len_list.append(tensor.numel() * tensor.element_size())
+ 
++        log_tensor_layout_summary(
++            [(name, tensor) for name, tensor in transferable_tensors if name not in skipped_shared_names],
++            stage="receiver_before_read",
++            session_id=self.transfer_session_id,
++            peer_session_id=seed_info.session_id,
++            processed_layout=processed_layout,
++            known_formats=self.weight_formats,
++        )
++
+         chunks = list(iter_transfer_chunks(weight_names, seed_ptr_list, client_ptr_list, client_len_list))
+         total_bytes = sum(client_len_list)
+         total_gib = total_bytes / (1024**3)
+@@ -759,9 +804,11 @@ class RForkTransferBackend:
+             )
+         transfer_elapsed = time.perf_counter() - transfer_start
+         throughput_gib_s = total_gib / transfer_elapsed if transfer_elapsed > 0 else 0.0
+-        logger.debug(
+-            "RFork weight transfer completed: weights=%d, chunks=%d, bytes=%.2f GiB, "
++        log_transfer = logger.info if self.tp_rank == 0 else logger.debug
++        log_transfer(
++            "RFork weight transfer completed: tp_rank=%s, weights=%d, chunks=%d, bytes=%.2f GiB, "
+             "elapsed=%.4fs, throughput=%.2f GiB/s",
++            self.tp_rank,
+             len(client_len_list),
+             len(chunks),
+             total_gib,
+diff --git a/vllm_ascend/model_loader/rfork/types.py b/vllm_ascend/model_loader/rfork/types.py
+index 164bdd48c..407d68168 100644
+--- a/vllm_ascend/model_loader/rfork/types.py
++++ b/vllm_ascend/model_loader/rfork/types.py
+@@ -28,6 +28,21 @@ class LeaseReleaseResult(Enum):
+     REJECTED = auto()
+ 
+ 
++class SeedReportStatus(Enum):
++    ACCEPTED = auto()
++    RETRYABLE = auto()
++    REJECTED = auto()
++
++
++@dataclass(frozen=True, slots=True)
++class SeedReportResult:
++    status: SeedReportStatus
++    reason: str = ""
++
++    def __bool__(self) -> bool:
++        return self.status is SeedReportStatus.ACCEPTED
++
++
+ class RForkSeedServiceStartResult(Enum):
+     STARTED = auto()
+     DEFERRED = auto()
+-- 
+2.51.0.windows.1
+
