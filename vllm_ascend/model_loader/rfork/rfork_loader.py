@@ -148,10 +148,27 @@ def _is_mtp_hf_config(hf_config: object | None) -> bool:
     return any(isinstance(architecture, str) and architecture.endswith("MTPModel") for architecture in architectures)
 
 
+def _is_extract_hidden_states_model(model_config: object | None) -> bool:
+    if model_config is None:
+        return False
+    for config_attr in ("hf_config", "hf_text_config"):
+        hf_config = getattr(model_config, config_attr, None)
+        if getattr(hf_config, "model_type", None) == "extract_hidden_states":
+            return True
+        architectures = getattr(hf_config, "architectures", None)
+        if architectures == "ExtractHiddenStatesModel" or (
+            isinstance(architectures, (list, tuple)) and "ExtractHiddenStatesModel" in architectures
+        ):
+            return True
+    return False
+
+
 def _is_draft_model_config(model_config: object | None) -> bool:
     if model_config is None:
         return False
     if getattr(model_config, "runner_type", None) == "draft":
+        return True
+    if _is_extract_hidden_states_model(model_config):
         return True
 
     return any(
@@ -609,6 +626,11 @@ class RForkModelLoader(BaseModelLoader):
         prefix: str = "",
     ) -> Module | None:
         load_started_at = time.perf_counter()
+        # This cache-only proposer has no model weights. Keep the already-serving
+        # target RFork session untouched when it is constructed after the target.
+        if _is_extract_hidden_states_model(model_config):
+            return _load_with_default_loader(vllm_config, model_config, self.load_config, prefix)
+
         device_config = vllm_config.device_config
         load_config = self.load_config
         load_device = device_config.device if load_config.device is None else load_config.device

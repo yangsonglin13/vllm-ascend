@@ -670,6 +670,68 @@ def test_rfork_uses_separate_session_attr_for_explicit_draft_model_config():
     assert _get_rfork_session_attr(target_vllm_config, draft_model_config) == "rfork_draft_session"
 
 
+def test_rfork_uses_draft_session_for_explicit_extract_hidden_states_model_config():
+    target_vllm_config = _vllm_config(
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(
+                model_type="deepseek_v4",
+                architectures=["DeepSeekV4ForCausalLM"],
+            )
+        )
+    )
+    draft_model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(
+            model_type="extract_hidden_states",
+            architectures=["ExtractHiddenStatesModel"],
+        )
+    )
+
+    assert _is_draft_model(target_vllm_config, draft_model_config)
+    assert _get_rfork_session_attr(target_vllm_config, draft_model_config) == "rfork_draft_session"
+
+
+def test_rfork_extract_hidden_states_load_skips_rfork_transfer(monkeypatch):
+    import vllm.model_executor.model_loader as model_loader
+
+    load_config = DummyLoadConfig({"model_url": "model", "model_deploy_strategy_name": "strategy"})
+    loader = RForkModelLoader(load_config)
+    target_vllm_config = _vllm_config(
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(
+                model_type="deepseek_v4",
+                architectures=["DeepSeekV4ForCausalLM"],
+            )
+        )
+    )
+    draft_model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(
+            model_type="extract_hidden_states",
+            architectures=["ExtractHiddenStatesModel"],
+        )
+    )
+    expected_model = SimpleNamespace()
+    captured = {}
+
+    def fail_if_rfork_session_is_created(*args, **kwargs):
+        raise AssertionError("RFork session should not be initialized for extract_hidden_states")
+
+    def fake_get_model(**kwargs):
+        captured.update(kwargs)
+        return expected_model
+
+    monkeypatch.setattr(loader, "_ensure_rfork_session", fail_if_rfork_session_is_created)
+    monkeypatch.setattr(model_loader, "get_model", fake_get_model)
+
+    model = loader.load_model(vllm_config=target_vllm_config, model_config=draft_model_config)
+
+    assert model is expected_model
+    assert captured["vllm_config"] is target_vllm_config
+    assert captured["model_config"] is draft_model_config
+    assert captured["load_config"] is not load_config
+    assert captured["load_config"].load_format == "auto"
+    assert captured["load_config"].model_loader_extra_config == {}
+
+
 def test_rfork_fallback_load_config_copy_does_not_mutate_original():
     original_extra_config = {"model_url": "model", "model_deploy_strategy_name": "tp8"}
     load_config = DummyLoadConfig(original_extra_config)
