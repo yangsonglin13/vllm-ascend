@@ -20,6 +20,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 
 from vllm_ascend.model_loader.rfork.rfork_loader import (
     RForkModelLoader,
@@ -29,6 +30,7 @@ from vllm_ascend.model_loader.rfork.rfork_loader import (
     _is_draft_model,
     _is_dynamic_eplb_enabled,
     _make_fallback_load_config,
+    _requires_post_load_shape_processing,
     _reset_process_global_model_state,
     _rfork_pre_transfer_weight_processing,
     _rfork_skip_unquantized_moe_post_load_processing,
@@ -38,6 +40,7 @@ from vllm_ascend.model_loader.rfork.types import (
     RForkFallbackCleanupResult,
     RForkSeedServiceStartResult,
 )
+from vllm_ascend.ops.linear import AscendUnquantizedLinearMethod
 
 
 class DummyLoadConfig:
@@ -375,14 +378,17 @@ def test_rfork_draft_load_passes_target_registered_blocks_to_session(monkeypatch
     assert captured_blocks == [target_blocks, target_blocks]
 
 
-@pytest.mark.parametrize("processed_layout", [False, True])
-def test_rfork_acquires_seed_after_model_preparation(monkeypatch, processed_layout):
+@pytest.mark.parametrize(
+    ("processed_layout", "shape_change"),
+    [(False, False), (True, False), (True, True)],
+)
+def test_rfork_acquires_seed_after_model_preparation(monkeypatch, processed_layout, shape_change):
     load_config = DummyLoadConfig({"model_url": "model", "model_deploy_strategy_name": "strategy"})
     loader = RForkModelLoader(load_config)
     model_config = SimpleNamespace(
         dtype=torch.float32,
         model="/models/test",
-        quantization="ascend" if processed_layout else None,
+        quantization="ascend" if processed_layout and not shape_change else None,
     )
     vllm_config = _vllm_config(model_config=model_config)
     events = []
@@ -394,6 +400,7 @@ def test_rfork_acquires_seed_after_model_preparation(monkeypatch, processed_layo
 
     class _Session:
         def register_destination(self, model, processed_layout, exclude_blocks=None):
+            events.append("register")
             return True
 
         def acquire_seed(self):
@@ -413,10 +420,20 @@ def test_rfork_acquires_seed_after_model_preparation(monkeypatch, processed_layo
 
     session = _Session()
     monkeypatch.setattr(loader, "_ensure_rfork_session", lambda vc, mc: session)
-    monkeypatch.setattr(loader, "_requires_processed_layout_transfer", lambda mc: processed_layout)
+    monkeypatch.setattr(
+        "vllm_ascend.model_loader.rfork.rfork_loader._requires_post_load_shape_processing",
+        lambda model: shape_change,
+    )
     monkeypatch.setattr(
         "vllm_ascend.model_loader.rfork.rfork_loader.get_ascend_config",
-        lambda: SimpleNamespace(eplb_config=SimpleNamespace(dynamic_eplb=False, expert_map_record_path=None)),
+        lambda: SimpleNamespace(
+            eplb_config=SimpleNamespace(dynamic_eplb=False, expert_map_record_path=None),
+            weight_nz_mode=0,
+        ),
+    )
+    monkeypatch.setattr(
+        "vllm_ascend.model_loader.rfork.rfork_loader.get_current_hardware_profile",
+        lambda: SimpleNamespace(weight_layout_policy=SimpleNamespace(name="CONFIGURABLE")),
     )
 
     def initialize_model(**kwargs):
@@ -442,9 +459,71 @@ def test_rfork_acquires_seed_after_model_preparation(monkeypatch, processed_layo
     assert loader.load_model(vllm_config=vllm_config, model_config=model_config) is model
 
     if processed_layout:
-        assert events[:6] == ["initialize", "layout", "synchronize", "acquire", "transfer", "layout_summary"]
+        assert events[:7] == [
+            "initialize",
+            "layout",
+            "synchronize",
+            "register",
+            "acquire",
+            "transfer",
+            "layout_summary",
+        ]
     else:
-        assert events[:5] == ["initialize", "acquire", "transfer", "post_load", "layout_summary"]
+        assert events[:6] == ["initialize", "register", "acquire", "transfer", "post_load", "layout_summary"]
+
+
+class _UnquantizedLinearStub(torch.nn.Module):
+    """Minimal stand-in for an unquantized linear layer with a wo_a-style weight."""
+
+    def __init__(self, prefix: str, weight_shape: tuple[int, ...], dtype: torch.dtype):
+        super().__init__()
+        self.prefix = prefix
+        self.quant_config = None
+        self.quant_method = AscendUnquantizedLinearMethod()
+        self.n_local_groups = 2
+        self.o_lora_rank = 4
+        self.precast_fp32_weight = False
+        self.skip_weight_nz_conversion = False
+        self.weight = torch.nn.Parameter(torch.empty(weight_shape, dtype=dtype), requires_grad=False)
+
+
+@pytest.mark.parametrize(
+    ("prefix", "weight_shape", "dtype", "mx_quant_fusion"),
+    [
+        ("model.layers.0.self_attn.wo_a", (8, 2), torch.bfloat16, False),
+        ("model.layers.0.self_attn.wo_a", (8, 2), torch.bfloat16, True),
+        ("model.layers.0.self_attn.wo_a", (8, 2), torch.float16, True),
+        ("model.layers.0.self_attn.wo_a", (2, 2, 4), torch.bfloat16, False),
+        ("model.layers.0.self_attn.q_proj", (8, 2), torch.bfloat16, False),
+    ],
+)
+def test_rfork_shape_detection_matches_post_load_reshape(monkeypatch, prefix, weight_shape, dtype, mx_quant_fusion):
+    """Pin the detector to what post-load processing actually does to weight shapes.
+
+    ``register_destination`` digests tensor shapes, so a post-load reshape the detector
+    misses breaks seed matching. If the reshape rules in ``ops/linear.py`` move or grow,
+    this test fails until ``_requires_post_load_shape_processing`` is updated to match.
+    """
+    monkeypatch.setattr(
+        "vllm_ascend.ops.linear.get_current_hardware_profile",
+        lambda: SimpleNamespace(supports=lambda capability: mx_quant_fusion, weight_layout_policy=None),
+    )
+    # NZ conversion preserves shape; keep it out of the comparison.
+    monkeypatch.setattr("vllm_ascend.ops.linear.maybe_trans_nz", lambda weight, *args, **kwargs: weight)
+    # Upstream's base post-load branches on the running platform. The Ascend override
+    # owns the reshape, so isolate it from platform-dependent base behaviour.
+    monkeypatch.setattr(UnquantizedLinearMethod, "process_weights_after_loading", lambda self, layer: None)
+
+    model = torch.nn.Module()
+    model.proj = _UnquantizedLinearStub(prefix, weight_shape, dtype)
+
+    predicted = _requires_post_load_shape_processing(model)
+
+    shapes_before = {name: tensor.shape for name, tensor in model.state_dict().items()}
+    model.proj.quant_method.process_weights_after_loading(model.proj)
+    shapes_after = {name: tensor.shape for name, tensor in model.state_dict().items()}
+
+    assert predicted is (shapes_before != shapes_after)
 
 
 @pytest.mark.parametrize("failure_stage", ["initialize", "layout"])

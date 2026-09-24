@@ -55,6 +55,7 @@ from vllm_ascend.model_loader.rfork.types import (
     RForkLifecycleState,
     RForkSeedServiceStartResult,
 )
+from vllm_ascend.ops.linear import AscendUnquantizedLinearMethod, _should_reshape_wo_a_to_3d
 
 
 class _RForkSeedUnavailable(RuntimeError):
@@ -456,6 +457,22 @@ def _noop_process_weights_after_loading(*args: Any, **kwargs: Any) -> None:
     pass
 
 
+def _requires_post_load_shape_processing(model: Module) -> bool:
+    """Detect a linear weight reshape that changes the RFork tensor digest."""
+    if not isinstance(model, Module):
+        return False
+    for layer in model.modules():
+        quant_method = getattr(layer, "quant_method", None)
+        if not isinstance(quant_method, AscendUnquantizedLinearMethod):
+            continue
+        weight = getattr(layer, "weight", None)
+        if not isinstance(weight, torch.Tensor) or weight.ndim != 2:
+            continue
+        if _should_reshape_wo_a_to_3d(layer.prefix, layer.quant_config, weight.dtype):
+            return True
+    return False
+
+
 def _refresh_rfork_flatquant_state(model: Module) -> None:
     """Refresh FlatQuant's existing host cache without rerunning layout conversion."""
     for module in model.modules():
@@ -633,6 +650,7 @@ class RForkModelLoader(BaseModelLoader):
                         model_config=model_config,
                         prefix=prefix,
                     )
+                processed_layout_transfer |= _requires_post_load_shape_processing(model)
                 logger.debug(
                     "RFork %s model initialization took %.2f seconds",
                     _rfork_model_kind(session),
