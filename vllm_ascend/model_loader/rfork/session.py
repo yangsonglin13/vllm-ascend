@@ -113,7 +113,9 @@ class RForkSession:
             started_at = time.monotonic()
             if not self.transfer_backend.register_memory_region(model, processed_layout, exclude_blocks):
                 return False
-            self.planner.bind_structural_digest(_compute_structural_digest(model, processed_layout))
+            self.planner.bind_structural_digest(
+                build_structural_digest(self.transfer_backend.snapshot_registered_tensor_inventory())
+            )
             self._registration_elapsed = time.monotonic() - started_at
             self.state = RForkLifecycleState.REGISTERED
             # Seed misses are silent 404s; the bound key and digest make them debuggable.
@@ -247,11 +249,11 @@ class RForkSession:
             self._ensure_lease_release_retry_locked()
             return True
 
-    def log_transferred_model_layout(self, model, processed_layout: bool) -> None:
-        """Log the final receiver layout without affecting transfer state."""
+    def log_transferred_model_layout(self, model, processed_layout: bool) -> str | None:
+        """Log the final receiver layout and return its digest for immediate seed promotion."""
         with self._lock:
             peer_session_id = self._source_transfer_session_id
-        self.transfer_backend.log_model_layout_summary(
+        return self.transfer_backend.log_model_layout_summary(
             model,
             processed_layout,
             stage=("receiver_after_transfer_finalize" if processed_layout else "receiver_after_post_load"),
@@ -446,6 +448,8 @@ class RForkSession:
         model,
         processed_layout: bool,
         exclude_blocks: list[tuple[int, int]] | None = None,
+        *,
+        structural_digest: str | None = None,
     ) -> RForkSeedServiceStartResult:
         if self.identity.is_draft_model:
             # Keep drafts receive-only because the proposer can rebind or rewrite their weights after loading.
@@ -482,7 +486,10 @@ class RForkSession:
                             registered = False
                         if registered:
                             try:
-                                self.planner.bind_structural_digest(_compute_structural_digest(model, processed_layout))
+                                structural_digest = build_structural_digest(
+                                    self.transfer_backend.snapshot_registered_tensor_inventory()
+                                )
+                                self.planner.bind_structural_digest(structural_digest)
                             except RuntimeError as exc:
                                 # The structure drifted from destination registration; a seed
                                 # advertised under the stale key could never pass manifest checks.
@@ -499,6 +506,7 @@ class RForkSession:
                 if self.seed_lease is not None:
                     if self._lease_release_exhausted or self.lease_release_stop_event.is_set():
                         return RForkSeedServiceStartResult.FAILED
+                    # A deferred promotion must inspect the live model again when it actually starts.
                     self._deferred_seed_start = (model, processed_layout, exclude_blocks)
                     self._ensure_lease_release_retry_locked()
                     logger.debug(
@@ -506,7 +514,9 @@ class RForkSession:
                         "the transferred model remains available for inference."
                     )
                     return RForkSeedServiceStartResult.DEFERRED
-            started = self._start_seed_service(model, processed_layout, exclude_blocks)
+            started = self._start_seed_service(
+                model, processed_layout, exclude_blocks, structural_digest=structural_digest
+            )
             if not started:
                 self._cleanup_failed_seed_start()
             return RForkSeedServiceStartResult.STARTED if started else RForkSeedServiceStartResult.FAILED
@@ -516,6 +526,8 @@ class RForkSession:
         model,
         processed_layout: bool,
         exclude_blocks: list[tuple[int, int]] | None = None,
+        *,
+        structural_digest: str | None = None,
     ) -> bool:
         # Keep health/planner I/O outside _lock; transitional state blocks transfer and registration.
         with self._lock:
@@ -530,10 +542,10 @@ class RForkSession:
             self.state = RForkLifecycleState.CLEANUP_REQUIRED
         try:
             info = self._seed_transfer_info()
-            # Production check of the pre/post post-load symmetry invariant: the
-            # digest recomputed at advertisement must equal the one bound at
-            # destination registration.
-            self.planner.verify_structural_digest(_compute_structural_digest(model, processed_layout))
+            # Immediate promotion reuses the final-layout scan; deferred promotion takes a fresh scan.
+            if structural_digest is None:
+                structural_digest = _compute_structural_digest(model, processed_layout)
+            self.planner.verify_structural_digest(structural_digest)
             # Reserve adjacent main/draft slots for every distributed worker.
             port = _resolve_seed_server_port(self.config, self.identity)
             if port > 0:
