@@ -447,6 +447,11 @@ class RForkSession:
         processed_layout: bool,
         exclude_blocks: list[tuple[int, int]] | None = None,
     ) -> RForkSeedServiceStartResult:
+        if self.identity.is_draft_model:
+            # The proposer can rebind or rewrite draft weights after loading.
+            # Keep drafts receive-only until final-topology registration is supported.
+            logger.debug("RFork draft models do not advertise a seed; the loaded model serves inference only.")
+            return RForkSeedServiceStartResult.FAILED
         with self._seed_lifecycle_lock:
             with self._lock:
                 if self.lease_release_stop_event.is_set():
