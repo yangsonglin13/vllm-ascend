@@ -738,6 +738,8 @@ def test_rfork_seed_start_failure_returns_valid_model_without_disk_reload(monkey
     model = _Model()
 
     class _Session:
+        identity = SimpleNamespace(is_draft_model=False)
+
         def register_destination(self, model, processed_layout, exclude_blocks=None):
             return True
 

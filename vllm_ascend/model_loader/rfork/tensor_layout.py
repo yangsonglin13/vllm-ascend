@@ -338,12 +338,7 @@ def _tensor_child_key(
 
 
 def collect_transferable_tensors(model: nn.Module, processed_layout: bool) -> list[tuple[str, torch.Tensor]]:
-    """Collect each tensor range once using order-independent, shortest-path IDs.
-
-    Finish an entire BFS layer before expanding the next. Each node takes the
-    smallest ID offered by its shortest-path predecessors; no alias paths are
-    enumerated. Addresses are used only for local tensor-range deduplication.
-    """
+    """Collect each tensor range once using stable IDs derived from shortest graph paths."""
     root_key = (id(model), False)
     frontier = {root_key: hashlib.sha256(b"rfork-tensor-id").digest()}
     # Keep strong references throughout the scan so object IDs cannot be reused.

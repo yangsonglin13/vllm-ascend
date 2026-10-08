@@ -18,10 +18,11 @@ def _session_for(runtime, *, is_draft_model):
 
 
 @pytest.mark.parametrize("processed_layout", [False, True])
-def test_draft_session_refuses_to_start_a_seed_service(runtime, processed_layout):
+@pytest.mark.parametrize("structural_digest", [None, "final-digest"])
+def test_draft_session_refuses_to_start_a_seed_service(runtime, processed_layout, structural_digest):
     session = _session_for(runtime, is_draft_model=True)
 
-    result = session.start_seed_service(dummy_model(), processed_layout)
+    result = session.start_seed_service(dummy_model(), processed_layout, structural_digest=structural_digest)
 
     assert result is runtime.types.RForkSeedServiceStartResult.FAILED
     # Refused before touching the listener or the planner, so nothing to unwind.
