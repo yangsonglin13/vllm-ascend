@@ -14,7 +14,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from tests.ut.model_loader.rfork.session_test_utils import dummy_model, make_session
+from tests.ut.model_loader.rfork.session_test_utils import dummy_model, make_session, run_and_join
 
 
 def _session_for(runtime, *, is_draft_model):
@@ -49,6 +49,9 @@ def test_draft_refusal_leaves_the_session_usable_for_inference(runtime):
 def test_main_model_session_still_advertises(runtime, monkeypatch):
     """The gate keys on the draft flag only; main models are unaffected."""
     session = _session_for(runtime, is_draft_model=False)
+    session.state = runtime.types.RForkLifecycleState.READY
+    session.planner.release_seed_once.return_value = runtime.types.LeaseReleaseResult.RELEASED
+    run_and_join(session)
     monkeypatch.setattr(session, "_start_seed_service", Mock(return_value=True))
 
     result = session.start_seed_service(dummy_model(), True)
