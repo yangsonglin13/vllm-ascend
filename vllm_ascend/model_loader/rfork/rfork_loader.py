@@ -121,7 +121,7 @@ def _start_rfork_seed_service(
     if result is RForkSeedServiceStartResult.DEFERRED:
         return False
     started = bool(result)
-    if not started:
+    if not started and not getattr(session.identity, "is_draft_model", False):
         logger.warning(
             "RFork %s model loaded from %s is ready, but seed service startup failed; inference can continue.",
             _rfork_model_kind(session),
