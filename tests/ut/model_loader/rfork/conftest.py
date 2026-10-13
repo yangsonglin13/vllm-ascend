@@ -64,7 +64,7 @@ def runtime(monkeypatch):
         "model", "strategy", "http://planner", request_timeout_sec=0.1, lease_release_retry_interval_sec=0.001
     )
     identity = types.RForkIdentity(0, 0, compatibility_fingerprint="fingerprint")
-    lease = types.SeedLease("127.0.0.1", 1234, "private-user-id", 0, "model-key")
+    lease = types.SeedLease("127.0.0.1", 1234, "private-user-id", 0, "model-key", lease_ttl_sec=60.0)
     return SimpleNamespace(types=types, client=client, session=session, config=cfg, identity=identity, lease=lease)
 
 

@@ -64,6 +64,7 @@ class RForkConfig:
     lease_release_max_attempts: int = DEFAULT_RFORK_LEASE_RELEASE_MAX_ATTEMPTS
     lease_release_retry_interval_sec: float = DEFAULT_RFORK_LEASE_RELEASE_RETRY_INTERVAL_SEC
     send_model_identity_headers: bool = False
+    seed_removal_supported: bool | None = None
 
     def __post_init__(self) -> None:
         # Operational settings are JSON-only; reject typos instead of using similar environment variables.
@@ -79,6 +80,8 @@ class RForkConfig:
             raise ValueError("rfork_seed_port_base must be a JSON integer in range [0, 65535]")
         if not isinstance(self.send_model_identity_headers, bool):
             raise ValueError("rfork_model_identity_headers must be a JSON boolean")
+        if self.seed_removal_supported is not None and not isinstance(self.seed_removal_supported, bool):
+            raise ValueError("rfork_seed_removal_supported must be a JSON boolean or null")
         if self.send_model_identity_headers:
             for name in ("model_url", "model_deploy_strategy_name"):
                 if not getattr(self, name).isascii():
@@ -108,6 +111,7 @@ class RForkConfig:
 
         return cls(
             send_model_identity_headers=send_model_identity_headers,
+            seed_removal_supported=config.get("rfork_seed_removal_supported"),
             heartbeat_interval_sec=config.get("rfork_heartbeat_interval_sec", DEFAULT_RFORK_HEARTBEAT_INTERVAL_SEC),
             lease_release_max_attempts=config.get(
                 "rfork_lease_release_max_attempts", DEFAULT_RFORK_LEASE_RELEASE_MAX_ATTEMPTS
