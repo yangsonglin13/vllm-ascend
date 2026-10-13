@@ -8,6 +8,8 @@ import os
 from dataclasses import dataclass
 from typing import Any
 
+from vllm_ascend import envs
+
 DEFAULT_RFORK_SEED_TIMEOUT_SEC = 5.0
 DEFAULT_RFORK_REQUEST_TIMEOUT_SEC = 10.0
 DEFAULT_RFORK_HEARTBEAT_INTERVAL_SEC = 30.0
@@ -64,10 +66,10 @@ class RForkConfig:
     lease_release_max_attempts: int = DEFAULT_RFORK_LEASE_RELEASE_MAX_ATTEMPTS
     lease_release_retry_interval_sec: float = DEFAULT_RFORK_LEASE_RELEASE_RETRY_INTERVAL_SEC
     send_model_identity_headers: bool = False
-    seed_removal_supported: bool | None = None
+    seed_removal_supported: bool | None = False
 
     def __post_init__(self) -> None:
-        # Operational settings are JSON-only; reject typos instead of using similar environment variables.
+        # Heartbeat and release retry settings are JSON-only; reject invalid types and ranges.
         for name in ("heartbeat_interval_sec", "lease_release_retry_interval_sec"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, (int, float)) or _positive_float(value) is None:
@@ -109,9 +111,15 @@ class RForkConfig:
                 raise ValueError("RFORK_MODEL_IDENTITY_HEADERS must be '0', '1', 'true' or 'false'")
             send_model_identity_headers = model_identity_headers in {"1", "true"}
 
+        # Reading envs validates its value; do not evaluate it when JSON overrides the switch.
+        if "rfork_seed_removal_supported" in config:  # noqa: SIM401
+            seed_removal_supported = config["rfork_seed_removal_supported"]
+        else:
+            seed_removal_supported = envs.VLLM_ASCEND_RFORK_SEED_REMOVAL_SUPPORTED
+
         return cls(
             send_model_identity_headers=send_model_identity_headers,
-            seed_removal_supported=config.get("rfork_seed_removal_supported"),
+            seed_removal_supported=seed_removal_supported,
             heartbeat_interval_sec=config.get("rfork_heartbeat_interval_sec", DEFAULT_RFORK_HEARTBEAT_INTERVAL_SEC),
             lease_release_max_attempts=config.get(
                 "rfork_lease_release_max_attempts", DEFAULT_RFORK_LEASE_RELEASE_MAX_ATTEMPTS

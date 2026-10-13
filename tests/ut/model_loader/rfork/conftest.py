@@ -13,6 +13,18 @@ import pytest
 from .rfork_test_support import RFORK_ROOT, _load_module, _stub
 
 
+@pytest.fixture(autouse=True)
+def rfork_envs(monkeypatch):
+    """Load centralized configuration without importing the NPU plugin entry points."""
+    envs = _load_module(monkeypatch, "vllm_ascend.envs", "../../envs.py")
+    if "vllm_ascend" not in sys.modules:
+        _stub(monkeypatch, "vllm_ascend", __path__=[str(RFORK_ROOT.parents[1])], envs=envs)
+    else:
+        monkeypatch.setattr(sys.modules["vllm_ascend"], "envs", envs, raising=False)
+    monkeypatch.delenv("VLLM_ASCEND_RFORK_SEED_REMOVAL_SUPPORTED", raising=False)
+    return envs
+
+
 @pytest.fixture
 def runtime(monkeypatch):
     """Load the real lease/session code with external runtime dependencies stubbed."""
@@ -61,7 +73,12 @@ def runtime(monkeypatch):
     session = load("session")
     monkeypatch.setattr(session.atexit, "register", lambda callback: None)
     cfg = config.RForkConfig(
-        "model", "strategy", "http://planner", request_timeout_sec=0.1, lease_release_retry_interval_sec=0.001
+        "model",
+        "strategy",
+        "http://planner",
+        request_timeout_sec=0.1,
+        lease_release_retry_interval_sec=0.001,
+        seed_removal_supported=None,
     )
     identity = types.RForkIdentity(0, 0, compatibility_fingerprint="fingerprint")
     lease = types.SeedLease("127.0.0.1", 1234, "private-user-id", 0, "model-key", lease_ttl_sec=60.0)
