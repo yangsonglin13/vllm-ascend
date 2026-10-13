@@ -464,8 +464,7 @@ def _base_extra_config():
     }
 
 
-def test_seed_removal_capability_defaults_to_false_when_json_key_is_missing(runtime, monkeypatch):
-    monkeypatch.delenv("VLLM_ASCEND_RFORK_SEED_REMOVAL_SUPPORTED", raising=False)
+def test_seed_removal_capability_defaults_to_false_when_json_key_is_missing(runtime):
     parsed = type(runtime.config).from_extra_config(_base_extra_config())
     assert parsed.seed_removal_supported is False
 

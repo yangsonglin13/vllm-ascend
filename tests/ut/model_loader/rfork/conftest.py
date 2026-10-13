@@ -13,18 +13,6 @@ import pytest
 from .rfork_test_support import RFORK_ROOT, _load_module, _stub
 
 
-@pytest.fixture(autouse=True)
-def rfork_envs(monkeypatch):
-    """Load centralized configuration without importing the NPU plugin entry points."""
-    envs = _load_module(monkeypatch, "vllm_ascend.envs", "../../envs.py")
-    if "vllm_ascend" not in sys.modules:
-        _stub(monkeypatch, "vllm_ascend", __path__=[str(RFORK_ROOT.parents[1])], envs=envs)
-    else:
-        monkeypatch.setattr(sys.modules["vllm_ascend"], "envs", envs, raising=False)
-    monkeypatch.delenv("VLLM_ASCEND_RFORK_SEED_REMOVAL_SUPPORTED", raising=False)
-    return envs
-
-
 @pytest.fixture
 def runtime(monkeypatch):
     """Load the real lease/session code with external runtime dependencies stubbed."""
