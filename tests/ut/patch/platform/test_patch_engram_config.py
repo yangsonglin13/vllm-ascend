@@ -51,23 +51,30 @@ def engram_config():
 
 
 @pytest.mark.parametrize(
-    "draft,shared,dp,pcp",
+    "load_format,draft,shared,dp,pcp",
     [
-        (False, None, 4, 1),
-        (True, None, 4, 1),
-        (False, False, 2, 2),
-        (True, True, 4, 1),
-        (False, True, 1, 2),
-        (False, True, 2, 2),
+        ("safetensors", False, None, 4, 1),
+        ("safetensors", True, None, 4, 1),
+        ("safetensors", False, False, 2, 2),
+        ("safetensors", True, True, 4, 1),
+        ("safetensors", False, True, 1, 2),
+        ("safetensors", False, True, 2, 2),
+        ("rfork", False, None, 4, 1),
+        ("rfork", True, None, 4, 1),
+        ("rfork", False, False, 4, 1),
+        ("rfork", True, False, 4, 1),
+        ("rfork", False, True, 4, 1),
+        ("rfork", True, True, 4, 1),
     ],
 )
-def test_native_engram_resolution_on_npu(engram_config, draft, shared, dp, pcp):
+def test_native_engram_resolution_on_npu(engram_config, load_format, draft, shared, dp, pcp):
     from vllm.config import EngramConfig, VllmConfig
     from vllm.platforms import current_platform
 
     from vllm_ascend.platform import _validate_engram_config
 
     config = engram_config
+    config.load_config.load_format = load_format
     config.parallel_config.data_parallel_size = dp
     config.parallel_config.prefill_context_parallel_size = pcp
     original = EngramConfig(cpu_offload=True, dp_shared_memory=shared) if shared is not None else None
@@ -79,12 +86,11 @@ def test_native_engram_resolution_on_npu(engram_config, draft, shared, dp, pcp):
     assert not current_platform.is_cuda()
     VllmConfig._resolve_and_verify_engram_config(config)
     _validate_engram_config(config)
+    assert config.load_config.load_format == load_format
     assert type(config.engram_config) is EngramConfig
     if original is not None:
         assert config.engram_config is original
-    # vLLM 0.31 resolves the default to True when the caller leaves it unset.
-    expected_dp_shared_memory = True if shared is None else bool(shared)
-    assert config.engram_config.dp_shared_memory == expected_dp_shared_memory
+    assert config.engram_config.dp_shared_memory == bool(shared)
 
 
 @pytest.mark.parametrize(
@@ -100,15 +106,24 @@ def test_native_engram_resolution_on_npu(engram_config, draft, shared, dp, pcp):
         ("load_config", "load_format", "pt", "indexed safetensors"),
     ],
 )
-def test_ascend_engram_limits(engram_config, section, field, value, error):
+@pytest.mark.parametrize("load_format", ["safetensors", "rfork"])
+def test_ascend_engram_limits(engram_config, section, field, value, error, load_format):
     from vllm.config import VllmConfig
 
     from vllm_ascend.platform import _validate_engram_config
 
+    engram_config.load_config.load_format = load_format
     setattr(getattr(engram_config, section), field, value)
     with pytest.raises(ValueError, match=error):
         VllmConfig._resolve_and_verify_engram_config(engram_config)
         _validate_engram_config(engram_config)
+
+
+@pytest.mark.parametrize("load_format", ["dummy", "npcache", "bitsandbytes", "sharded_state"])
+def test_shared_engram_still_rejects_unsupported_loaders(engram_config, load_format):
+    engram_config.load_config.load_format = load_format
+    with pytest.raises(ValueError, match="dp_shared_memory requires load_format"):
+        engram_config.engram_config.verify_load_config(engram_config.load_config)
 
 
 def test_engram_patch_retains_layer_check(engram_config):

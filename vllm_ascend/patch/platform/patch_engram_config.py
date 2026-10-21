@@ -41,5 +41,15 @@ if importlib.util.find_spec("vllm.config.engram") is not None:
         if self.embedding_across_dp and parallel_config.data_parallel_size > 1 and parallel_config.enable_elastic_ep:
             raise ValueError("Engram embedding_across_dp is not supported with elastic EP yet.")
 
+    def verify_load_config(self, load_config) -> None:
+        # RFork loads host tables locally through the existing shard reader,
+        # including its shared-writer synchronization, before NPU registration.
+        if self.dp_shared_memory and load_config.load_format not in ("auto", "safetensors", "pt", "rfork"):
+            raise ValueError(
+                "dp_shared_memory requires load_format 'auto', 'safetensors', 'pt' or 'rfork'; "
+                f"got {load_config.load_format!r}."
+            )
+
     EngramConfig.verify_model_config = verify_model_config
     EngramConfig.verify_parallel_config = verify_parallel_config
+    EngramConfig.verify_load_config = verify_load_config
